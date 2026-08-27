@@ -1,0 +1,31 @@
+{
+  "name": "ai-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Zero-API-Key AI Gateway - reuse logged-in AI web sessions, expose OpenAI-compatible API",
+  "packageManager": "pnpm@11.17.0",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "dev": "pnpm run build:packages && pnpm -r --parallel run dev",
+    "build": "pnpm -r run build",
+    "build:packages": "pnpm -r --filter \"./packages/*\" run build",
+    "typecheck": "pnpm run build:packages && pnpm -r run typecheck",
+    "lint": "pnpm -r run lint",
+    "format": "prettier --write .",
+    "dev:extension": "pnpm --filter @ai-gateway/extension dev",
+    "dev:server": "pnpm --filter @ai-gateway/server dev",
+    "build:all": "node scripts/build-all.js",
+    "package": "node scripts/package.js"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.9.1",
+    "eslint-plugin-vue": "^10.10.0",
+    "globals": "^17.11.0",
+    "prettier": "^3.9.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0"
+  }
+}

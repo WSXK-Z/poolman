@@ -1,0 +1,466 @@
+event: ready
+data: {"request_message_id":11,"response_message_id":12,"model_type":"default"}
+
+event: update_session
+data: {"updated_at":1787832983.8384118}
+
+data: {"v":{"response":{"message_id":12,"parent_id":11,"model":"","role":"ASSISTANT","thinking_enabled":true,"ban_edit":false,"ban_regenerate":false,"status":"WIP","incomplete_message":null,"accumulated_token_usage":0,"feedback":null,"inserted_at":1787832983.827313,"search_enabled":true,"fragments":[{"id":2,"type":"THINK","content":"我们","elapsed_secs":null,"references":[],"stage_id":1}],"conversation_mode":"DEFAULT","has_pending_fragment":false,"auto_continue":false,"search_triggered":false}}}
+
+data: {"p":"response/fragments/-1/content","o":"APPEND","v":"得"}
+
+data: {"v":"根据"}
+
+data: {"v":"用户"}
+
+data: {"v":"问题"}
+
+data: {"v":"“"}
+
+data: {"v":"能"}
+
+data: {"v":"绘图"}
+
+data: {"v":"吗"}
+
+data: {"v":"”"}
+
+data: {"v":"来"}
+
+data: {"v":"回答"}
+
+data: {"v":"。"}
+
+data: {"v":"用户"}
+
+data: {"v":"可能"}
+
+data: {"v":"是指"}
+
+data: {"v":"能否"}
+
+data: {"v":"生成"}
+
+data: {"v":"图形"}
+
+data: {"v":"、"}
+
+data: {"v":"图表"}
+
+data: {"v":"、"}
+
+data: {"v":"流程图"}
+
+data: {"v":"等"}
+
+data: {"v":"。"}
+
+data: {"v":"我"}
+
+data: {"v":"可以通过"}
+
+data: {"v":"M"}
+
+data: {"v":"ermaid"}
+
+data: {"v":"代码"}
+
+data: {"v":"块"}
+
+data: {"v":"渲染"}
+
+data: {"v":"图表"}
+
+data: {"v":"，"}
+
+data: {"v":"这在"}
+
+data: {"v":"Mark"}
+
+data: {"v":"down"}
+
+data: {"v":"中"}
+
+data: {"v":"支持"}
+
+data: {"v":"，"}
+
+data: {"v":"另外"}
+
+data: {"v":"我可以"}
+
+data: {"v":"描述"}
+
+data: {"v":"代码"}
+
+data: {"v":"逻辑"}
+
+data: {"v":"生成"}
+
+data: {"v":"流程图"}
+
+data: {"v":"。"}
+
+data: {"v":"也可以"}
+
+data: {"v":"使用"}
+
+data: {"v":"其他"}
+
+data: {"v":"图表"}
+
+data: {"v":"工具"}
+
+data: {"v":"。"}
+
+data: {"v":"我"}
+
+data: {"v":"直接"}
+
+data: {"v":"回答"}
+
+data: {"v":"可以"}
+
+data: {"v":"，"}
+
+data: {"v":"并且"}
+
+data: {"v":"给出"}
+
+data: {"v":"示例"}
+
+data: {"v":"。"}
+
+data: {"v":"因为"}
+
+data: {"v":"这是"}
+
+data: {"v":"对话"}
+
+data: {"v":"式"}
+
+data: {"v":"问答"}
+
+data: {"v":"，"}
+
+data: {"v":"不需要"}
+
+data: {"v":"调用"}
+
+data: {"v":"工具"}
+
+data: {"v":"。"}
+
+data: {"p":"response/fragments/-1/elapsed_secs","o":"SET","v":1.475212739}
+
+data: {"p":"response/fragments","o":"APPEND","v":[{"id":3,"type":"RESPONSE","content":"可以","references":[],"stage_id":1}]}
+
+data: {"p":"response/fragments/-1/content","v":"，"}
+
+data: {"v":"我能"}
+
+data: {"v":"生成"}
+
+data: {"v":"各种"}
+
+data: {"v":"图表"}
+
+data: {"v":"和"}
+
+data: {"v":"流程图"}
+
+data: {"v":"。"}
+
+data: {"v":"在"}
+
+data: {"v":"回答"}
+
+data: {"v":"中"}
+
+data: {"v":"，"}
+
+data: {"v":"我会"}
+
+data: {"v":"使用"}
+
+data: {"v":" **"}
+
+data: {"v":"M"}
+
+data: {"v":"ermaid"}
+
+data: {"v":"**"}
+
+data: {"v":" "}
+
+data: {"v":"代码"}
+
+data: {"v":"块"}
+
+data: {"v":"来"}
+
+data: {"v":"渲染"}
+
+data: {"v":"，"}
+
+data: {"v":"比如"}
+
+data: {"v":"：\n\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"流程图"}
+
+data: {"v":"\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"时序"}
+
+data: {"v":"图"}
+
+data: {"v":"\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"类"}
+
+data: {"v":"图"}
+
+data: {"v":"\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"状态"}
+
+data: {"v":"图"}
+
+data: {"v":"\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"甘"}
+
+data: {"v":"特"}
+
+data: {"v":"图"}
+
+data: {"v":"\n"}
+
+data: {"v":"-"}
+
+data: {"v":" "}
+
+data: {"v":"饼"}
+
+data: {"v":"图"}
+
+data: {"v":"等"}
+
+data: {"v":"\n\n"}
+
+data: {"v":"如果你"}
+
+data: {"v":"需要"}
+
+data: {"v":"，"}
+
+data: {"v":"我可以"}
+
+data: {"v":"基于"}
+
+data: {"v":"你的"}
+
+data: {"v":"代码"}
+
+data: {"v":"或"}
+
+data: {"v":"业务"}
+
+data: {"v":"逻辑"}
+
+data: {"v":"直接"}
+
+data: {"v":"画出"}
+
+data: {"v":"对应的"}
+
+data: {"v":"图表"}
+
+data: {"v":"。"}
+
+data: {"v":"你可以"}
+
+data: {"v":"直接"}
+
+data: {"v":"告诉我"}
+
+data: {"v":"需要"}
+
+data: {"v":"什么"}
+
+data: {"v":"类型的"}
+
+data: {"v":"图"}
+
+data: {"v":"，"}
+
+data: {"v":"或者"}
+
+data: {"v":"描述"}
+
+data: {"v":"要"}
+
+data: {"v":"表达"}
+
+data: {"v":"的内容"}
+
+data: {"v":"，"}
+
+data: {"v":"我来"}
+
+data: {"v":"帮你"}
+
+data: {"v":"生成"}
+
+data: {"v":"。\n\n"}
+
+data: {"v":"比如"}
+
+data: {"v":"，"}
+
+data: {"v":"一个"}
+
+data: {"v":"简单的"}
+
+data: {"v":"流程图"}
+
+data: {"v":"：\n\n"}
+
+data: {"v":"```"}
+
+data: {"v":"m"}
+
+data: {"v":"ermaid"}
+
+data: {"v":"\n"}
+
+data: {"v":"flow"}
+
+data: {"v":"chart"}
+
+data: {"v":" TD"}
+
+data: {"v":"\n"}
+
+data: {"v":"   "}
+
+data: {"v":" A"}
+
+data: {"v":"["}
+
+data: {"v":"开始"}
+
+data: {"v":"]"}
+
+data: {"v":" -->"}
+
+data: {"v":" B"}
+
+data: {"v":"{"}
+
+data: {"v":"判断"}
+
+data: {"v":"条件"}
+
+data: {"v":"}\n"}
+
+data: {"v":"   "}
+
+data: {"v":" B"}
+
+data: {"v":" -->"}
+
+data: {"v":"|"}
+
+data: {"v":"是"}
+
+data: {"v":"|"}
+
+data: {"v":" C"}
+
+data: {"v":"["}
+
+data: {"v":"执行"}
+
+data: {"v":"操作"}
+
+data: {"v":"]\n"}
+
+data: {"v":"   "}
+
+data: {"v":" B"}
+
+data: {"v":" -->"}
+
+data: {"v":"|"}
+
+data: {"v":"否"}
+
+data: {"v":"|"}
+
+data: {"v":" D"}
+
+data: {"v":"["}
+
+data: {"v":"结束"}
+
+data: {"v":"]\n"}
+
+data: {"v":"   "}
+
+data: {"v":" C"}
+
+data: {"v":" -->"}
+
+data: {"v":" D"}
+
+data: {"v":"\n"}
+
+data: {"v":"```\n\n"}
+
+data: {"v":"如果你"}
+
+data: {"v":"有"}
+
+data: {"v":"具体"}
+
+data: {"v":"需求"}
+
+data: {"v":"，"}
+
+data: {"v":"随时"}
+
+data: {"v":"告诉我"}
+
+data: {"v":"。"}
+
+data: {"p":"response","o":"BATCH","v":[{"p":"accumulated_token_usage","v":6689},{"p":"quasi_status","v":"FINISHED"}]}
+
+data: {"p":"response/status","o":"SET","v":"FINISHED"}
+
+event: update_session
+data: {"updated_at":1787832985.993218}
+
+event: close
+data: {"click_behavior":"none","auto_resume":false}
+

@@ -1,0 +1,176 @@
+import type { ModelProvider, ProviderStatusMap } from '@ai-gateway/shared';
+import { randomId } from '@ai-gateway/utils';
+import { browser } from 'wxt/browser';
+import {
+  DEFAULT_SETTINGS,
+  type AppSettings,
+  type CapturedChatApi,
+  type ExtensionState,
+  type LogEntry,
+} from '~/shared/constants';
+
+/** 持久化存储 key（避免 Service Worker 重启 / 扩展重载后丢失捕获结果） */
+const STORE_KEYS = {
+  tokens: '__ai_gateway_tokens',
+  settingsTokens: '__ai_gateway_settings_tokens',
+  templates: '__ai_gateway_templates',
+  hif: '__ai_gateway_hif',
+} as const;
+
+/**
+ * Background 全局状态（模块级单例）。
+ * Service Worker 中所有模块共享此对象。
+ * 捕获的 token / settingsToken / 接口模板会持久化到 browser.storage.local，
+ * 扩展重载后自动恢复，无需反复捕获。
+ */
+class BackgroundState {
+  settings: AppSettings = { ...DEFAULT_SETTINGS };
+  connected = false;
+  providers: ProviderStatusMap = {};
+  /** 各平台访问凭证 */
+  private tokens: Partial<Record<ModelProvider, string>> = {};
+  /** 各平台 settingsToken（x-settings-token 请求头用，如 localStorage.settingsJwt） */
+  private settingsTokens: Partial<Record<ModelProvider, string>> = {};
+  /** 各平台聊天接口模板（由内容脚本拦截网页真实请求获得，自适配） */
+  private apiTemplates: Partial<Record<ModelProvider, CapturedChatApi>> = {};
+  /** 各平台 x-hif-leim / x-hif-dliq（DeepSeek 完成接口需要的会话级头，独立持久化避免模板污染丢失） */
+  private hifHeaders: Partial<Record<ModelProvider, { leim?: string; dliq?: string }>> = {};
+  private logs: LogEntry[] = [];
+  private readonly maxLogs = 200;
+
+  private listeners = new Set<() => void>();
+
+  /** 从 storage.local 恢复捕获结果（扩展启动时调用） */
+  async loadPersisted(): Promise<void> {
+    try {
+      const stored = await browser.storage.local.get([
+        STORE_KEYS.tokens,
+        STORE_KEYS.settingsTokens,
+        STORE_KEYS.templates,
+        STORE_KEYS.hif,
+      ]);
+      const tokens = stored[STORE_KEYS.tokens] as Partial<Record<ModelProvider, string>> | undefined;
+      const settingsTokens = stored[STORE_KEYS.settingsTokens] as Partial<Record<ModelProvider, string>> | undefined;
+      const templates = stored[STORE_KEYS.templates] as Partial<Record<ModelProvider, CapturedChatApi>> | undefined;
+      const hif = stored[STORE_KEYS.hif] as Partial<Record<ModelProvider, { leim?: string; dliq?: string }>> | undefined;
+      if (tokens) this.tokens = { ...this.tokens, ...tokens };
+      if (settingsTokens) this.settingsTokens = { ...this.settingsTokens, ...settingsTokens };
+      if (templates) this.apiTemplates = { ...this.apiTemplates, ...templates };
+      if (hif) this.hifHeaders = { ...this.hifHeaders, ...hif };
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 保存平台访问凭证 */
+  setToken(provider: ModelProvider, token: string): void {
+    this.tokens[provider] = token;
+    this.notify();
+    void browser.storage.local.set({ [STORE_KEYS.tokens]: this.tokens }).catch(() => {});
+  }
+
+  /** 读取平台访问凭证 */
+  getToken(provider: ModelProvider): string | undefined {
+    return this.tokens[provider];
+  }
+
+  /** 保存平台 settingsToken */
+  setSettingsToken(provider: ModelProvider, token: string): void {
+    this.settingsTokens[provider] = token;
+    void browser.storage.local.set({ [STORE_KEYS.settingsTokens]: this.settingsTokens }).catch(() => {});
+  }
+
+  /** 读取平台 settingsToken */
+  getSettingsToken(provider: ModelProvider): string | undefined {
+    return this.settingsTokens[provider];
+  }
+
+  /** 保存平台聊天接口模板 */
+  setApiTemplate(provider: ModelProvider, api: CapturedChatApi): void {
+    this.apiTemplates[provider] = api;
+    this.notify();
+    void browser.storage.local.set({ [STORE_KEYS.templates]: this.apiTemplates }).catch(() => {});
+  }
+
+  /** 读取平台聊天接口模板 */
+  getApiTemplate(provider: ModelProvider): CapturedChatApi | undefined {
+    return this.apiTemplates[provider];
+  }
+
+  /** 保存平台 x-hif-leim / x-hif-dliq */
+  setHifHeaders(provider: ModelProvider, hif: { leim?: string; dliq?: string }): void {
+    this.hifHeaders[provider] = { ...this.hifHeaders[provider], ...hif };
+    void browser.storage.local.set({ [STORE_KEYS.hif]: this.hifHeaders }).catch(() => {});
+  }
+
+  /** 读取平台 x-hif-leim / x-hif-dliq */
+  getHifHeaders(provider: ModelProvider): { leim?: string; dliq?: string } | undefined {
+    return this.hifHeaders[provider];
+  }
+
+  /** 订阅状态变化（返回取消函数） */
+  subscribe(fn: () => void): () => void {
+    this.listeners.add(fn);
+    return () => this.listeners.delete(fn);
+  }
+
+  private notify(): void {
+    this.listeners.forEach((fn) => fn());
+  }
+
+  setSettings(partial: Partial<AppSettings>): void {
+    this.settings = { ...this.settings, ...partial };
+    this.notify();
+  }
+
+  setConnected(connected: boolean): void {
+    this.connected = connected;
+    this.notify();
+  }
+
+  setProviderStatus(provider: ModelProvider, status: Partial<ProviderStatusMap[ModelProvider]>): void {
+    const prev = this.providers[provider] ?? {
+      provider,
+      connected: false,
+      authed: false,
+      models: [],
+      lastChecked: 0,
+    };
+    this.providers = {
+      ...this.providers,
+      [provider]: { ...prev, ...status, lastChecked: Date.now() },
+    };
+    this.notify();
+  }
+
+  replaceProviders(status: ProviderStatusMap): void {
+    this.providers = status;
+    this.notify();
+  }
+
+  addLog(level: LogEntry['level'], message: string): void {
+    this.logs = [...this.logs, { id: randomId(8), time: Date.now(), level, message }].slice(-this.maxLogs);
+    this.notify();
+  }
+
+  clearLogs(): void {
+    this.logs = [];
+    this.notify();
+  }
+
+  getLogs(): LogEntry[] {
+    return this.logs;
+  }
+
+  /** 构建返回给 UI 的状态快照 */
+  snapshot(): ExtensionState {
+    return {
+      settings: this.settings,
+      connected: this.connected,
+      providers: this.providers,
+      logs: this.getLogs(),
+    };
+  }
+}
+
+export const backgroundState = new BackgroundState();

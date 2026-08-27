@@ -1,0 +1,28 @@
+{
+  "name": "@ai-gateway/extension",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "dev:firefox": "wxt -b firefox",
+    "build": "wxt build",
+    "build:firefox": "wxt build -b firefox",
+    "zip": "wxt zip",
+    "prepare": "wxt prepare",
+    "typecheck": "wxt prepare && tsc --noEmit",
+    "lint": "eslint ."
+  },
+  "dependencies": {
+    "@ai-gateway/shared": "workspace:*",
+    "@ai-gateway/utils": "workspace:*",
+    "naive-ui": "^2.45.2",
+    "vue": "^3.5.41"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^6.0.8",
+    "@wxt-dev/module-vue": "^1.0.3",
+    "typescript": "^5.9.3",
+    "wxt": "^0.21.4"
+  }
+}

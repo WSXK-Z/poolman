@@ -1,0 +1,12 @@
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# pnpm 11 默认阻止依赖的 postinstall 脚本；按需放行所需构建脚本。
+allowBuilds:
+  esbuild: true
+  '@parcel/watcher': true
+  unrs-resolver: true
+
+minimumReleaseAgeExclude:
+  - hono@4.13.5

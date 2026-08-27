@@ -1,0 +1,14 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "types": [],
+    "jsx": "preserve",
+    "baseUrl": ".",
+    "paths": {
+      "#imports": ["./.wxt/types/imports.d.ts"],
+      "~/*": ["./src/*"]
+    },
+    "noUncheckedIndexedAccess": false
+  },
+  "include": [".wxt/types/**/*.d.ts", "src/**/*"]
+}

@@ -1,0 +1,28 @@
+{
+  "name": "@ai-gateway/server",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "eslint src",
+    "pm2": "pm2 start ecosystem.config.js"
+  },
+  "dependencies": {
+    "@ai-gateway/shared": "workspace:*",
+    "@ai-gateway/utils": "workspace:*",
+    "@hono/node-server": "^2.1.1",
+    "hono": "^4.13.5",
+    "ws": "^8.21.3",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26.3.0",
+    "@types/ws": "^8.18.1",
+    "tsx": "^4.23.12",
+    "typescript": "^5.9.3"
+  }
+}
