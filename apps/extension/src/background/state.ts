@@ -108,6 +108,42 @@ class BackgroundState {
     return this.hifHeaders[provider];
   }
 
+  /**
+   * 返回所有已捕获凭证（供 WS 连接/重连后全量 CREDENTIAL_SYNC 同步给服务端）。
+   * 连接器化后，插件本地只保留这份副本供 UI 展示与重连重发，决策与使用都在服务端。
+   */
+  getAllCredentials(): Array<{
+    provider: ModelProvider;
+    token?: string;
+    settingsToken?: string;
+    hifHeaders?: { leim?: string; dliq?: string };
+    apiTemplate?: CapturedChatApi;
+  }> {
+    const providers = new Set<ModelProvider>([
+      ...(Object.keys(this.tokens) as ModelProvider[]),
+      ...(Object.keys(this.settingsTokens) as ModelProvider[]),
+      ...(Object.keys(this.hifHeaders) as ModelProvider[]),
+      ...(Object.keys(this.apiTemplates) as ModelProvider[]),
+    ]);
+    const out: Array<{
+      provider: ModelProvider;
+      token?: string;
+      settingsToken?: string;
+      hifHeaders?: { leim?: string; dliq?: string };
+      apiTemplate?: CapturedChatApi;
+    }> = [];
+    for (const provider of providers) {
+      out.push({
+        provider,
+        token: this.tokens[provider],
+        settingsToken: this.settingsTokens[provider],
+        hifHeaders: this.hifHeaders[provider],
+        apiTemplate: this.apiTemplates[provider],
+      });
+    }
+    return out;
+  }
+
   /** 订阅状态变化（返回取消函数） */
   subscribe(fn: () => void): () => void {
     this.listeners.add(fn);

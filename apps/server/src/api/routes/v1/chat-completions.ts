@@ -13,17 +13,32 @@ export function createChatCompletionsRoute(handler: ChatHandler): Hono {
     if (raw === null) {
       throw new HTTPException(400, { message: '请求体必须是合法的 JSON' });
     }
-    console.log('received raw chat request', JSON.stringify(raw, null, 2));
     const parsed = chatCompletionRequestSchema.safeParse(raw);
     if (!parsed.success) {
       throw new HTTPException(400, {
         message: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; '),
       });
     }
-    console.log('received chat request', JSON.stringify(parsed.data, null, 2));
-    const last = parsed.data.messages.pop();
-    parsed.data.messages=last?[last]:[];
+    // 保留完整 messages（含 system 提示词），供服务端判断对话归属 / 构造 DeepSeek prompt；
+    // DOM 平台只需最后一条，由 chatHandler 按 provider 裁剪。
     const req = parsed.data;
+
+    // 分析辅助：设置 DUMP_CHAT_REQUESTS=1 时，把每次 chat/completions 请求的完整 messages 转储到
+    // apps/server/data/requests/chat-<ts>.json，用于分析对话结构（分析完毕后删除该逻辑）。
+    if (process.env.DUMP_CHAT_REQUESTS === '1') {
+      try {
+        const { mkdirSync, writeFileSync } = await import('node:fs');
+        const { join } = await import('node:path');
+        const dir = join(process.cwd(), 'data', 'requests');
+        mkdirSync(dir, { recursive: true });
+        writeFileSync(
+          join(dir, `chat-${Date.now()}.json`),
+          JSON.stringify({ model: req.model, stream: req.stream, messages: req.messages }, null, 2),
+        );
+      } catch {
+        /* 转储失败不影响主流程 */
+      }
+    }
 
     // 固定会话：优先取请求头 x-deepseek-session，其次请求体 session_id
     const headerSession = c.req.header('x-deepseek-session');
@@ -41,14 +56,30 @@ export function createChatCompletionsRoute(handler: ChatHandler): Hono {
         try {
           const result = await handler.handleStream(req, (delta) => {
             const chunks = JSON.parse(delta) as Record<string, unknown>;
+            // 工具调用：以 OpenAI 流式 tool_calls delta 输出
+            if (Array.isArray(chunks.tool_calls)) {
+              stream.write(
+                `data: ${JSON.stringify({
+                  ...base,
+                  choices: [{
+                    index: 0,
+                    delta: { tool_calls: chunks.tool_calls },
+                    finish_reason: null,
+                  }],
+                })}\n\n`,
+              );
+              return;
+            }
             stream.write(
               `data: ${JSON.stringify({
                 ...base,
-                choices: [{ index: 0, delta: { 
-                  content: chunks["RESPONSE"] ?? "",
-                  reasoning_content: chunks["THINK"] ?? ""
-                },
-                  finish_reason: null }],
+                choices: [{
+                  index: 0, delta: {
+                    content: chunks["RESPONSE"] ?? "",
+                    reasoning_content: chunks["THINK"] ?? ""
+                  },
+                  finish_reason: null
+                }],
               })}\n\n`,
             );
           });
@@ -77,18 +108,22 @@ export function createChatCompletionsRoute(handler: ChatHandler): Hono {
 
     // 非流式：直接返回完整 JSON
     const result = await handler.handle(req);
+    // 判断是否返回 tool_calls
+    const hasToolCalls = result.tool_calls && result.tool_calls.length > 0;
     return c.json({
       id: result.id,
       object: 'chat.completion',
       created: result.created,
       model: result.model,
-      choices: [
-        {
-          index: 0,
-          message: { role: 'assistant', content: result.content },
-          finish_reason: result.finishedReason ?? 'stop',
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: hasToolCalls ? null : result.content,
+          ...(hasToolCalls && { tool_calls: result.tool_calls }),
         },
-      ],
+        finish_reason: hasToolCalls ? 'tool_calls' : (result.finishedReason ?? 'stop'),
+      }],
       usage: result.usage,
     });
   });

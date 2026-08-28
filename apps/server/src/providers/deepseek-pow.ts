@@ -1,10 +1,14 @@
 /**
- * DeepSeek 网页版 PoW（Proof-of-Work）实现。
+ * DeepSeek 网页版 PoW（Proof-of-Work）实现 —— 服务端纯计算模块。
+ *
+ * 从浏览器插件（apps/extension/src/providers/deepseek-pow.ts）移植而来。
+ * 该模块只包含**纯计算**逻辑（哈希 / 求解 / 组头），不依赖浏览器 API，
+ * 因此连接器化重构后搬到服务端运行。
  *
  * DeepSeek 会要求每次聊天请求都携带 `x-ds-pow-response` 头（防机器人），
  * 其值 = base64(JSON{algorithm, challenge, salt, answer, signature, target_path})。
  *
- * 求解流程：
+ * 求解流程（编排部分在 DeepSeekService）：
  *  1. POST /api/v0/chat/create_pow_challenge  body: {target_path: "/api/v0/chat/completion"}
  *  2. 返回 data.biz_data.challenge = {algorithm, challenge(hex), salt, expire_at, difficulty, signature, target_path}
  *  3. 遍历 answer ∈ [0, difficulty)，使得 DeepSeekHashV1(prefix + str(answer)) == challenge
@@ -17,7 +21,6 @@
  *
  * 参考：l-spaces/deepseek-api 的 Go 实现（pow/deepseek_hash.go、pow/deepseek_pow.go）。
  */
-import { diag } from '~/background/diagnostics';
 
 /* ------------------------------------------------------------------ */
 /* DeepSeekHashV1（Keccak-f[1600] rounds 1..23，Number/32 位双字）       */
@@ -169,8 +172,8 @@ export function deepSeekHashV1(data: Uint8Array): Uint8Array {
   keccakF23(state, 1);
   const out = new Uint8Array(32);
   for (let i = 0; i < 4; i++) {
-    let lo = state[2 * i + 1];
-    let hi = state[2 * i];
+    const lo = state[2 * i + 1];
+    const hi = state[2 * i];
     const o = i * 8;
     out[o] = lo & 255;
     out[o + 1] = (lo >>> 8) & 255;
@@ -200,7 +203,12 @@ export interface DeepSeekChallenge {
 }
 
 /** 遍历 answer ∈ [0, difficulty)，返回匹配的 answer；找不到返回 -1。 */
-function solvePow(challengeHex: string, salt: string, expireAt: number, difficulty: number): number {
+export function solvePow(
+  challengeHex: string,
+  salt: string,
+  expireAt: number,
+  difficulty: number,
+): number {
   const target = new Uint8Array(32);
   for (let i = 0; i < 32; i++) target[i] = parseInt(challengeHex.slice(i * 2, i * 2 + 2), 16);
   const t0h = (target[4] | (target[5] << 8) | (target[6] << 16) | (target[7] << 24)) >>> 0;
@@ -275,56 +283,6 @@ function solvePow(challengeHex: string, salt: string, expireAt: number, difficul
   return -1;
 }
 
-const POW_CHALLENGE_URL = 'https://chat.deepseek.com/api/v0/chat/create_pow_challenge';
-
-/** 请求并解析 PoW 挑战（响应路径 data.biz_data.challenge）。 */
-export async function fetchPowChallenge(
-  token: string,
-  settingsToken?: string,
-): Promise<DeepSeekChallenge> {
-  const headers: Record<string, string> = {
-    'x-client-bundle-id': 'com.deepseek.chat',
-    'x-client-platform': 'web',
-    'x-client-version': '2.4.0',
-    'x-client-locale': 'zh_CN',
-    'x-client-timezone-offset': '28800',
-    'Content-Type': 'application/json',
-    Authorization: `Bearer ${token}`,
-  };
-  if (settingsToken) headers['x-settings-token'] = settingsToken;
-
-  const res = await fetch(POW_CHALLENGE_URL, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ target_path: '/api/v0/chat/completion' }),
-  });
-  const text = await res.text();
-  if (!res.ok) {
-    throw new Error(`create_pow_challenge HTTP ${res.status}: ${text.slice(0, 300)}`);
-  }
-  let json: any;
-  try {
-    json = JSON.parse(text);
-  } catch {
-    throw new Error(`create_pow_challenge 返回非 JSON: ${text.slice(0, 300)}`);
-  }
-  // 兼容多种响应包裹
-  const ch = json?.data?.biz_data?.challenge ?? json?.data?.challenge ?? json?.challenge;
-  if (!ch) {
-    throw new Error(`create_pow_challenge 未返回 challenge: ${text.slice(0, 300)}`);
-  }
-  const difficulty = Number(ch.difficulty ?? 144000) || 144000;
-  return {
-    algorithm: String(ch.algorithm ?? 'DeepSeekHashV1'),
-    challenge: String(ch.challenge ?? ''),
-    salt: String(ch.salt ?? ''),
-    expireAt: Number(ch.expire_at ?? ch.expireAt ?? ch.expires_at ?? 0),
-    difficulty,
-    signature: String(ch.signature ?? ''),
-    targetPath: String(ch.target_path ?? '/api/v0/chat/completion'),
-  };
-}
-
 /** 序列化 PoW 应答头：base64(JSON{...})。不含 difficulty/expire_at。 */
 export function buildPowHeader(ch: DeepSeekChallenge, answer: number): string {
   const obj = {
@@ -335,41 +293,6 @@ export function buildPowHeader(ch: DeepSeekChallenge, answer: number): string {
     signature: ch.signature,
     target_path: ch.targetPath,
   };
-  // background（service worker）环境有 btoa；JSON 全 ASCII，安全。
+  // Node 18+ 全局有 btoa；JSON 全 ASCII，安全。
   return btoa(JSON.stringify(obj));
-}
-
-/** 端到端：拉取挑战 → 求解 → 组装 x-ds-pow-response 头；失败返回 null 并上报诊断。 */
-export async function solvePowAndBuildHeader(
-  token: string,
-  settingsToken?: string,
-): Promise<string | null> {
-  try {
-    const ch = await fetchPowChallenge(token, settingsToken);
-    diag('info', 'deepseek', '获取 PoW 挑战', {
-      algorithm: ch.algorithm,
-      difficulty: ch.difficulty,
-      expireAt: ch.expireAt,
-      saltLen: ch.salt.length,
-      challengeLen: ch.challenge.length,
-    });
-    const start = Date.now();
-    const answer = solvePow(ch.challenge, ch.salt, ch.expireAt, ch.difficulty);
-    const elapsedMs = Date.now() - start;
-    if (answer < 0) {
-      diag('error', 'deepseek', 'PoW 求解失败（difficulty 范围内未找到答案）', {
-        difficulty: ch.difficulty,
-        elapsedMs,
-      });
-      return null;
-    }
-    diag('info', 'deepseek', `PoW 求解成功 answer=${answer}`, {
-      elapsedMs,
-      difficulty: ch.difficulty,
-    });
-    return buildPowHeader(ch, answer);
-  } catch (err) {
-    diag('error', 'deepseek', 'PoW 流程失败', { error: String(err) });
-    return null;
-  }
 }

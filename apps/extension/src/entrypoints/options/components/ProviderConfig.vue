@@ -19,11 +19,12 @@ const providers = computed(() => {
   }));
 });
 
+// 连接器化后凭证在服务端存储，插件本地捕获副本即视为"已同步服务端"
 const captureText = (p: { status?: ProviderStatusMap[ModelProvider] }): string => {
   const s = p.status;
-  if (s?.templateCaptured) return '凭证+接口已捕获';
-  if (s?.tokenCaptured) return '凭证已捕获';
-  return '未捕获';
+  if (s?.templateCaptured) return '凭证+接口已同步';
+  if (s?.tokenCaptured) return '凭证已同步';
+  return '未同步';
 };
 
 
@@ -45,6 +46,7 @@ async function open(id: ModelProvider): Promise<void> {
       <n-card v-for="p in providers" :key="p.id" size="small" :title="p.label">
         <div class="provider-config-row">
           <n-switch :value="p.enabled" @update:value="(v: boolean) => toggle(p.id, v)" />
+          <n-tag v-if="p.id === 'deepseek-web'" type="info" size="small" round>服务端直管</n-tag>
           <n-tag :type="p.status?.authed ? 'success' : 'warning'" size="small" round>
             {{ p.status?.authed ? '已登录' : '未登录' }}
           </n-tag>

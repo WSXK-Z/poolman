@@ -178,5 +178,104 @@ export default defineContentScript({
       if (pendingUrl) report(pendingUrl, captured, bodyStr);
       origSend.call(this, body);
     };
+
+    /* ==================== 网页执行器（连接器化） ====================
+     * 服务端通过 EXECUTE_REQUEST 下发「用这些 url/headers/body 执行一次 fetch」的指令，
+     * 插件只负责在页面 context 机械执行并把原始响应流逐块回传——不含任何业务逻辑。
+     * 这样既能复用浏览器会话环境（规避 Node 直连被反爬拦截），又能让全部智能在服务端。
+     */
+    function postToExtension(msg: Record<string, unknown>): void {
+      window.postMessage({ source: 'ai-gateway', ...msg }, '*');
+    }
+
+    async function executeInPage(opts: {
+      requestId: string;
+      method?: string;
+      url: string;
+      headers: Record<string, string>;
+      body?: string | null;
+      streaming?: boolean;
+    }): Promise<void> {
+      // 防挂起：请求总超时 + 流式空闲超时。DeepSeek 偶发对 pow/会话接口挂起（不返回也不关闭），
+      // 无超时会让整个聊天流程无限等待。非流式 20s 总超时；流式按「空闲 30s 无新数据」终止。
+      const TOTAL_TIMEOUT = opts.streaming ? 120_000 : 20_000;
+      const IDLE_TIMEOUT = 30_000;
+      const controller = new AbortController();
+      let idleTimer: number | null = null;
+      const armIdle = (): void => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = window.setTimeout(() => controller.abort(), IDLE_TIMEOUT);
+      };
+      const totalTimer = window.setTimeout(() => controller.abort(), TOTAL_TIMEOUT);
+      armIdle();
+      try {
+        // 重要：这里必须用被拦截器保存的原始 origFetch，而不是被包装后的 window.fetch，
+        // 否则执行器请求也会被上面的拦截器劫持（report 捕获 + 包装），既污染模板捕获，
+        // 也可能因拦截逻辑干扰到真实执行。
+        const res = await origFetch(opts.url, {
+          method: opts.method || 'POST',
+          // 服务端已过滤 forbidden headers（host/origin/cookie 等），只保留 x-* + Content-Type/Authorization
+          headers: opts.headers,
+          body: opts.body ?? undefined,
+          // 同源请求默认带 cookie；DeepSeek 鉴权走 Authorization 头，cookie 无鉴权不影响
+          credentials: 'same-origin',
+          signal: controller.signal,
+        });
+        // 收到响应头后取消初始空闲计时（后续按流式数据刷新）
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+        // 流式成功：把原始响应流逐块回传，服务端自行分行解析（不在此做任何协议解析）
+        if (opts.streaming && res.ok && res.body) {
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            const text = decoder.decode(value, { stream: true });
+            if (text) {
+              // 有数据输出，刷新空闲计时（连接仍在输出则不会误 abort）
+              armIdle();
+              postToExtension({ type: 'EXECUTE_CHUNK', requestId: opts.requestId, data: text });
+            }
+          }
+          postToExtension({
+            type: 'EXECUTE_RESULT',
+            requestId: opts.requestId,
+            status: res.status,
+            ok: true,
+            statusText: res.statusText,
+            body: null,
+          });
+        } else {
+          // 非流式 / 失败：读取完整响应体一次性回传（供服务端做 422 自愈等）
+          const text = await res.text();
+          postToExtension({
+            type: 'EXECUTE_RESULT',
+            requestId: opts.requestId,
+            status: res.status,
+            ok: res.ok,
+            statusText: res.statusText,
+            body: text,
+          });
+        }
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        postToExtension({ type: 'EXECUTE_ERROR', requestId: opts.requestId, error: msg, code: 'execute_failed' });
+      } finally {
+        if (totalTimer) clearTimeout(totalTimer);
+        if (idleTimer) clearTimeout(idleTimer);
+      }
+    }
+
+    // 监听 isolated world 转发的执行指令（source 校验与现有捕获桥一致）
+    window.addEventListener('message', (event) => {
+      const data = event.data as
+        | { source?: string; type?: string; requestId?: string; method?: string; url?: string }
+        | undefined;
+      if (!data || data.source !== 'ai-gateway' || data.type !== 'EXECUTE_IN_PAGE' || !data.requestId) return;
+      void executeInPage(data as unknown as Parameters<typeof executeInPage>[0]);
+    });
   },
 });

@@ -4,6 +4,7 @@ import { prettyJSON } from 'hono/pretty-json';
 import type { ServerConfig } from '../config/index.js';
 import type { WebSocketBridge } from '../bridge/websocket.js';
 import type { ChatHandler } from '../handlers/chatHandler.js';
+import type { CredentialStore } from '../providers/credentials.js';
 import { httpLogger } from './middleware/logger.js';
 import { errorHandler } from './middleware/error.js';
 import { createV1Routes } from './routes/v1/index.js';
@@ -12,6 +13,8 @@ export interface AppDeps {
   bridge: WebSocketBridge;
   chatHandler: ChatHandler;
   config: ServerConfig;
+  /** 服务端凭证存储（供 /health 展示各平台凭证同步状态） */
+  credentials: CredentialStore;
 }
 
 /** 创建 Hono 应用（含中间件与路由） */
@@ -33,6 +36,8 @@ export function createApp(deps: AppDeps): Hono {
       uptime: process.uptime(),
       extensionConnected: deps.bridge.connected,
       providers: deps.bridge.latestStatus,
+      // 连接器化后凭证在服务端，展示各平台凭证同步状态
+      credentials: deps.credentials.summary(),
       timestamp: new Date().toISOString(),
     }),
   );

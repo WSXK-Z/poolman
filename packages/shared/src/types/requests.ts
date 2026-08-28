@@ -1,9 +1,11 @@
-export type ChatRole = 'system' | 'user' | 'assistant';
+export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ChatMessage {
   role: ChatRole;
-  content: string;
+  content: string | null;     
   name?: string;
+  tool_calls?: ToolCall[];          // assistant 角色使用
+  tool_call_id?: string;            // tool 角色使用
 }
 
 export interface ChatOptions {
@@ -14,6 +16,8 @@ export interface ChatOptions {
   timeoutMs?: number;
   /** 固定会话 ID：若指定，则复用该会话（如 DeepSeek 网页会话），不再自动查找/新建 */
   sessionId?: string;
+  tools?: Tool[];                 
+  tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } }; 
 }
 
 export interface TokenUsage {
@@ -23,8 +27,28 @@ export interface TokenUsage {
 }
 
 export interface ChatResult {
-  content: string;
+  content?: string;                 
+  tool_calls?: ToolCall[];
   model: string;
   usage?: TokenUsage;
   finishedReason?: string;
+}
+
+// ===== 工具定义 =====
+export interface FunctionDefinition {
+  name: string;
+  description?: string;
+  parameters?: Record<string, unknown>; // JSON Schema 对象
+}
+export interface Tool {
+  type: 'function';
+  function: FunctionDefinition;
+}
+export interface ToolCall {
+  id: string;
+  type: 'function';
+  function: {
+    name: string;
+    arguments: string; // JSON 字符串
+  };
 }

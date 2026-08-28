@@ -18,7 +18,14 @@ const TOKEN_STORAGE_KEYS = [
 
 /** 从页面存储 / cookie 中提取访问凭证 */
 function extractTokenFromPage(): string | null {
-  for (const key of TOKEN_STORAGE_KEYS) {
+  // DeepSeek 正确的访问凭证在 localStorage.userToken（Bearer 头来源）。
+  // 页面上其它通用 key（token/accessToken 等）可能是无关值，若按通用顺序先命中会导致
+  // 上报错误的 token（与主世界拦截的真实请求头不一致，造成 92/64 交替刷屏）。
+  const isDeepSeek = location.hostname.includes('deepseek');
+  const keys = isDeepSeek
+    ? ['userToken', ...TOKEN_STORAGE_KEYS.filter((k) => k !== 'userToken')]
+    : TOKEN_STORAGE_KEYS;
+  for (const key of keys) {
     try {
       const v = localStorage.getItem(key);
       if (v) return v.replace(/^Bearer\s+/i, '');
@@ -68,8 +75,9 @@ export default defineContentScript({
   world: 'ISOLATED',
   runAt: 'document_idle',
   main() {
-    // 1) 转发主世界捕获的 Token / 接口模板
+    // 1) 转发主世界捕获的 Token / 接口模板 + 执行回包（EXECUTE_CHUNK / RESULT / ERROR）
     window.addEventListener('message', (event) => {
+      // 单一宽对象类型：主世界会发送多种 payload，字段全部可选，避免联合类型窄化失败
       const data = event.data as
         | {
             source?: string;
@@ -80,9 +88,41 @@ export default defineContentScript({
             headers?: Record<string, string>;
             template?: Record<string, unknown> | null;
             hifHeaders?: { leim?: string; dliq?: string };
+            requestId?: string;
+            data?: string;
+            status?: number;
+            ok?: boolean;
+            statusText?: string;
+            body?: string | null;
+            error?: string;
+            code?: string;
           }
         | undefined;
       if (!data || data.source !== 'ai-gateway') return;
+
+      // 执行回包：MAIN world 的网页执行器结果 → background（再转 EXECUTE_* 协议消息给服务端）
+      if (
+        data.type === 'EXECUTE_CHUNK' ||
+        data.type === 'EXECUTE_RESULT' ||
+        data.type === 'EXECUTE_ERROR'
+      ) {
+        if (data.requestId) {
+          browser.runtime
+            .sendMessage({
+              type: data.type,
+              requestId: data.requestId,
+              data: data.data,
+              status: data.status,
+              ok: data.ok,
+              statusText: data.statusText,
+              body: data.body,
+              error: data.error,
+              code: data.code,
+            })
+            .catch(() => {});
+        }
+        return;
+      }
 
       if (data.type === 'CAPTURED_API' && data.provider) {
         browser.runtime
@@ -108,10 +148,42 @@ export default defineContentScript({
       }
     });
 
-    // 2) 响应 background 的主动捕获请求
+    // 2) 响应 background 的主动捕获请求 + 执行指令转发
     browser.runtime.onMessage.addListener((message: unknown) => {
-      const msg = message as { type?: string; provider?: string } | undefined;
-      if (!msg || msg.type !== 'CAPTURE_TOKEN' || !msg.provider) return undefined;
+      // 单一宽对象类型：CAPTURE_TOKEN / EXECUTE_IN_PAGE 两种指令的字段并集，全部可选
+      const msg = message as
+        | {
+            type?: string;
+            provider?: string;
+            requestId?: string;
+            method?: string;
+            url?: string;
+            headers?: Record<string, string>;
+            body?: string | null;
+            streaming?: boolean;
+          }
+        | undefined;
+      if (!msg) return undefined;
+
+      // 执行指令：转发给 MAIN world 的网页执行器（它才是真正 fetch 的地方）
+      if (msg.type === 'EXECUTE_IN_PAGE' && msg.requestId) {
+        window.postMessage(
+          {
+            source: 'ai-gateway',
+            type: 'EXECUTE_IN_PAGE',
+            requestId: msg.requestId,
+            method: msg.method,
+            url: msg.url,
+            headers: msg.headers,
+            body: msg.body,
+            streaming: msg.streaming,
+          },
+          '*',
+        );
+        return undefined;
+      }
+
+      if (msg.type !== 'CAPTURE_TOKEN' || !msg.provider) return undefined;
       const token = extractTokenFromPage();
       const settingsToken = extractSettingsToken();
       if (token || settingsToken) {

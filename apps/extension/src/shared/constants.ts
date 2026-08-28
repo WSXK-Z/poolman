@@ -36,33 +36,8 @@ export interface LogEntry {
   message: string;
 }
 
-/** 拦截到的平台聊天接口模板（网页前端真实请求的 body 结构，用于自适配转发） */
-export interface ChatApiTemplate {
-  agent_name?: string;
-  model_name?: string;
-  think_enabled?: boolean;
-  generation_settings?: Record<string, unknown>;
-  has_session_id?: boolean;
-  has_parent_message_id?: boolean;
-  /** 网页真实请求里使用的会话 ID（复用即可，随机 UUID 会被判 invalid） */
-  chat_session_id?: string;
-  /** 网页真实请求里的父消息 ID */
-  parent_message_id?: string | null;
-  /** 2026-08 网站真实字段：模型类型（如 'default'） */
-  model_type?: string;
-  thinking_enabled?: boolean;
-  search_enabled?: boolean;
-}
-
-/** 拦截到的平台聊天接口完整信息 */
-export interface CapturedChatApi {
-  provider: ModelProvider;
-  url: string;
-  headers: Record<string, string>;
-  template: ChatApiTemplate;
-  token: string;
-  capturedAt: number;
-}
+// 捕获凭证/接口模板类型已上移到共享包（服务端与插件共用），此处 re-export 保持兼容。
+export type { ChatApiTemplate, CapturedChatApi } from '@ai-gateway/shared';
 
 /** 插件内部（UI <-> background）消息协议 */
 export type InternalMessage =

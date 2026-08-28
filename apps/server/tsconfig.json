@@ -8,7 +8,11 @@
     "rootDir": "src",
     "noEmit": false,
     "sourceMap": true,
-    "types": ["node"]
+    "types": ["node"],
+    // PoW 模块（providers/deepseek-pow.ts）是从浏览器插件原样移植的纯计算代码，
+    // 使用大量 TypedArray 索引访问；noUncheckedIndexedAccess 会把这些索引推断为
+    // number | undefined，导致上百处报错。为保持算法零改动，此处覆盖关闭（与插件 tsconfig 一致）。
+    "noUncheckedIndexedAccess": false
   },
   "include": ["src"]
 }

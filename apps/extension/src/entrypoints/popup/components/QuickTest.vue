@@ -5,11 +5,13 @@ import type { ModelProvider } from '@ai-gateway/shared';
 import { PROVIDER_LABELS } from '~/shared/constants';
 import { sendMessage } from '~/lib/messaging';
 
-const providerOptions = (Object.entries(PROVIDER_LABELS) as [ModelProvider, string][]).map(
-  ([value, label]) => ({ value, label }),
-);
+// DeepSeek 已由服务端直管（插件不再直连网页接口），快速测试仅覆盖 DOM 平台；
+// DeepSeek 请用 OpenAI 客户端 / curl 指向 http://127.0.0.1:3000/v1 测试
+const providerOptions = (Object.entries(PROVIDER_LABELS) as [ModelProvider, string][])
+  .filter(([value]) => value !== 'deepseek-web')
+  .map(([value, label]) => ({ value, label }));
 
-const selected = ref<ModelProvider>('deepseek-web');
+const selected = ref<ModelProvider>('chatgpt-web');
 const prompt = ref('');
 const result = ref('');
 const loading = ref(false);
@@ -37,6 +39,9 @@ async function run(): Promise<void> {
 <template>
   <n-card size="small" title="快速测试">
     <n-space vertical size="small">
+      <n-alert type="default" size="small">
+        快速测试仅支持 DOM 平台；DeepSeek 由服务端直管，请用 OpenAI 客户端 / curl 指向 /v1。
+      </n-alert>
       <n-select v-model:value="selected" :options="providerOptions" size="small" />
       <n-input
         v-model:value="prompt"

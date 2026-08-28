@@ -1,8 +1,8 @@
 import { browser } from 'wxt/browser';
-import type { ModelProvider, ProviderStatusMap } from '@ai-gateway/shared';
+import { MessageType, type ModelProvider, type ProviderStatusMap } from '@ai-gateway/shared';
 import { createLogger, errorMessage } from '@ai-gateway/utils';
 import { GatewayConnection } from '~/background/connection';
-import { bindDiagnosticSender, diag } from '~/background/diagnostics';
+import { bindDiagnosticSender } from '~/background/diagnostics';
 import { handleServerMessage } from '~/background/messageRouter';
 import { backgroundState } from '~/background/state';
 import { getProvider, listProviders } from '~/providers';
@@ -29,10 +29,36 @@ function startConnection(): void {
     autoReconnect: backgroundState.settings.autoReconnect,
     getStatus,
     onMessage: (msg) => void handleServerMessage(msg, (resp) => connection?.send(resp)),
+    // 连接（或重连）建立后，把本地已捕获凭证全量同步给服务端
+    onOpen: () => syncCredentialsToServer(),
   });
   // 诊断信息通过该连接上报给服务端
   bindDiagnosticSender((msg) => connection?.send(msg));
   connection.start();
+}
+
+/**
+ * 向服务端同步凭证（CREDENTIAL_SYNC）。provider 指定则只同步该平台，否则全量。
+ * 内容脚本捕获后本地缓存一份（供 UI 展示 / 重连重发），真正存储与使用在服务端。
+ */
+function syncCredentialsToServer(provider?: ModelProvider): void {
+  if (!connection) return;
+  const creds = backgroundState.getAllCredentials();
+  for (const c of creds) {
+    if (provider && c.provider !== provider) continue;
+    connection.send({
+      id: `credsync_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 6)}`,
+      type: MessageType.CREDENTIAL_SYNC,
+      timestamp: Date.now(),
+      payload: {
+        provider: c.provider,
+        token: c.token ?? null,
+        settingsToken: c.settingsToken ?? null,
+        hifHeaders: c.hifHeaders,
+        apiTemplate: c.apiTemplate ?? null,
+      },
+    });
+  }
 }
 
 /** 刷新各平台登录态并写入状态 */
@@ -81,7 +107,7 @@ async function handleInternalMessage(msg: InternalMessage): Promise<InternalResp
         const provider = getProvider(msg.payload.model);
         const started = Date.now();
         const result = await provider.chat(msg.payload.model, [{ role: 'user', content: msg.payload.prompt }]);
-        return { ok: true, result: { content: result.content, elapsedMs: Date.now() - started } };
+        return { ok: true, result: { content: result.content ?? '', elapsedMs: Date.now() - started } };
       } catch (err) {
         return { ok: false, error: errorMessage(err) };
       }
@@ -139,23 +165,71 @@ export default defineBackground(() => {
               token: string | null;
               hifHeaders?: { leim?: string; dliq?: string };
             };
+          }
+        | {
+            type: 'EXECUTE_CHUNK' | 'EXECUTE_RESULT' | 'EXECUTE_ERROR';
+            requestId: string;
+            data?: string;
+            status?: number;
+            ok?: boolean;
+            statusText?: string;
+            body?: string | null;
+            error?: string;
+            code?: string;
           },
     ) => {
       if (message && typeof message === 'object' && 'type' in message) {
+        // content 网页执行器的回包 → 转发为协议消息给服务端（id 复用 EXECUTE_REQUEST 的 id）
+        if (
+          message.type === 'EXECUTE_CHUNK' ||
+          message.type === 'EXECUTE_RESULT' ||
+          message.type === 'EXECUTE_ERROR'
+        ) {
+          if (message.requestId) {
+            const base = { id: message.requestId, timestamp: Date.now() };
+            if (message.type === 'EXECUTE_CHUNK') {
+              connection?.send({ ...base, type: MessageType.EXECUTE_CHUNK, payload: { data: message.data ?? '' } });
+            } else if (message.type === 'EXECUTE_RESULT') {
+              connection?.send({
+                ...base,
+                type: MessageType.EXECUTE_RESULT,
+                payload: {
+                  status: message.status ?? 0,
+                  ok: message.ok ?? false,
+                  statusText: message.statusText,
+                  body: message.body ?? null,
+                },
+              });
+            } else {
+              connection?.send({
+                ...base,
+                type: MessageType.EXECUTE_ERROR,
+                payload: { error: message.error ?? 'unknown execute error', code: message.code },
+              });
+            }
+          }
+          return;
+        }
         if (message.type === 'TOKEN_CAPTURED') {
-          // 内容脚本捕获到平台 Token（持久化到 storage.local，重载不丢）
+          // 内容脚本捕获到平台 Token（本地持久化一份供 UI / 重连重发）。
+          // 内容脚本每 2s 轮询上报，凭证没变化时跳过同步/日志，避免刷屏与重复同步。
+          const hasToken = !!message.payload?.token;
+          const hasSettings = !!message.payload?.settingsToken;
+          const changed =
+            (hasToken && message.payload.token !== backgroundState.getToken(message.payload.provider)) ||
+            (hasSettings &&
+              message.payload.settingsToken !== backgroundState.getSettingsToken(message.payload.provider));
           if (message.payload?.token) {
             backgroundState.setToken(message.payload.provider, message.payload.token);
           }
           if (message.payload?.settingsToken) {
             backgroundState.setSettingsToken(message.payload.provider, message.payload.settingsToken);
           }
-          backgroundState.addLog('info', `捕获到 ${message.payload.provider} 的访问 Token`);
-          diag('info', 'capture', `${message.payload.provider} 访问凭证已捕获`, {
-            provider: message.payload.provider,
-            tokenLength: message.payload.token?.length ?? 0,
-            hasSettingsToken: !!message.payload.settingsToken,
-          });
+          // 连接器化：凭证有变化才同步给服务端（服务端存储与使用）并记录日志
+          if (changed) {
+            syncCredentialsToServer(message.payload.provider);
+            backgroundState.addLog('info', `捕获到 ${message.payload.provider} 的访问 Token`);
+          }
           return;
         }
         if (message.type === 'API_CAPTURED') {
@@ -193,13 +267,9 @@ export default defineBackground(() => {
             if (message.payload.token) {
               backgroundState.setToken(message.payload.provider, message.payload.token);
             }
+            // 连接器化：接口模板捕获后立即同步给服务端
+            syncCredentialsToServer(message.payload.provider);
             backgroundState.addLog('info', `捕获到 ${message.payload.provider} 接口模板: ${message.payload.url}`);
-            diag('info', 'capture', `${message.payload.provider} 聊天接口模板已捕获`, {
-              provider: message.payload.provider,
-              url: message.payload.url,
-              headers: message.payload.headers,
-              template: tpl,
-            });
           }
           return;
         }

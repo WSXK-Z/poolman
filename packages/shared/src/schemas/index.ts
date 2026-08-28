@@ -1,15 +1,36 @@
 import { z } from 'zod';
 import { MessageType } from '../types/protocol.js';
 import { PROVIDERS } from '../types/models.js';
+import type { ChatMessage } from '../types/requests.js';
 
+const functionDefinitionSchema = z.object({
+  name: z.string(),
+  description: z.string().optional(),
+  parameters: z.record(z.string(), z.unknown()).optional(),
+});
+const toolSchema = z.object({
+  type: z.literal('function'),
+  function: functionDefinitionSchema,
+});
+
+const toolCallSchema = z.object({
+  id: z.string(),
+  type: z.literal('function'),
+  function: z.object({
+    name: z.string(),
+    arguments: z.string(),
+  }),
+});
 /* ------------------------------ 基础类型 ------------------------------ */
 
 export const chatRoleSchema = z.enum(['system', 'user', 'assistant']);
 
-export const chatMessageSchema = z.object({
-  role: chatRoleSchema,
-  content: z.string().min(1),
+const chatMessageSchema: z.ZodType<ChatMessage> = z.object({
+  role: z.enum(['system', 'user', 'assistant', 'tool']),
+  content: z.string().nullable(),
   name: z.string().optional(),
+  tool_calls: z.array(toolCallSchema).optional(),
+  tool_call_id: z.string().optional(),
 });
 
 export const chatOptionsSchema = z.object({
@@ -100,6 +121,75 @@ export const diagnosticMessageSchema = baseMessageSchema.extend({
   }),
 });
 
+/* ---------------------- 连接器化新增消息 schema ---------------------- */
+/* 插件只作"连接器"：凭证同步 + 网页执行器。业务逻辑（存储/组装/解析）全在服务端。 */
+
+/** 服务 -> 插件：请求主动捕获凭证 */
+export const captureRequestSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.CAPTURE_REQUEST),
+  payload: z.object({
+    provider: providerIdSchema,
+  }),
+});
+
+/** 服务 -> 插件：在指定平台网页执行一次 fetch */
+export const executeRequestSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.EXECUTE_REQUEST),
+  payload: z.object({
+    provider: providerIdSchema,
+    method: z.string().optional(),
+    url: z.string(),
+    headers: z.record(z.string(), z.string()),
+    body: z.string().nullable().optional(),
+    streaming: z.boolean().optional(),
+  }),
+});
+
+/** 插件 -> 服务：凭证/接口模板同步（apiTemplate 用 z.unknown 宽松校验，避免丢弃网页捕获的未知结构） */
+export const credentialSyncSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.CREDENTIAL_SYNC),
+  payload: z.object({
+    provider: providerIdSchema,
+    token: z.string().nullable().optional(),
+    settingsToken: z.string().nullable().optional(),
+    hifHeaders: z
+      .object({
+        leim: z.string().optional(),
+        dliq: z.string().optional(),
+      })
+      .optional(),
+    apiTemplate: z.unknown().nullable().optional(),
+  }),
+});
+
+/** 插件 -> 服务：执行过程中的原始响应流文本块 */
+export const executeChunkSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.EXECUTE_CHUNK),
+  payload: z.object({
+    data: z.string(),
+  }),
+});
+
+/** 插件 -> 服务：执行完成（非流式或响应非 2xx 时带完整响应体，供服务端做 422 自愈等） */
+export const executeResultSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.EXECUTE_RESULT),
+  payload: z.object({
+    status: z.number(),
+    ok: z.boolean(),
+    statusText: z.string().optional(),
+    body: z.string().nullable().optional(),
+  }),
+});
+
+/** 插件 -> 服务：执行失败（网络错误、页面不可达等） */
+export const executeErrorSchema = baseMessageSchema.extend({
+  type: z.literal(MessageType.EXECUTE_ERROR),
+  payload: z.object({
+    error: z.string(),
+    code: z.string().optional(),
+  }),
+});
+
 /** 协议消息校验器（WebSocket 入口统一使用） */
 export const protocolMessageSchema = z.discriminatedUnion('type', [
   chatRequestSchema,
@@ -108,24 +198,31 @@ export const protocolMessageSchema = z.discriminatedUnion('type', [
   chatErrorSchema,
   statusSyncSchema,
   diagnosticMessageSchema,
+  captureRequestSchema,
+  executeRequestSchema,
+  credentialSyncSchema,
+  executeChunkSchema,
+  executeResultSchema,
+  executeErrorSchema,
 ]);
 
 /* ------------------------- OpenAI 兼容接口 schema ------------------------- */
 
 export const chatCompletionRequestSchema = z.object({
-  model: z.string().min(1),
-  messages: z.array(chatMessageSchema).min(1),
+  model: z.string(),
+  messages: z.array(chatMessageSchema),
+  tools: z.array(toolSchema).optional(),
+  tool_choice: z.union([
+    z.literal('auto'),
+    z.literal('none'),
+    z.object({ type: z.literal('function'), function: z.object({ name: z.string() }) }),
+  ]).optional(),
   temperature: z.number().min(0).max(2).optional(),
   top_p: z.number().min(0).max(1).optional(),
   max_tokens: z.number().int().positive().optional(),
   stream: z.boolean().optional(),
-  stream_options: z
-    .object({
-      include_usage: z.boolean().optional(),
-    })
-    .optional(),
-  /** 固定会话 ID（与请求头 x-deepseek-session 等价，两者皆可） */
   session_id: z.string().optional(),
+  stream_options: z.object({ include_usage: z.boolean().optional() }).optional(),
 });
 
 export type ChatCompletionRequest = z.infer<typeof chatCompletionRequestSchema>;
@@ -135,3 +232,5 @@ export type ChatCompletionRequest = z.infer<typeof chatCompletionRequestSchema>;
 export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
 export type ChatOptionsInput = z.infer<typeof chatOptionsSchema>;
 export type ProviderStatusMapInput = z.infer<typeof providerStatusMapSchema>;
+
+

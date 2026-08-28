@@ -14,6 +14,8 @@ export interface ConnectionOptions {
   autoReconnect: boolean;
   getStatus: () => ProviderStatusMap;
   onMessage: (msg: ProtocolMessage) => void;
+  /** 连接（或重连）建立后触发，用于向服务端重发本地已捕获凭证等 */
+  onOpen?: () => void;
 }
 
 /**
@@ -75,6 +77,8 @@ export class GatewayConnection {
         log.info('connected to server', url);
         backgroundState.setConnected(true);
         this.sendStatus();
+        // 连接（或重连）建立后，让 background 重发本地已捕获凭证给服务端
+        this.opts.onOpen?.();
       };
       ws.onmessage = (event) => {
         try {
