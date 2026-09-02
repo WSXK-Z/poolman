@@ -321,6 +321,49 @@ fn attach_answer_prefix(content: &str, ts: &str, session_id: &str) -> String {
     format!("回答时间: {}\n会话: {}\n{}", ts, session_id, content)
 }
 
+/// 估算文本对应的 token 数（DeepSeek 网页版不返回真实 usage，只能近似）：
+/// 中文等 CJK 字符按 1 字 ≈ 1 token；其它字符按每 4 字符 ≈ 1 token（向上取整）。
+fn estimate_tokens(text: &str) -> u32 {
+    let mut cjk: u32 = 0;
+    let mut other: u32 = 0;
+    for c in text.chars() {
+        if ('\u{4E00}'..='\u{9FFF}').contains(&c) || ('\u{3400}'..='\u{4DBF}').contains(&c) {
+            cjk += 1;
+        } else {
+            other += 1;
+        }
+    }
+    cjk + (other + 3) / 4
+}
+
+/// 组装 OpenAI 兼容的 usage JSON
+fn make_usage(prompt_tokens: u32, completion_tokens: u32) -> Value {
+    json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": prompt_tokens + completion_tokens,
+    })
+}
+
+/// 递归收集 Value 中的所有字符串叶子并拼接（估算模型生成 {THINK,RESPONSE} 的输出 token 用）
+fn value_text(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Array(a) => a.iter().map(value_text).collect(),
+        Value::Object(m) => m.values().map(value_text).collect(),
+        _ => String::new(),
+    }
+}
+
+/// 从流式转发增量（{"THINK":..} / {"RESPONSE":..} / {"tool_calls":..}）提取纯文本，用于累计输出 token。
+/// 网关自加前缀「回答时间/会话」也是实际输出的 token，故保留不剥。
+fn delta_text(d: &str) -> String {
+    if let Ok(v) = serde_json::from_str::<Value>(d) {
+        return value_text(&v);
+    }
+    d.to_string()
+}
+
 /* ------------------------------ SSE 解析器 ------------------------------ */
 
 struct Fragment {
@@ -897,11 +940,13 @@ impl DeepSeekService {
             .unwrap_or(crate::converter::vscode_copilot::PLATFORM);
         let converter = crate::converter::resolve(platform)
             .ok_or_else(|| anyhow!("未知转换平台: {}", platform))?;
-        let prompt = converter.convert(&crate::converter::ConvertContext {
+        let ctx = crate::converter::ConvertContext {
             messages,
             tools: tools.as_ref(),
             is_first_turn,
-        });
+        };
+        // 所有 Key 一律走平台转换器（按平台拆分重建提示词）
+        let prompt = converter.convert(&ctx);
 
         let pow_header = self.get_pow_header(&token, settings_token.as_deref()).await?;
 
@@ -1088,6 +1133,13 @@ impl DeepSeekService {
         let content = self
             .execute_with_retry(&built.url, built.headers.clone(), &built.body)
             .await?;
+        // DeepSeek 网页版不返回 usage → 估算：输入=发给平台的提示词，输出=模型生成的全部内容
+        let usage = {
+            let prompt_tokens = estimate_tokens(&built.prompt);
+            let completion_tokens = estimate_tokens(&value_text(&content));
+            info!(session = %session_id, prompt_tokens, completion_tokens, total = prompt_tokens + completion_tokens, "估算 token 用量（DeepSeek 网页版无真实 usage）");
+            Some(make_usage(prompt_tokens, completion_tokens))
+        };
         if built.is_new_session {
             let token = self.ensure_token().await?;
             let settings_token = self.credentials.get_settings_token(PROVIDER_ID);
@@ -1099,7 +1151,7 @@ impl DeepSeekService {
             return Ok(ChatResponsePayload {
                 content: String::new(),
                 model: PROVIDER_ID.to_string(),
-                usage: None,
+                usage: usage.clone(),
                 finished_reason: Some("tool_calls".to_string()),
                 tool_calls: Some(tool_calls),
             });
@@ -1113,7 +1165,7 @@ impl DeepSeekService {
         Ok(ChatResponsePayload {
             content: final_content,
             model: PROVIDER_ID.to_string(),
-            usage: None,
+            usage,
             finished_reason: Some("stop".to_string()),
             tool_calls: None,
         })
@@ -1143,6 +1195,8 @@ impl DeepSeekService {
         let has_tools = options
             .get("tools")
             .map_or(false, |t| t.as_array().map_or(false, |a| !a.is_empty()));
+        // 累计本次流式实际输出的文本，用于估算输出 token（DeepSeek 网页版无真实 usage）
+        let completion_buf = Arc::new(StdMutex::new(String::new()));
 
         let mut current_body = built.body.clone();
         let mut deltas_out: Vec<String> = Vec::new();
@@ -1159,15 +1213,17 @@ impl DeepSeekService {
             let on_chunk_cb: Box<dyn FnMut(String) + Send + Sync> = {
                 let driver_cb = driver.clone();
                 let on_chunk_cb = on_chunk.clone();
+                let completion_cb = Arc::clone(&completion_buf);
                 Box::new(move |data: String| {
                     let deltas = {
                         let mut d = driver_cb.lock().unwrap();
                         d.feed(&data)
                     };
-                    // 实时转发到客户端（THINK / 普通回答逐字流式）
+                    // 实时转发到客户端（THINK / 普通回答逐字流式），同时累计输出文本用于估算 token
                     if !deltas.is_empty() {
                         let mut oc = on_chunk_cb.lock().unwrap();
                         for d in deltas {
+                            completion_cb.lock().unwrap().push_str(&delta_text(&d));
                             oc(d);
                         }
                     }
@@ -1203,6 +1259,7 @@ impl DeepSeekService {
             if !final_deltas.is_empty() {
                 let mut oc = on_chunk.lock().unwrap();
                 for d in &final_deltas {
+                    completion_buf.lock().unwrap().push_str(&delta_text(d));
                     oc(d.clone());
                 }
             }
@@ -1235,11 +1292,17 @@ impl DeepSeekService {
             self.update_session_title(&token, settings_token.as_deref(), &session_id).await;
         }
 
+        // 估算 token：输入=发给平台的提示词，输出=本次流式实际输出的全部文本
+        let prompt_tokens = estimate_tokens(&built.prompt);
+        let completion_tokens = estimate_tokens(&completion_buf.lock().unwrap());
+        info!(session = %session_id, prompt_tokens, completion_tokens, total = prompt_tokens + completion_tokens, "估算 token 用量（DeepSeek 网页版无真实 usage）");
+        let usage = Some(make_usage(prompt_tokens, completion_tokens));
+
         if let Some(tc) = tool_calls {
             return Ok(ChatResponsePayload {
                 content: String::new(),
                 model: PROVIDER_ID.to_string(),
-                usage: None,
+                usage,
                 finished_reason: Some("tool_calls".to_string()),
                 tool_calls: Some(tc),
             });
@@ -1247,7 +1310,7 @@ impl DeepSeekService {
         Ok(ChatResponsePayload {
             content: String::new(),
             model: PROVIDER_ID.to_string(),
-            usage: None,
+            usage,
             finished_reason: Some("stop".to_string()),
             tool_calls: None,
         })
@@ -1959,6 +2022,37 @@ mod tests {
         // 无有效会话 id → None
         assert!(super::extract_session_id("这是一个普通回答").is_none());
         assert!(super::extract_session_id("开启新会话吧").is_none());
+    }
+
+    /// token 估算：中文 1 字≈1、其它≈4 字符/1、向上取整
+    #[test]
+    fn estimate_tokens_basic() {
+        assert_eq!(super::estimate_tokens("你好世界"), 4); // 4 个中文 → 4
+        assert_eq!(super::estimate_tokens("hello"), 2); // 5 ascii → ceil(5/4)=2
+        assert_eq!(super::estimate_tokens("ab"), 1); // 2 ascii → ceil(2/4)=1
+        assert_eq!(super::estimate_tokens(""), 0);
+        assert!(super::estimate_tokens("你好 hello 世界") > 0);
+    }
+
+    /// 增量文本提取：{"THINK":..} / {"RESPONSE":..} 拼接（用于累计输出 token）
+    #[test]
+    fn delta_text_collects_payload_strings() {
+        assert_eq!(super::delta_text(r#"{"RESPONSE":"你好"}"#), "你好");
+        let s = super::delta_text(r#"{"THINK":"思考","RESPONSE":"回答"}"#);
+        assert!(s.contains("思考") && s.contains("回答"), "应包含所有字符串叶子, 实际: {}", s);
+        // 非法 JSON → 原样返回
+        assert_eq!(super::delta_text("not json"), "not json");
+    }
+
+    /// 对象值收集：{THINK,RESPONSE} → 全部文本（估算输出 token 含思考）；数字不是叶子
+    #[test]
+    fn value_text_joins_leaves() {
+        let v = serde_json::json!({ "THINK": "思考", "RESPONSE": "回答", "n": 1 });
+        let s = super::value_text(&v);
+        assert!(s.contains("思考") && s.contains("回答"), "实际: {}", s);
+        assert!(!s.contains('1'), "数字不应计入文本: {}", s);
+        assert_eq!(super::value_text(&serde_json::json!("plain")), "plain");
+        assert_eq!(super::value_text(&serde_json::json!(42)), "");
     }
 
     /// 流式实时性：THINK/RESPONSE 逐块输出，不是等整个流结束一次性给

@@ -200,10 +200,11 @@ pub async fn chat_completions_handler(
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     // 原始消息与转换后提示词在 deepseek.rs 转换处一并保存（同一文件）
-    // API Key 鉴权 → (key, 绑定平台)：key 用于会话归属，平台决定使用哪个转换器
-    let (api_key, platform) = match resolve_api_key_platform(&headers, &state.api_keys).await {
-        Ok(p) => p,
-        Err(status) => {
+    // API Key 鉴权 → (key, 绑定平台)：key 用于会话归属，平台决定转换器
+    let (api_key, platform) =
+        match resolve_api_key_platform(&headers, &state.api_keys).await {
+            Ok(p) => p,
+            Err(status) => {
             return (
                 status,
                 AxumJson(serde_json::json!({

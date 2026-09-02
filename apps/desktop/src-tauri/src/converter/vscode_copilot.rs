@@ -128,7 +128,11 @@ fn render_tools(tools: &Value) -> String {
             let required: Vec<String> = params
                 .get("required")
                 .and_then(|r| r.as_array())
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default();
             let req_str = if required.is_empty() {
                 "（全部可选）".to_string()
@@ -180,15 +184,8 @@ fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
             for (tag, body) in sections {
                 match tag.as_deref() {
                     Some("userRequest") => question = Some(body),
-                    Some(t) => parts.push(format!(
-                        "以下是 {} 内容：\n{}",
-                        tag_cn(t),
-                        body
-                    )),
-                    None => parts.push(format!(
-                        "以下是用户的环境信息：\n{}",
-                        body
-                    )),
+                    Some(t) => parts.push(format!("以下是 {} 内容：\n{}", tag_cn(t), body)),
+                    None => parts.push(format!("以下是用户的环境信息：\n{}", body)),
                 }
             }
         }
@@ -223,38 +220,37 @@ impl Converter for VscodeCopilotConverter {
     /// 工具转换：工具定义 → 平台工具「记住」段
     fn convert_tools(&self, tools: &Value) -> String {
         let instruction = r#"
-        1. 不管用户的问题是什么，你都得优先考虑调用工具来完成任务
-        2. 如果用户问题涉及读写文件/执行命令/搜索/检索等操作，你必须调用工具来完成任务；只有纯问答才直接回答。
-        3. 你可以在一次回答中调用多个工具，但必须一个工具对应一个完整的 tool_call 块。
-        4. 调用工具时，必须把每个工具输出成一个独立的 <tool_call> ... </tool_call> 围栏 YAML 块，且这是【唯一合法格式】，格式如下：
-<tool_call>
-name: <工具名>
-arguments:
-  <参数名>: <值>
-</tool_call>
-        5. 格式硬性要求，违反任何一条都会导致你的工具调用无法被解析、任务失败：
+        1. 你可以在一次回答中调用多个工具，但必须一个工具对应一个完整的 tool_call 块。
+        2. 调用工具时，必须把每个工具输出成一个独立的 <tool_call> ... </tool_call> 围栏 YAML 块，且这是【唯一合法格式】，格式如下：
+            <tool_call>
+            name: <工具名>
+            arguments:
+              <参数名>: <值>
+            </tool_call>
+        3. 格式硬性要求，违反任何一条都会导致你的工具调用无法被解析、任务失败：
            - 每个块必须以开围栏 <tool_call> 开始、以闭围栏 </tool_call> 结束，开闭标签必须成对；不能漏下划线、不能改写成 <toolcall> 或其他任何变体；
            - 块内第一行必须是 name: <工具名>，第二行必须是 arguments:，所有参数必须放在 arguments 键下面；禁止把工具名裸写在首行、禁止省略 name 或 arguments 键；
            - 每个工具块独占一个完整的开/闭围栏；多个工具块之间用换行分隔；
            - 多行参数（代码内容等）用块标量 |- 原样直写，不要转义引号/反斜杠/换行；参数里出现三反引号 ```（如 markdown 代码块）不影响围栏，正常书写即可；
            - 路径用正斜杠或原样反斜杠均可；只能调用已定义工具；编辑类工具先读取文件最新内容再改。
-        6. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。"#;
+        4. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。"#;
         format!(
-            "以下是你可以调用的工具：\n{}\n{}",
-            render_tools(tools),
-            instruction
+            "\n{}\n以下是你可以调用的工具：\n{}",
+            //render_tools(tools),
+            instruction,
+            tools,
         )
     }
 
     /// 追问轮次：再次强调工具调用格式（简短提醒，不重复完整工具列表）
     fn tool_format_reminder(&self) -> String {
         r#"再次提醒：只要需要调用工具，就必须严格按下面的格式输出（唯一合法格式）：
-<tool_call>
-name: <工具名>
-arguments:
-  <参数名>: <值>
-</tool_call>
-要求：开围栏 <tool_call> 与闭围栏 </tool_call> 必须成对，不能漏下划线、不能改写成 <toolcall> 或其他变体；第一行必须 name:、第二行必须 arguments:，参数放在 arguments 键下；不要省略 name/arguments 键、不要把工具名裸写在首行；每个工具块独占完整开/闭围栏，多个工具块用换行分隔；多行参数用 |- 块标量原样直写。调用工具时只输出 <tool_call> 块，不要夹带任何普通文本；普通文本与工具调用不可同时出现。"#
+            <tool_call>
+            name: <工具名>
+            arguments:
+              <参数名>: <值>
+            </tool_call>
+        要求：开围栏 <tool_call> 与闭围栏 </tool_call> 必须成对，不能漏下划线、不能改写成 <toolcall> 或其他变体；第一行必须 name:、第二行必须 arguments:，参数放在 arguments 键下；不要省略 name/arguments 键、不要把工具名裸写在首行；每个工具块独占完整开/闭围栏，多个工具块用换行分隔；多行参数用 |- 块标量原样直写。调用工具时只输出 <tool_call> 块，不要夹带任何普通文本；普通文本与工具调用不可同时出现。"#
             .to_string()
     }
 
@@ -272,10 +268,7 @@ arguments:
                                 tag_cn(&t),
                                 body
                             )),
-                            None => parts.insert(0, format!(
-                                "以下是你必须牢记的身份：\n{}",
-                                body
-                            )),
+                            None => parts.insert(0, format!("以下是你必须牢记的身份：\n{}", body)),
                         }
                     }
                 }
@@ -302,10 +295,7 @@ arguments:
                 let sections = split_tagged_sections(c);
                 if sections.is_empty() {
                     // 无标签的整条 user：作为环境规则段
-                    parts.push(format!(
-                        "以下是用户的环境信息：\n{}",
-                        c
-                    ));
+                    parts.push(format!("以下是用户的环境信息：\n{}", c));
                     continue;
                 }
                 for (tag, body) in sections {
@@ -316,15 +306,8 @@ arguments:
                                 question = Some(body);
                             }
                         }
-                        Some(t) => parts.push(format!(
-                            "以下是 {} 内容：\n{}",
-                            tag_cn(t),
-                            body
-                        )),
-                        None => parts.push(format!(
-                            "以下是用户的环境信息：\n{}",
-                            body
-                        )),
+                        Some(t) => parts.push(format!("以下是 {} 内容：\n{}", tag_cn(t), body)),
+                        None => parts.push(format!("以下是用户的环境信息：\n{}", body)),
                     }
                 }
             }
@@ -399,13 +382,25 @@ mod tests {
                  <userRequest>请帮我写个函数</userRequest>";
         let out = split_tagged_sections(s);
         assert_eq!(out.len(), 7);
-        assert_eq!(out[0], (Some("environment_info".into()), "Windows 系统".into()));
+        assert_eq!(
+            out[0],
+            (Some("environment_info".into()), "Windows 系统".into())
+        );
         assert_eq!(out[1], (Some("workspace_info".into()), "工作区结构".into()));
         assert_eq!(out[2], (Some("userMemory".into()), "用户记忆".into()));
         assert_eq!(out[3], (Some("repoMemory".into()), "仓库记忆".into()));
-        assert_eq!(out[4], (Some("editorContext".into()), "编辑器上下文".into()));
-        assert_eq!(out[5], (Some("reminderInstructions".into()), "提醒指令".into()));
-        assert_eq!(out[6], (Some("userRequest".into()), "请帮我写个函数".into()));
+        assert_eq!(
+            out[4],
+            (Some("editorContext".into()), "编辑器上下文".into())
+        );
+        assert_eq!(
+            out[5],
+            (Some("reminderInstructions".into()), "提醒指令".into())
+        );
+        assert_eq!(
+            out[6],
+            (Some("userRequest".into()), "请帮我写个函数".into())
+        );
     }
 
     #[test]
@@ -419,7 +414,10 @@ mod tests {
         assert_eq!(out.len(), 4);
         assert_eq!(out[0], (None, "System: You are an expert.".into()));
         assert_eq!(out[1], (Some("instructions".into()), "指令内容".into()));
-        assert_eq!(out[2], (Some("toolUseInstructions".into()), "工具使用".into()));
+        assert_eq!(
+            out[2],
+            (Some("toolUseInstructions".into()), "工具使用".into())
+        );
         assert_eq!(out[3], (Some("skills".into()), "技能".into()));
     }
 
