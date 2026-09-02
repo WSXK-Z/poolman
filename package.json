@@ -15,7 +15,6 @@
     "lint": "pnpm -r run lint",
     "format": "prettier --write .",
     "dev:extension": "pnpm --filter @ai-gateway/extension dev",
-    "dev:server": "pnpm --filter @ai-gateway/server dev",
     "build:all": "node scripts/build-all.js",
     "package": "node scripts/package.js"
   },

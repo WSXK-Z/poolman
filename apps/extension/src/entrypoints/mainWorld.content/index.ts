@@ -216,7 +216,8 @@ export default defineContentScript({
           method: opts.method || 'POST',
           // 服务端已过滤 forbidden headers（host/origin/cookie 等），只保留 x-* + Content-Type/Authorization
           headers: opts.headers,
-          body: opts.body ?? undefined,
+          // 空 body 转 undefined：GET/HEAD 请求不能携带 body（否则浏览器报 "Request with GET/HEAD method cannot have body"）
+          body: opts.body ? opts.body : undefined,
           // 同源请求默认带 cookie；DeepSeek 鉴权走 Authorization 头，cookie 无鉴权不影响
           credentials: 'same-origin',
           signal: controller.signal,
