@@ -546,6 +546,8 @@ struct BuiltRequest {
     headers: Vec<(String, String)>,
     body: Value,
     is_new_session: bool,
+    /// 是否首次对话（没有 assistant 消息）：仅在首次回答加「回答时间 + 会话」前缀
+    is_first_turn: bool,
     chat_session_id: String,
     /// 转换后的提示词（实际发给网页平台的对话）
     prompt: String,
@@ -936,6 +938,7 @@ impl DeepSeekService {
             headers,
             body,
             is_new_session,
+            is_first_turn,
             chat_session_id,
             prompt,
         })
@@ -1101,7 +1104,12 @@ impl DeepSeekService {
                 tool_calls: Some(tool_calls),
             });
         }
-        let final_content = attach_answer_prefix(&text, &ts, &session_id);
+        // 只在首次回答添加「回答时间 + 会话」前缀；追问通过反向查找历史里的前缀定位会话
+        let final_content = if built.is_first_turn {
+            attach_answer_prefix(&text, &ts, &session_id)
+        } else {
+            text
+        };
         Ok(ChatResponsePayload {
             content: final_content,
             model: PROVIDER_ID.to_string(),
@@ -1126,7 +1134,12 @@ impl DeepSeekService {
         self.record_session(&built, &messages, &options).await;
         let ts = format_ts_ms();
         let session_id = built.chat_session_id.clone();
-        let prefix = format!("回答时间: {}\n会话: {}\n", ts, session_id);
+        // 只在首次回答带前缀；追问不再带（通过反向查找历史前缀定位会话）
+        let prefix = if built.is_first_turn {
+            format!("回答时间: {}\n会话: {}\n", ts, session_id)
+        } else {
+            String::new()
+        };
         let has_tools = options
             .get("tools")
             .map_or(false, |t| t.as_array().map_or(false, |a| !a.is_empty()));

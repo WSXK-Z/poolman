@@ -10,7 +10,9 @@
 外部调用方 (OpenAI 客户端 / Cursor / Chatbox)
         │  HTTP / SSE  (localhost:3000)
         ▼
-  本地服务 (Hono + @hono/node-server)   /v1/chat/completions · /v1/models · /health
+  Tauri 桌面应用 (Vue3 + NaiveUI + Rust)
+   - 提供 OpenAI 兼容 HTTP 服务（基于 Rust 的 axum 或类似）
+   - 通过 WebSocket 与 Chrome 插件通信
         │  WebSocket  (localhost:3001)
         ▼
   Chrome 插件 (WXT + Vue3 + NaiveUI)
@@ -24,30 +26,30 @@
 ## 目录
 
 ```
-apps/extension   Chrome 插件（WXT + Vue3 + NaiveUI）
-apps/server      本地 OpenAI 兼容服务（Hono + ws）
-packages/shared  共享类型与 Zod 校验（通信协议）
-packages/utils   通用工具（日志/加密/重试）
-scripts          辅助脚本
+apps/desktop      Tauri 桌面应用（Vue3 + NaiveUI + Rust）
+apps/extension    Chrome 插件（WXT + Vue3 + NaiveUI）
+packages/shared   共享类型与 Zod 校验（通信协议）
+packages/utils    通用工具（日志/加密/重试）
+scripts           辅助脚本
 ```
 
 ## 快速开始
 
-环境要求：Node.js 18+、pnpm 8+、Chrome
+环境要求：Node.js 18+、pnpm 8+、Chrome、Rust（用于桌面应用）
 
 ```bash
 # 1. 安装依赖
 pnpm install
 
-# 2. 同时启动插件与本地服务
+# 2. 开发模式：同时启动桌面应用和插件
 pnpm dev
 # 或分别启动
-pnpm --filter @ai-gateway/server dev
+pnpm --filter @ai-gateway/desktop dev
 pnpm --filter @ai-gateway/extension dev
 ```
 
-- **插件**：在 Chrome 扩展程序页（`chrome://extensions`）开启“开发者模式”，加载已解压扩展，选择 `apps/extension/.output/chrome-mv3`（开发模式）或 `apps/extension/dist`（构建后）。
-- **服务**：API 监听 `http://127.0.0.1:3000`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。
+- **桌面应用**：启动后提供 HTTP 服务，默认监听 `http://127.0.0.1:3000`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。同时打开 GUI 窗口用于状态查看和配置。
+- **插件**：在 Chrome 扩展程序页（`chrome://extensions`）开启“开发者模式”，加载已解压扩展，选择 `apps/extension/.output/chrome-mv3`（开发模式）或 `apps/extension/dist`（构建后）。插件会自动连接桌面应用的 WebSocket。
 
 ## 调用示例
 
@@ -87,19 +89,22 @@ curl -N http://127.0.0.1:3000/v1/chat/completions \
 
 ```bash
 pnpm build
-cd apps/server
-pm2 start ecosystem.config.js   # 或 pm2 start apps/server/ecosystem.config.js
+# 桌面应用构建为各平台可执行文件（参见 apps/desktop/src-tauri/tauri.conf.json）
+cd apps/desktop
+pnpm tauri build
 ```
+
+构建产物位于 `apps/desktop/src-tauri/target/release`。
 
 ## 常用命令
 
 | 命令 | 说明 |
 | --- | --- |
-| `pnpm dev` | 并行启动插件与服务开发模式（pnpm 递归并行） |
+| `pnpm dev` | 并行启动桌面应用与插件开发模式（pnpm 递归并行） |
 | `pnpm build` | 全量构建（按依赖顺序，pnpm 递归） |
 | `pnpm typecheck` | 先构建共享包，再做全量类型检查 |
 | `pnpm lint` | ESLint 检查 |
-| `pnpm build:all` | 按依赖顺序构建（shared → utils → server → extension） |
+| `pnpm build:all` | 按依赖顺序构建（shared → utils → desktop → extension） |
 | `pnpm package` | 打包发布产物 |
 
 ## 风险说明

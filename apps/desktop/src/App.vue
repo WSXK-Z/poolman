@@ -11,6 +11,7 @@ import {
   dateZhCN,
 } from "naive-ui";
 import ConfigView from "./views/ConfigView.vue";
+import HelpView from "./views/HelpView.vue";
 import KeysView from "./views/KeysView.vue";
 import SessionView from "./views/SessionView.vue";
 import StatusView from "./views/StatusView.vue";
@@ -21,6 +22,7 @@ const menuOptions = [
   { label: "会话", key: "sessions" },
   { label: "状态", key: "status" },
   { label: "配置", key: "config" },
+  { label: "帮助", key: "help" },
 ];
 </script>
 
@@ -36,6 +38,7 @@ const menuOptions = [
         </n-layout-sider>
         <n-layout-content class="page">
           <ConfigView v-if="activeMenu === 'config'" />
+          <HelpView v-else-if="activeMenu === 'help'" />
           <KeysView v-else-if="activeMenu === 'keys'" />
           <SessionView v-else-if="activeMenu === 'sessions'" />
           <StatusView v-else />
