@@ -29,6 +29,13 @@ const AUX_TIMEOUT: u64 = 10_000;
 const TOOL_FENCE_PREFIXES: [&str; 2] = ["<tool_call", "<toolcall"];
 /// 闭围栏：</tool_call>（与开围栏对称）
 const TOOL_FENCE_CLOSE: &str = "</tool_call>";
+/// invoke 标签名（工具调用的入口标签）
+const MARKER_INVOKE: &str = "invoke";
+/// invoke 内部参数字段标签名
+const PARAM_TAG_NAME: &str = "parameter";
+/// 可独立标识「工具调用开始」的标签名：DSML 外层标记标签（真实输出里外层名即 calls）、
+/// 工具标签与自有围栏变体（parameter 只是内部字段，不算起始标记）。
+const TOOL_TAG_NAMES: [&str; 5] = ["tool_call", "toolcall", "tool_calls", "calls", MARKER_INVOKE];
 const SEND_INTERVAL_MS: u64 = 1_000;
 
 /* ------------------------------ 辅助函数 ------------------------------ */
@@ -131,6 +138,271 @@ fn parse_biz_error(body: &str) -> Option<(i64, String)> {
     None
 }
 
+/// 标签前缀后是否为合法边界（'>' 或空白）；空串表示流式增量尚未到达后续字符。
+/// 用于区分 <tool_calls>（前缀后紧随 's'，非边界）与项目自有 <tool_call>。
+fn is_tag_boundary(after: &str) -> bool {
+    match after.chars().next() {
+        None => true,
+        Some(c) => c == '>' || c.is_whitespace(),
+    }
+}
+
+/// 扫描到的标签（'<' … '>'）
+struct Tag<'a> {
+    /// '<' 的下标
+    start: usize,
+    /// '>' 之后的下标
+    end: usize,
+    /// 是否闭合标签（'</' 开头）
+    closing: bool,
+    /// 标记名（tool_call/toolcall/tool_calls/invoke/parameter）；非标记标签为 None
+    marker: Option<&'static str>,
+    /// '<' 与 '>' 之间的原文（含属性）
+    inner: &'a str,
+}
+
+/// 从 `from` 起扫描下一个标签；没有完整标签（缺 '>'）时返回 None
+fn next_tag(text: &str, from: usize) -> Option<Tag<'_>> {
+    if from >= text.len() {
+        return None;
+    }
+    let lt = text[from..].find('<')? + from;
+    let gt = lt + text[lt..].find('>')?;
+    let inner = &text[lt + 1..gt];
+    Some(Tag {
+        start: lt,
+        end: gt + 1,
+        closing: inner.trim_start().starts_with('/'),
+        marker: marker_name(inner),
+        inner,
+    })
+}
+
+/// 收集文本里所有 [A-Za-z0-9_]+ 连续段
+fn ident_runs(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in s.char_indices() {
+        let is_ident = c.is_ascii_alphanumeric() || c == '_';
+        match (is_ident, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s0)) => {
+                out.push(&s[s0..i]);
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    if let Some(s0) = start {
+        out.push(&s[s0..]);
+    }
+    out
+}
+
+/// 识别标签原文里的标记名：不依赖具体标记前缀，直接看标识符段，
+/// 使 <invoke name="x">、<|DSML| invoke>、<||DSML|| invoke>、全角竖线 <｜｜DSML｜｜invoke> 都能识别；
+/// 非标记标签（html/div/json 等）返回 None。
+fn marker_name(inner: &str) -> Option<&'static str> {
+    for token in inner.split_whitespace() {
+        // 属性 token（含 '='，如 name="invoke"）只看等号前的部分，避免参数值恰好是标签名时误判
+        let head = match token.find('=') {
+            Some(i) => &token[..i],
+            None => token,
+        };
+        // 逐个标识符段判断：跳过标记符里的名字（<||DSML|| invoke> 里的 "DSML"），命中标记名即返回
+        for ident in ident_runs(head) {
+            if let Some(n) = TOOL_TAG_NAMES.iter().find(|n| **n == ident) {
+                return Some(*n);
+            }
+            if ident == PARAM_TAG_NAME {
+                return Some(PARAM_TAG_NAME);
+            }
+        }
+    }
+    None
+}
+
+/// 提取标签属性值（键名须为独立单词；支持 " 与 ' 引号）
+fn extract_attr(attr: &str, key: &str) -> Option<String> {
+    for quote in ['"', '\''] {
+        let needle = format!("{}={}", key, quote);
+        let mut from = 0;
+        while let Some(rel) = attr[from..].find(&needle) {
+            let pos = from + rel;
+            let prev = attr[..pos].chars().next_back();
+            if prev.map_or(true, |c| !(c.is_alphanumeric() || c == '_' || c == '-')) {
+                let rest = &attr[pos + needle.len()..];
+                if let Some(end) = rest.find(quote) {
+                    return Some(rest[..end].to_string());
+                }
+            }
+            from = pos + needle.len();
+        }
+    }
+    None
+}
+
+/// 找 `from` 之后第一个闭合的标记标签（如 </invoke>、</|DSML| parameter>），返回其 '<' 下标
+fn find_close_marker(text: &str, from: usize, marker: &str) -> Option<usize> {
+    let mut i = from;
+    while i < text.len() {
+        let tag = next_tag(text, i)?;
+        if tag.closing && tag.marker == Some(marker) {
+            return Some(tag.start);
+        }
+        // 只前进一个字节：值里出现 '<'（如代码 "if (a < b)"）会被误当标签，必须继续找真正的闭合标签
+        i = tag.start + 1;
+    }
+    None
+}
+
+/// 是否出现工具调用开标签的【完整】形态（<tool_call> / <tool_calls> / <invoke name="X"> /
+/// <|DSML| invoke name="X"> 等）。只认完整标签；被增量拆分的前缀由 tool_fence_remaining 处理。
+fn contains_tool_open_tag(buf: &str) -> bool {
+    let mut i = 0;
+    while let Some(tag) = next_tag(buf, i) {
+        // 只认标记标签（参数标签不算起始标记）；普通标签（json/div 等）marker 为 None
+        if !tag.closing && tag.marker.is_some() && tag.marker != Some(PARAM_TAG_NAME) {
+            return true;
+        }
+        i = tag.end;
+    }
+    false
+}
+
+/// 尾部（从最后一个 '<' 开始）是否可能是工具调用开标签的未完成前缀。
+/// 覆盖 <tool_call / <tool_calls / <invoke 及 DSML 标记形态（半角 | 与全角 ｜ 均支持）。
+/// 返回 Some 表示还需继续缓冲；None 表示不是（含标签已闭合、交由 looks_like_tool_call 判定的情况）。
+fn xml_fence_remaining(tail: &str) -> Option<usize> {
+    if !tail.starts_with('<') || tail.contains('>') {
+        return None;
+    }
+    let body = &tail[1..];
+    match body.chars().next() {
+        // 只有 '<'，等后续字符
+        None => return Some(1),
+        // 普通文本里的 '<'（如 "a < b"）不算标签前缀
+        Some(c) if !(c.is_ascii_alphabetic() || c == '/' || c == '|' || c == '\u{FF5C}') => {
+            return None
+        }
+        _ => {}
+    }
+    // 剥掉标记前缀（<|DSML| / </|DSML| / <||DSML|| / <｜｜DSML｜｜ 等）：取最后一个标记符后的部分
+    let after_prefix = match body.rfind(|c: char| c == '|' || c == '\u{FF5C}') {
+        Some(i) => {
+            // 标记符可能是多字节字符（全角竖线占 3 字节）→ 按字符长度跳过，避免切断 UTF-8
+            let mark_len = body[i..].chars().next().map_or(1, |c| c.len_utf8());
+            &body[i + mark_len..]
+        }
+        None => body,
+    };
+    let word: String = after_prefix
+        .trim_start_matches('/')
+        .chars()
+        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+        .collect();
+    if word.is_empty() {
+        // 标记前缀还没输完
+        return Some(1);
+    }
+    if TOOL_TAG_NAMES.iter().any(|n| n.starts_with(word.as_str())) {
+        return Some(1);
+    }
+    None
+}
+
+/// 工具名校验：非空且不含空白/尖括号（挡住畸形标签，避免产生假工具调用）
+fn is_valid_tool_name(name: &str) -> bool {
+    !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c == '<' || c == '>')
+}
+
+/// XML/DSML 参数值：去掉独占多行布局引入的首尾换行；
+/// force_string（对应 string="true"）或多行值原样保留字符串；其余单行值按标量自动转类型
+/// （整数/小数/布尔/null）。
+fn xml_param_value(raw: &str, force_string: bool) -> Value {
+    let mut v = raw;
+    if let Some(r) = v.strip_prefix("\r\n").or_else(|| v.strip_prefix('\n')) {
+        v = r;
+    }
+    if let Some(r) = v.strip_suffix("\r\n").or_else(|| v.strip_suffix('\n')) {
+        v = r;
+    }
+    if force_string || v.contains('\n') {
+        return Value::String(v.to_string());
+    }
+    let t = v.trim();
+    if t.is_empty() {
+        return Value::String(String::new());
+    }
+    if let Ok(i) = t.parse::<i64>() {
+        return json!(i);
+    }
+    if let Ok(f) = t.parse::<f64>() {
+        if let Some(n) = serde_json::Number::from_f64(f) {
+            return Value::Number(n);
+        }
+    }
+    if t.eq_ignore_ascii_case("true") {
+        return json!(true);
+    }
+    if t.eq_ignore_ascii_case("false") {
+        return json!(false);
+    }
+    if t == "null" {
+        return Value::Null;
+    }
+    Value::String(t.to_string())
+}
+
+/// 解析 invoke 体：<parameter name="k" string="true">v</parameter>（含 <|DSML| parameter> 变体）→ 参数对象
+fn parse_xml_parameters(body: &str) -> Value {
+    let mut map = serde_json::Map::new();
+    let mut i = 0;
+    while i < body.len() {
+        let Some(tag) = next_tag(body, i) else { break };
+        if tag.closing || tag.marker != Some(PARAM_TAG_NAME) {
+            i = tag.start + 1;
+            continue;
+        }
+        let Some(key) = extract_attr(tag.inner, "name") else {
+            i = tag.start + 1;
+            continue;
+        };
+        let value_end = find_close_marker(body, tag.end, PARAM_TAG_NAME).unwrap_or(body.len());
+        let force_string = extract_attr(tag.inner, "string")
+            .map_or(false, |v| v.trim().eq_ignore_ascii_case("true"));
+        map.insert(key, xml_param_value(&body[tag.end..value_end], force_string));
+        i = value_end + 1;
+    }
+    Value::Object(map)
+}
+
+/// 解析 XML/DSML 工具调用：
+///   <invoke name="X"><parameter name="k">v</parameter></invoke>
+///   <|DSML| tool_calls><|DSML| invoke name="X"><|DSML| parameter name="k" string="true">v</|DSML| parameter></|DSML| invoke></|DSML| tool_calls>
+/// （外层 tool_calls 可缺）。返回 (工具名, 参数对象) 列表。
+fn parse_xml_tool_call_blocks(text: &str) -> Vec<(String, Value)> {
+    let mut out: Vec<(String, Value)> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        let Some(tag) = next_tag(text, i) else { break };
+        if tag.closing || tag.marker != Some(MARKER_INVOKE) {
+            i = tag.start + 1;
+            continue;
+        }
+        let Some(name) = extract_attr(tag.inner, "name") else {
+            i = tag.start + 1;
+            continue;
+        };
+        let body_end = find_close_marker(text, tag.end, MARKER_INVOKE).unwrap_or(text.len());
+        if is_valid_tool_name(&name) {
+            out.push((name, parse_xml_parameters(&text[tag.end..body_end])));
+        }
+        i = body_end + 1;
+    }
+    out
+}
+
 /// 解析单个工具块（纯 YAML）：<tool_call> 围栏内/整体均为 YAML 块标量格式。
 /// 返回解析出的对象或数组；必须是工具形状（含 name/function）才接受。
 fn parse_tool_block_yaml(raw: &str) -> Option<Value> {
@@ -182,6 +454,9 @@ fn parse_tool_call_blocks(text: &str) -> Option<Vec<(String, Value)>> {
         }
     };
 
+    // 0) XML 工具调用格式（<tool_calls>/<invoke>/<parameter>）：与自有围栏格式并存
+    results.extend(parse_xml_tool_call_blocks(text));
+
     // 1) 围栏块（<tool_call> ... </tool_call>；兼容 <tool_call name="X"> 属性形式；
     //    支持漏下划线变体 <toolcall>；支持多个工具块）
     let mut rest = text;
@@ -222,6 +497,11 @@ fn find_open_fence(text: &str) -> Option<(usize, usize, Option<String>)> {
         while let Some(rel) = text[from..].find(prefix) {
             let pos = from + rel;
             let after = &text[pos + prefix.len()..];
+            // 前缀后必须是标签边界：排除 <tool_calls>（XML 工具调用格式，前缀后紧随 's'）等其它标签
+            if !is_tag_boundary(after) {
+                from = pos + prefix.len();
+                continue;
+            }
             if let Some(gt) = after.find('>') {
                 let attr = &after[..gt];
                 let end = pos + prefix.len() + gt + 1;
@@ -237,20 +517,9 @@ fn find_open_fence(text: &str) -> Option<(usize, usize, Option<String>)> {
     best
 }
 
-/// 从开围栏属性串（如 ` name="Read"`）提取 name 值（支持 " 与 ' 引号）
+/// 从标签属性串提取 name 值（自有围栏 <tool_call name="Read"> 与 XML 格式共用）
 fn extract_name_attr(attr: &str) -> Option<String> {
-    for (key, quote) in [("name=\"", '"'), ("name='", '\'')] {
-        if let Some(i) = attr.find(key) {
-            let rest = &attr[i + key.len()..];
-            if let Some(j) = rest.find(quote) {
-                let v = rest[..j].trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
+    extract_attr(attr, "name")
 }
 
 /// 属性形式下解析参数 YAML：兼容裸参数（filePath: a）与带 arguments/parameters/args 包装；
@@ -1510,11 +1779,15 @@ impl StreamProcessor {
 }
 
 /// 流式嗅探：判断累积内容中是否已出现【完整】工具调用标识（任意位置，普通文本后可夹杂）。
-/// 覆盖：<tool_call> 开围栏（含属性形式 <tool_call name="X">，可在普通文本之后出现）、YAML name: 开头（行首）。
-/// 只用于"确定是工具"→ 切 Tool 模式；不完整的前缀由 tool_fence_remaining 处理。
+/// 覆盖：<tool_call> 开围栏（含属性形式 <tool_call name="X">）、XML 格式 <tool_calls> / <invoke name="X">、
+/// YAML name: 开头（行首）。只用于"确定是工具"→ 切 Tool 模式；不完整的前缀由 tool_fence_remaining 处理。
 fn looks_like_tool_call(buf: &str) -> bool {
     // <tool_call> / <toolcall> / <tool_call name="X"> 开围栏：普通文本夹杂时也能命中（不只开头）
     if contains_open_fence(buf) {
+        return true;
+    }
+    // XML/DSML 工具调用格式：完整开标签（<invoke name="X">、<|DSML| invoke name="X"> 等）
+    if contains_tool_open_tag(buf) {
         return true;
     }
     // YAML name: 开头（行首，前面的普通文本行不受影响）
@@ -1542,8 +1815,9 @@ fn contains_open_fence(buf: &str) -> bool {
     false
 }
 
-/// 判断累积内容【尾部】是否处于 <tool_call> 开围栏前缀阶段，并返回还差多少字符补齐完整开围栏（含 '>'）。
-/// 例如 `<`、`<t`、`<to`、`<too`、`<tool_`、`<tool_c`、`<tool_call` 等，都可能继续拼成完整开围栏。
+/// 判断累积内容【尾部】是否处于开围栏前缀阶段（自有 <tool_call> 或 XML 格式 <tool_calls>/<invoke>），
+/// 并返回还差多少字符补齐完整开围栏（含 '>'）。
+/// 例如 `<`、`<t`、`<to`、`<too`、`<tool_`、`<tool_c`、`<tool_call`、`<tool_calls`、`<invo` 等，都可能继续拼成完整开围栏。
 /// 返回 None 表示不是开围栏前缀（普通文本或其它）。
 /// 开围栏最小形态 = 前缀 + '>'，据此动态计算剩余待匹配长度。
 fn tool_fence_remaining(buf: &str) -> Option<usize> {
@@ -1575,7 +1849,8 @@ fn tool_fence_remaining(buf: &str) -> Option<usize> {
             // after 以 '>' 开头 → 完整开围栏，由 looks_like_tool_call 判定
         }
     }
-    None
+    // XML/DSML 工具调用格式的开标签（<tool_calls / <invoke / <|DSML| invoke 等）前缀：同样需缓冲
+    xml_fence_remaining(tail)
 }
 
 /* ------------------------------ 其他辅助 ------------------------------ */
@@ -2089,6 +2364,428 @@ mod tests {
             .collect();
         assert!(resp3.contains("回答二"), "后续增量应只含新内容, 实际: {:?}", d3);
         assert!(!resp3.contains("回答一"), "不应重发已输出的内容: {:?}", d3);
+    }
+
+    /// XML 格式工具调用：<tool_calls><invoke name="X"><parameter name="k">v</parameter></invoke></tool_calls>
+    #[test]
+    fn parse_xml_tool_calls_basic() {
+        let text = "<tool_calls>\n<invoke name=\"file_search\">\n<parameter name=\"query\">**/*.csproj</parameter>\n<parameter name=\"maxResults\">50</parameter>\n</invoke>\n</tool_calls>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(calls[0].1["query"], "**/*.csproj");
+        assert_eq!(calls[0].1["maxResults"], 50, "单行标量应自动转数字");
+    }
+
+    /// XML 格式：一次多个 <invoke> → 多个工具调用
+    #[test]
+    fn parse_xml_tool_calls_multiple_invokes() {
+        let text = "<tool_calls>\n<invoke name=\"file_search\">\n<parameter name=\"query\">**/*.csproj</parameter>\n</invoke>\n<invoke name=\"list_dir\">\n<parameter name=\"path\">f:/games</parameter>\n</invoke>\n</tool_calls>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 2, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(calls[0].1["query"], "**/*.csproj");
+        assert_eq!(calls[1].0, "list_dir");
+        assert_eq!(calls[1].1["path"], "f:/games");
+    }
+
+    /// XML 格式：缺少外层 <tool_calls> 包裹、普通文本夹杂时也能解析
+    #[test]
+    fn parse_xml_invoke_without_wrapper() {
+        let text = "好的，我来读取文件。\n<invoke name=\"read_file\">\n<parameter name=\"filePath\">d:/a.rs</parameter>\n<parameter name=\"startLine\">1</parameter>\n<parameter name=\"endLine\">10</parameter>\n</invoke>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1["filePath"], "d:/a.rs");
+        assert_eq!(calls[0].1["startLine"], 1);
+        assert_eq!(calls[0].1["endLine"], 10);
+    }
+
+    /// XML 格式：多行参数（代码/围栏）原样保留，只去掉布局引入的首尾换行
+    #[test]
+    fn parse_xml_tool_calls_multiline_parameter() {
+        let text = "<tool_calls>\n<invoke name=\"Write\">\n<parameter name=\"file_path\">d:/a.md</parameter>\n<parameter name=\"content\">\n# 标题\n```mermaid\ngraph TB\n```\n</parameter>\n</invoke>\n</tool_calls>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].1["file_path"], "d:/a.md");
+        let c = calls[0].1["content"].as_str().unwrap();
+        assert!(c.starts_with("# 标题"), "应去掉布局引入的首换行, 实际: {:?}", c);
+        assert!(c.contains("```mermaid"));
+        assert!(c.ends_with("```"), "应去掉布局引入的尾换行, 实际: {:?}", c);
+    }
+
+    /// XML 格式 → OpenAI 标准 tool_calls（参数序列化为 JSON 字符串）
+    #[test]
+    fn parse_tool_calls_xml_to_openai() {
+        let content = "<tool_calls><invoke name=\"read_file\"><parameter name=\"filePath\">d:/a.rs</parameter><parameter name=\"startLine\">1</parameter></invoke></tool_calls>";
+        let calls = parse_tool_calls(content).unwrap();
+        let arr = calls.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["type"], "function");
+        assert_eq!(arr[0]["function"]["name"], "read_file");
+        assert!(arr[0]["id"].as_str().unwrap().starts_with("call_"));
+        let args: serde_json::Value =
+            serde_json::from_str(arr[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["filePath"], "d:/a.rs");
+        assert_eq!(args["startLine"], 1);
+    }
+
+    /// XML 格式与自有 <tool_call> 围栏格式互不干扰（<tool_calls> 不被误当自有围栏）
+    #[test]
+    fn xml_and_own_fence_coexist() {
+        let own = "<tool_call>\nname: read_file\narguments:\n  filePath: a\n</tool_call>";
+        let calls = parse_tool_call_blocks(own).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+        let xml = "<tool_calls><invoke name=\"read_file\"><parameter name=\"filePath\">a</parameter></invoke></tool_calls>";
+        let calls = parse_tool_call_blocks(xml).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1["filePath"], "a");
+        // 畸形 invoke（无 name 属性）不产生工具调用
+        assert!(parse_tool_call_blocks(
+            "<tool_calls><invoke><parameter name=\"a\">1</parameter></invoke></tool_calls>"
+        )
+        .is_none());
+    }
+
+    /// 流式嗅探：XML 开标签（完整形态 / 未闭合不算）
+    #[test]
+    fn looks_like_xml_tool_open() {
+        assert!(super::looks_like_tool_call("<tool_calls>"));
+        assert!(super::looks_like_tool_call("好的，我来搜索\n<tool_calls>\n<invoke name=\"x\">"));
+        assert!(super::looks_like_tool_call("<invoke name=\"read_file\">"));
+        // 未读到 '>' 的不完整开标签不算完整标识
+        assert!(!super::looks_like_tool_call("<tool_calls"));
+        assert!(!super::looks_like_tool_call("<invoke name=\"read_file\""));
+        // 自有 <tool_call> 行为不变
+        assert!(super::looks_like_tool_call("<tool_call>\nname: read_file"));
+        assert!(!super::looks_like_tool_call("<tool_call"));
+    }
+
+    /// 流式嗅探：XML 开标签前缀（尾部、增量拆分中）→ 返回剩余待匹配长度
+    #[test]
+    fn is_xml_fence_prefix_sniff() {
+        assert!(super::tool_fence_remaining("<tool_calls").is_some());
+        assert!(super::tool_fence_remaining("<invo").is_some());
+        assert!(super::tool_fence_remaining("<invoke").is_some());
+        assert!(super::tool_fence_remaining("好的，我来搜索\n<invoke nam").is_some());
+        // 完整外层开标签不算前缀（由 looks_like_tool_call 判定）
+        assert!(super::tool_fence_remaining("<tool_calls>").is_none());
+    }
+
+    /// 流式：XML 工具调用格式 → tool_calls 增量
+    #[test]
+    fn stream_processor_xml_tool_call() {
+        let mut sp = super::StreamProcessor::new(true, String::new());
+        sp.feed("data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"<tool_calls>\\n<invoke name=\\\"file_search\\\">\\n<parameter name=\\\"query\\\">**/*.csproj</parameter>\\n</invoke>\\n</tool_calls>\"}]}}}\n");
+        let final_deltas = sp.finish();
+        let has_tool = final_deltas
+            .iter()
+            .any(|d| serde_json::from_str::<serde_json::Value>(d).map(|v| v.get("tool_calls").is_some()).unwrap_or(false));
+        assert!(has_tool, "XML 工具调用格式应解析出 tool_calls, 实际: {:?}", final_deltas);
+    }
+
+    /// 流式：XML 开标签被增量拆分（<tool_calls + >…）也能识别
+    #[test]
+    fn stream_processor_xml_split_fence() {
+        let mut sp = super::StreamProcessor::new(true, String::new());
+        sp.feed("data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"<tool_calls\"}]}}}\n");
+        sp.feed("data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\">\\n<invoke name=\\\"read_file\\\">\\n<parameter name=\\\"filePath\\\">a</parameter>\\n</invoke>\\n</tool_calls>\"}\n");
+        let final_deltas = sp.finish();
+        let has_tool = final_deltas
+            .iter()
+            .any(|d| serde_json::from_str::<serde_json::Value>(d).map(|v| v.get("tool_calls").is_some()).unwrap_or(false));
+        assert!(has_tool, "拆分的 XML 开标签应识别 tool_calls, 实际: {:?}", final_deltas);
+    }
+
+    /// DeepSeek DSML 格式（真实输出形态）：<|DSML| tool_calls> / <|DSML| invoke name="X"> /
+    /// <|DSML| parameter name="k" string="true">v</|DSML| parameter>
+    #[test]
+    fn parse_dsml_tool_calls() {
+        let text = r#"Optimized tool selection
+<|DSML| tool_calls>
+<|DSML| invoke name="file_search">
+<|DSML| parameter name="query" string="true">**/*.csproj</|DSML| parameter>
+<|DSML| parameter name="maxResults" string="false">50</|DSML| parameter>
+</|DSML| invoke>
+<|DSML| invoke name="file_search">
+<|DSML| parameter name="query" string="true">MyBuildings/**</|DSML| parameter>
+<|DSML| parameter name="maxResults" string="false">100</|DSML| parameter>
+</|DSML| invoke>
+<|DSML| invoke name="read_file">
+<|DSML| parameter name="filePath" string="true">f:\SteamLibrary\steamapps\common\RimWorld\Version.txt</|DSML| parameter>
+<|DSML| parameter name="startLine" string="false">1</|DSML| parameter>
+<|DSML| parameter name="endLine" string="false">10</|DSML| parameter>
+</|DSML| invoke>
+<|DSML| invoke name="list_dir">
+<|DSML| parameter name="path" string="true">f:\SteamLibrary\steamapps\common\RimWorld\MyBuildings</|DSML| parameter>
+</|DSML| invoke>
+</|DSML| tool_calls>"#;
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 4, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(calls[0].1["query"], "**/*.csproj");
+        assert_eq!(calls[0].1["maxResults"], 50);
+        assert_eq!(calls[1].0, "file_search");
+        assert_eq!(calls[1].1["query"], "MyBuildings/**");
+        assert_eq!(calls[1].1["maxResults"], 100);
+        assert_eq!(calls[2].0, "read_file");
+        assert_eq!(
+            calls[2].1["filePath"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\Version.txt"
+        );
+        assert_eq!(calls[2].1["startLine"], 1);
+        assert_eq!(calls[2].1["endLine"], 10);
+        assert_eq!(calls[3].0, "list_dir");
+        assert_eq!(
+            calls[3].1["path"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\MyBuildings"
+        );
+    }
+
+    /// DSML → OpenAI 标准 tool_calls（一次多个工具）
+    #[test]
+    fn parse_tool_calls_dsml_to_openai() {
+        let content = r#"<|DSML| tool_calls>
+<|DSML| invoke name="file_search">
+<|DSML| parameter name="query" string="true">**/*.csproj</|DSML| parameter>
+</|DSML| invoke>
+<|DSML| invoke name="read_file">
+<|DSML| parameter name="filePath" string="true">d:/a.rs</|DSML| parameter>
+<|DSML| parameter name="startLine" string="false">1</|DSML| parameter>
+</|DSML| invoke>
+</|DSML| tool_calls>"#;
+        let calls = parse_tool_calls(content).unwrap();
+        let arr = calls.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "实际: {:?}", arr);
+        assert_eq!(arr[0]["type"], "function");
+        assert_eq!(arr[0]["function"]["name"], "file_search");
+        assert_eq!(arr[1]["function"]["name"], "read_file");
+        assert!(arr[0]["id"].as_str().unwrap().starts_with("call_"));
+        let args: serde_json::Value =
+            serde_json::from_str(arr[1]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["filePath"], "d:/a.rs");
+        assert_eq!(args["startLine"], 1);
+    }
+
+    /// DSML：string 属性决定类型——string="true" 保持字符串，string="false" 按标量转数字
+    #[test]
+    fn parse_dsml_string_attribute() {
+        let text = r#"<|DSML| invoke name="file_search">
+<|DSML| parameter name="query" string="true">50</|DSML| parameter>
+<|DSML| parameter name="maxResults" string="false">50</|DSML| parameter>
+</|DSML| invoke>"#;
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].1["query"], "50");
+        assert_eq!(calls[0].1["maxResults"], 50);
+    }
+
+    /// DSML：多行值（代码含 '<'、三反引号）原样保留，只去掉布局引入的首尾换行
+    #[test]
+    fn parse_dsml_multiline_value_with_angle() {
+        let text = r#"<|DSML| invoke name="Write">
+<|DSML| parameter name="file_path" string="true">d:/a.md</|DSML| parameter>
+<|DSML| parameter name="content" string="true">
+# 标题
+if (a < b) { }
+```mermaid
+graph TB
+```
+</|DSML| parameter>
+</|DSML| invoke>"#;
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].1["file_path"], "d:/a.md");
+        let c = calls[0].1["content"].as_str().unwrap();
+        assert!(c.starts_with("# 标题"), "实际: {:?}", c);
+        assert!(c.contains("if (a < b) { }"), "实际: {:?}", c);
+        assert!(c.contains("```mermaid"), "实际: {:?}", c);
+        assert!(c.ends_with("```"), "实际: {:?}", c);
+    }
+
+    /// DSML 变体：双管道前缀（部分客户端渲染/输出的形态）同样识别
+    #[test]
+    fn parse_dsml_double_pipe() {
+        let text = r#"<||DSML|| tool_calls>
+<||DSML|| invoke name="list_dir">
+<||DSML|| parameter name="path" string="true">f:/a</||DSML|| parameter>
+</||DSML|| invoke>
+</||DSML|| tool_calls>"#;
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "list_dir");
+        assert_eq!(calls[0].1["path"], "f:/a");
+    }
+
+    /// 双竖线 DSML 完整样本：<||DSML|| tool_calls> / <||DSML|| invoke name="X"> /
+    /// <||DSML|| parameter name="k" string="true">v</||DSML|| parameter> / </||DSML|| invoke>
+    #[test]
+    fn parse_dsml_double_pipe_full_sample() {
+        let text = r#"Optimized tool selection<||DSML|| tool_calls>
+<||DSML|| invoke name="file_search">
+<||DSML|| parameter name="query" string="true">**/*.csproj</||DSML|| parameter>
+<||DSML|| parameter name="maxResults" string="false">50</||DSML|| parameter>
+</||DSML|| invoke>
+<||DSML|| invoke name="file_search">
+<||DSML|| parameter name="query" string="true">MyBuildings/**</||DSML|| parameter>
+<||DSML|| parameter name="maxResults" string="false">100</||DSML|| parameter>
+</||DSML|| invoke>
+<||DSML|| invoke name="file_search">
+<||DSML|| parameter name="query" string="true">Source/**/*.cs</||DSML|| parameter>
+<||DSML|| parameter name="maxResults" string="false">100</||DSML|| parameter>
+</||DSML|| invoke>
+<||DSML|| invoke name="read_file">
+<||DSML|| parameter name="filePath" string="true">f:\SteamLibrary\steamapps\common\RimWorld\Version.txt</||DSML|| parameter>
+<||DSML|| parameter name="startLine" string="false">1</||DSML|| parameter>
+<||DSML|| parameter name="endLine" string="false">10</||DSML|| parameter>
+</||DSML|| invoke>
+<||DSML|| invoke name="list_dir">
+<||DSML|| parameter name="path" string="true">f:\SteamLibrary\steamapps\common\RimWorld\MyBuildings</||DSML|| parameter>
+</||DSML|| invoke>
+<||DSML|| invoke name="list_dir">
+<||DSML|| parameter name="path" string="true">f:\SteamLibrary\steamapps\common\RimWorld\Source</||DSML|| parameter>
+</||DSML|| invoke>
+</||DSML|| tool_calls>"#;
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 6, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(calls[0].1["query"], "**/*.csproj");
+        assert_eq!(calls[0].1["maxResults"], 50);
+        assert_eq!(calls[1].1["query"], "MyBuildings/**");
+        assert_eq!(calls[1].1["maxResults"], 100);
+        assert_eq!(calls[2].1["query"], "Source/**/*.cs");
+        assert_eq!(calls[2].1["maxResults"], 100);
+        assert_eq!(calls[3].0, "read_file");
+        assert_eq!(
+            calls[3].1["filePath"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\Version.txt"
+        );
+        assert_eq!(calls[3].1["startLine"], 1);
+        assert_eq!(calls[3].1["endLine"], 10);
+        assert_eq!(calls[4].0, "list_dir");
+        assert_eq!(
+            calls[4].1["path"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\MyBuildings"
+        );
+        assert_eq!(calls[5].0, "list_dir");
+        assert_eq!(
+            calls[5].1["path"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\Source"
+        );
+    }
+
+    /// 全角竖线 DSML（原始输出形态，标记符为 U+FF5C + DSML）：6 个 invoke 全部解析。
+    /// 标记符在运行时用 char 转义拼出，源码里不出现原样标记字符。
+    #[test]
+    fn parse_dsml_fullwidth_pipe_full_sample() {
+        let p = "\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+        let o = format!("<{p}"); // 开标签前缀
+        let c = format!("</{p}"); // 闭标签前缀
+        let text = format!(
+            "{o} calls>\n\
+             {o} invoke name=\"file_search\">\n\
+             {o} parameter name=\"query\" string=\"true\">**/*.csproj{c} parameter>\n\
+             {o} parameter name=\"maxResults\" string=\"false\">50{c} parameter>\n\
+             {c} invoke>\n\
+             {o} invoke name=\"file_search\">\n\
+             {o} parameter name=\"query\" string=\"true\">MyBuildings/**{c} parameter>\n\
+             {o} parameter name=\"maxResults\" string=\"false\">100{c} parameter>\n\
+             {c} invoke>\n\
+             {o} invoke name=\"file_search\">\n\
+             {o} parameter name=\"query\" string=\"true\">Source/**/*.cs{c} parameter>\n\
+             {o} parameter name=\"maxResults\" string=\"false\">100{c} parameter>\n\
+             {c} invoke>\n\
+             {o} invoke name=\"read_file\">\n\
+             {o} parameter name=\"filePath\" string=\"true\">f:\\SteamLibrary\\steamapps\\common\\RimWorld\\Version.txt{c} parameter>\n\
+             {o} parameter name=\"startLine\" string=\"false\">1{c} parameter>\n\
+             {o} parameter name=\"endLine\" string=\"false\">10{c} parameter>\n\
+             {c} invoke>\n\
+             {o} invoke name=\"list_dir\">\n\
+             {o} parameter name=\"path\" string=\"true\">f:\\SteamLibrary\\steamapps\\common\\RimWorld\\MyBuildings{c} parameter>\n\
+             {c} invoke>\n\
+             {o} invoke name=\"list_dir\">\n\
+             {o} parameter name=\"path\" string=\"true\">f:\\SteamLibrary\\steamapps\\common\\RimWorld\\Source{c} parameter>\n\
+             {c} invoke>\n\
+             {c} calls>"
+        );
+        let calls = parse_tool_call_blocks(&text).unwrap();
+        assert_eq!(calls.len(), 6, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(calls[0].1["query"], "**/*.csproj");
+        assert_eq!(calls[0].1["maxResults"], 50);
+        assert_eq!(calls[1].0, "file_search");
+        assert_eq!(calls[1].1["query"], "MyBuildings/**");
+        assert_eq!(calls[1].1["maxResults"], 100);
+        assert_eq!(calls[2].0, "file_search");
+        assert_eq!(calls[2].1["query"], "Source/**/*.cs");
+        assert_eq!(calls[2].1["maxResults"], 100);
+        assert_eq!(calls[3].0, "read_file");
+        assert_eq!(
+            calls[3].1["filePath"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\Version.txt"
+        );
+        assert_eq!(calls[3].1["startLine"], 1);
+        assert_eq!(calls[3].1["endLine"], 10);
+        assert_eq!(calls[4].0, "list_dir");
+        assert_eq!(
+            calls[4].1["path"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\MyBuildings"
+        );
+        assert_eq!(calls[5].0, "list_dir");
+        assert_eq!(
+            calls[5].1["path"].as_str().unwrap(),
+            r"f:\SteamLibrary\steamapps\common\RimWorld\Source"
+        );
+    }
+
+    /// 流式嗅探：DSML 开标签完整形态 / 拆分前缀 / 普通文本 '<'
+    #[test]
+    fn dsml_fence_sniff() {
+        assert!(super::looks_like_tool_call("<||DSML|| tool_calls>"));
+        assert!(super::looks_like_tool_call(
+            "Optimized tool selection\n<||DSML|| invoke name=\"file_search\">"
+        ));
+        assert!(super::looks_like_tool_call("<|DSML| tool_calls>"));
+        assert!(super::looks_like_tool_call("<invoke name=\"file_search\">"));
+        assert!(!super::looks_like_tool_call("<||DSML|| tool_calls"));
+        assert!(!super::looks_like_tool_call("<||DSML|| invoke name=\"x\""));
+        // 全角竖线（原始输出形态）：标记符在运行时拼出，源码不含原样标记字符
+        let p = "\u{FF5C}\u{FF5C}DSML\u{FF5C}\u{FF5C}";
+        let open = format!("<{p}");
+        assert!(super::looks_like_tool_call(&format!("{open} calls>")));
+        assert!(super::looks_like_tool_call(&format!("{open} invoke name=\"file_search\">")));
+        assert!(!super::looks_like_tool_call(&format!("{open} calls")));
+        assert!(super::tool_fence_remaining(&open).is_some());
+        assert!(super::tool_fence_remaining(&format!("{open} invoke")).is_some());
+        assert!(super::tool_fence_remaining(&format!("{open} calls>")).is_none());
+        // 拆分前缀 → 需缓冲
+        assert!(super::tool_fence_remaining("<||DSML||").is_some());
+        assert!(super::tool_fence_remaining("<||DSML|| too").is_some());
+        assert!(super::tool_fence_remaining("<||DSML|| invoke").is_some());
+        assert!(super::tool_fence_remaining("<||DSML|| invoke nam").is_some());
+        assert!(super::tool_fence_remaining("<|DSML|").is_some());
+        // 完整标签不算前缀（由 looks_like_tool_call 判定）
+        assert!(super::tool_fence_remaining("<||DSML|| tool_calls>").is_none());
+        // 普通文本里的 '<' / 非标记标签不缓冲
+        assert!(super::tool_fence_remaining("a < b").is_none());
+        assert!(super::tool_fence_remaining("<div").is_none());
+    }
+
+    /// 流式：DSML 工具调用（普通文本 + 开标签被拆分）→ tool_calls 增量
+    #[test]
+    fn stream_processor_dsml_tool_call() {
+        let mut sp = super::StreamProcessor::new(true, String::new());
+        // 增量 1：普通文本 + DSML 标记前缀（标签未闭合）
+        sp.feed("data: {\"v\":{\"response\":{\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"Optimized tool selection\\n<|DSML|\"}]}}}\n");
+        // 增量 2：补齐完整 DSML 工具调用
+        sp.feed("data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\" tool_calls>\\n<|DSML| invoke name=\\\"file_search\\\">\\n<|DSML| parameter name=\\\"query\\\" string=\\\"true\\\">**/*.csproj</|DSML| parameter>\\n</|DSML| invoke>\\n</|DSML| tool_calls>\"}\n");
+        let final_deltas = sp.finish();
+        let has_tool = final_deltas
+            .iter()
+            .any(|d| serde_json::from_str::<serde_json::Value>(d).map(|v| v.get("tool_calls").is_some()).unwrap_or(false));
+        assert!(has_tool, "DSML 工具调用应解析出 tool_calls, 实际: {:?}", final_deltas);
     }
 }
 
