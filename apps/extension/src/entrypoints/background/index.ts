@@ -5,6 +5,7 @@ import { GatewayConnection } from '~/background/connection';
 import { bindDiagnosticSender } from '~/background/diagnostics';
 import { handleServerMessage } from '~/background/messageRouter';
 import { backgroundState } from '~/background/state';
+import { sendMessageToTab } from '~/lib/contentScript';
 import { getProvider, listProviders } from '~/providers';
 import {
   DEFAULT_SETTINGS,
@@ -16,6 +17,7 @@ import {
 const log = createLogger('ext:background');
 
 let connection: GatewayConnection | null = null;
+const providerStatusPolls = new Map<ModelProvider, ReturnType<typeof setTimeout> | null>();
 
 function getStatus(): ProviderStatusMap {
   return backgroundState.providers;
@@ -61,26 +63,81 @@ function syncCredentialsToServer(provider?: ModelProvider): void {
   }
 }
 
-/** 刷新各平台登录态并写入状态 */
+/** 检查单个平台登录状态并刷新界面数据 */
+async function refreshOneProviderStatus(provider: ReturnType<typeof getProvider>): Promise<boolean> {
+  const enabled = backgroundState.settings.enabledProviders[provider.id] ?? true;
+  if (!enabled) {
+    backgroundState.setProviderStatus(provider.id, {
+      connected: false,
+      authed: false,
+      models: provider.getModels(),
+    });
+    return false;
+  }
+  const authed = !!backgroundState.getToken(provider.id);
+  backgroundState.setProviderStatus(provider.id, {
+    connected: true,
+    authed,
+    models: provider.getModels(),
+    tokenCaptured: !!backgroundState.getToken(provider.id),
+    templateCaptured: !!backgroundState.getApiTemplate(provider.id),
+  });
+  return authed;
+}
+
+/** 页面刚打开时凭证可能尚未写入存储，主动请求内容脚本读取凭证并短暂轮询 */
+function pollProviderStatus(providerId: ModelProvider): void {
+  if (providerStatusPolls.has(providerId)) return;
+  const provider = getProvider(providerId);
+  let attempts = 0;
+  const maxAttempts = 20;
+  providerStatusPolls.set(providerId, null);
+
+  const poll = async (): Promise<void> => {
+    if (!(backgroundState.settings.enabledProviders[providerId] ?? true)) {
+      providerStatusPolls.delete(providerId);
+      return;
+    }
+    try {
+      const authed = await refreshOneProviderStatus(provider);
+      if (authed) {
+        providerStatusPolls.delete(providerId);
+        return;
+      }
+      for (const pattern of provider.matches) {
+        const tabs = await browser.tabs.query({ url: pattern });
+        const tab = tabs.find((item) => item.id != null);
+        if (tab?.id != null) {
+          await sendMessageToTab(tab.id, { type: 'CAPTURE_TOKEN', provider: providerId });
+          break;
+        }
+      }
+    } catch (err) {
+      log.warn(`检查供应商登录状态失败：${providerId}`, errorMessage(err));
+    }
+    attempts += 1;
+    if (attempts >= maxAttempts) {
+      providerStatusPolls.delete(providerId);
+      return;
+    }
+    providerStatusPolls.set(providerId, setTimeout(() => void poll(), 2_000));
+  };
+
+  void poll();
+}
+
+/** 刷新全部平台状态 */
 async function refreshProviderStatus(): Promise<void> {
   for (const provider of listProviders()) {
-    const enabled = backgroundState.settings.enabledProviders[provider.id] ?? true;
-    if (!enabled) {
-      backgroundState.setProviderStatus(provider.id, { connected: false, authed: false, models: provider.getModels() });
-      continue;
+    try {
+      await refreshOneProviderStatus(provider);
+    } catch (err) {
+      log.warn(`刷新供应商状态失败：${provider.id}`, errorMessage(err));
     }
-    const authed = await provider.checkAuth();
-    backgroundState.setProviderStatus(provider.id, {
-      connected: true,
-      authed,
-      models: provider.getModels(),
-      tokenCaptured: !!backgroundState.getToken(provider.id),
-      templateCaptured: !!backgroundState.getApiTemplate(provider.id),
-    });
   }
 }
 
-/** 处理来自 UI（popup/options）的内部消息 */
+/** 处理来自主界面的内部消息 */
 async function handleInternalMessage(msg: InternalMessage): Promise<InternalResponse> {
   switch (msg.type) {
     case 'GET_STATE':
@@ -98,6 +155,15 @@ async function handleInternalMessage(msg: InternalMessage): Promise<InternalResp
         startConnection();
       }
       if ('enabledProviders' in msg.payload) {
+        for (const provider of listProviders()) {
+          if (msg.payload.enabledProviders?.[provider.id] === true) {
+            pollProviderStatus(provider.id);
+          } else if (msg.payload.enabledProviders?.[provider.id] === false) {
+            const timer = providerStatusPolls.get(provider.id);
+            if (timer !== null && timer !== undefined) clearTimeout(timer);
+            providerStatusPolls.delete(provider.id);
+          }
+        }
         void refreshProviderStatus();
       }
       return { ok: true, data: backgroundState.settings };
@@ -116,6 +182,7 @@ async function handleInternalMessage(msg: InternalMessage): Promise<InternalResp
       try {
         const provider = getProvider(msg.payload.provider);
         await provider.open();
+        pollProviderStatus(provider.id);
         return { ok: true };
       } catch (err) {
         return { ok: false, error: errorMessage(err) };
@@ -143,7 +210,7 @@ export default defineBackground(() => {
     void refreshProviderStatus();
   });
 
-  // 2. 周期刷新登录态（同时用于 SW 心跳）
+  // 2. 周期刷新凭证状态（同时用于 SW 心跳）
   setInterval(() => void refreshProviderStatus(), 60_000);
 
   // 3. 响应 UI 消息 + 内容脚本上报
@@ -224,6 +291,16 @@ export default defineBackground(() => {
           }
           if (message.payload?.settingsToken) {
             backgroundState.setSettingsToken(message.payload.provider, message.payload.settingsToken);
+          }
+          if (hasToken || hasSettings) {
+            const provider = getProvider(message.payload.provider);
+            backgroundState.setProviderStatus(message.payload.provider, {
+              connected: true,
+              authed: !!backgroundState.getToken(message.payload.provider),
+              models: provider.getModels(),
+              tokenCaptured: !!backgroundState.getToken(message.payload.provider),
+              templateCaptured: !!backgroundState.getApiTemplate(message.payload.provider),
+            });
           }
           // 连接器化：凭证有变化才同步给服务端（服务端存储与使用）并记录日志
           if (changed) {

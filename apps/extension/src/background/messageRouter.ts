@@ -4,6 +4,7 @@ import { browser } from 'wxt/browser';
 import { diag } from '~/background/diagnostics';
 import { getProvider } from '~/providers';
 import { ProviderError } from '~/providers/base';
+import { sendMessageToTab } from '~/lib/contentScript';
 import { backgroundState } from './state';
 
 const log = createLogger('ext:router');
@@ -39,7 +40,7 @@ export async function handleServerMessage(
   switch (msg.type) {
     case MessageType.CHAT_REQUEST: {
       const { id, payload } = msg;
-      log.info(`received CHAT_REQUEST ${id} model=${payload.model}`);
+      log.info(`收到聊天请求 ${id}，模型=${payload.model}`);
       backgroundState.addLog('info', `收到请求 ${id} (${payload.model})`);
       diag('info', 'router', `收到请求 ${id}`, {
         id,
@@ -95,7 +96,7 @@ export async function handleServerMessage(
       } catch (err) {
         const message = errorMessage(err);
         const code = (err as { code?: string })?.code;
-        log.error(`request ${id} failed`, message);
+        log.error(`聊天请求 ${id} 失败`, message);
         backgroundState.addLog('error', `请求 ${id} 失败: ${message}`);
         diag('error', 'router', `请求 ${id} 失败`, { id, error: message, code });
         send({
@@ -110,7 +111,7 @@ export async function handleServerMessage(
     case MessageType.EXECUTE_REQUEST: {
       // 服务端下发的「网页执行」指令：插件只在对应平台网页机械执行 fetch 并回传原始流
       const { id, payload } = msg;
-      log.info(`received EXECUTE_REQUEST ${id} ${payload.method ?? 'POST'} ${payload.url}`);
+      log.info(`收到网页执行请求 ${id}：${payload.method ?? 'POST'} ${payload.url}`);
       backgroundState.addLog('info', `执行网页请求 ${id}`);
       try {
         const tab = await findProviderTab(payload.provider);
@@ -118,7 +119,8 @@ export async function handleServerMessage(
           throw new ProviderError(`未找到 ${payload.provider} 的标签页`, 'provider_tab_not_found');
         }
         // 下发到 isolated world → 转发 MAIN world 网页执行器执行
-        await browser.tabs.sendMessage(tab.id, {
+        // （内容脚本缺失时自动补注入并重试，避免「Receiving end does not exist」）
+        await sendMessageToTab(tab.id, {
           type: 'EXECUTE_IN_PAGE',
           requestId: id,
           method: payload.method,
@@ -132,7 +134,7 @@ export async function handleServerMessage(
       } catch (err) {
         const message = errorMessage(err);
         const code = (err as { code?: string })?.code;
-        log.error(`execute ${id} failed`, message);
+        log.error(`网页执行请求 ${id} 失败`, message);
         diag('error', 'router', `执行 ${id} 失败`, { id, error: message, code });
         send({
           id,
@@ -147,23 +149,23 @@ export async function handleServerMessage(
       // 服务端缺失凭证时，触发内容脚本从页面主动捕获（读 localStorage）。
       // 该消息无需回包：内容脚本捕获后会自动上报 CREDENTIAL_SYNC 给服务端。
       const { payload } = msg;
-      log.info(`received CAPTURE_REQUEST ${payload.provider}`);
+      log.info(`收到凭证捕获请求，平台=${payload.provider}`);
       try {
         const tab = await findProviderTab(payload.provider);
         if (tab?.id) {
           // isolated world 响应 CAPTURE_TOKEN：读 localStorage 后主动发 TOKEN_CAPTURED
           // → background 转 CREDENTIAL_SYNC → 服务端 resolveCapture
-          await browser.tabs
-            .sendMessage(tab.id, { type: 'CAPTURE_TOKEN', provider: payload.provider })
-            .catch(() => {});
+          await sendMessageToTab(tab.id, { type: 'CAPTURE_TOKEN', provider: payload.provider }).catch(
+            () => {},
+          );
         }
       } catch (err) {
-        log.warn('capture request failed', errorMessage(err));
+        log.warn('凭证捕获请求失败', errorMessage(err));
       }
       break;
     }
     default:
       // 所有协议消息类型都已在上面覆盖；此处仅防御性兜底（msg 已被窄化为 never）
-      log.warn('unhandled message type from server', msg);
+      log.warn('收到未处理的服务端消息类型', msg);
   }
 }

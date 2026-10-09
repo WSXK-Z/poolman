@@ -3,10 +3,19 @@
 }
 
 body {
+  width: 380px;
+  min-width: 380px;
+  margin: 0;
+  color: #1f2937;
+  background: #f3f6fb;
   font-family:
     -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC',
     'Microsoft YaHei', sans-serif;
-  background: #f5f7fa;
+}
+
+button,
+input {
+  font: inherit;
 }
 
 #app {
@@ -17,40 +26,231 @@ body {
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 12px;
+  padding: 14px;
 }
 
 .popup-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  padding: 2px 2px 5px;
 }
 
 .popup-title {
-  font-size: 16px;
-  font-weight: 700;
+  font-size: 18px;
+  font-weight: 750;
+  letter-spacing: -0.3px;
+}
+
+.popup-subtitle {
+  margin-top: 3px;
+  color: #8290a5;
+  font-size: 11px;
 }
 
 .status-badge {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
-  color: #888;
+  padding: 6px 9px;
+  border: 1px solid #e4eaf2;
+  border-radius: 20px;
+  background: white;
+  color: #667085;
+  font-size: 11px;
 }
 
 .status-dot {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
   border-radius: 50%;
-  background: #ccc;
+  background: #d03050;
 }
 
 .status-dot.on {
   background: #18a058;
-  box-shadow: 0 0 4px rgba(24, 160, 88, 0.6);
+  box-shadow: 0 0 7px rgb(24 160 88 / 45%);
 }
 
-.status-dot.off {
-  background: #d03050;
+.server-card,
+.providers-card {
+  border-radius: 12px;
+}
+
+.section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.section-icon {
+  display: inline-grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  border-radius: 7px;
+  background: #edf3ff;
+  color: #4778db;
+  font-size: 9px;
+  font-weight: 700;
+}
+
+.section-hint {
+  margin-left: auto;
+  color: #98a2b3;
+  font-size: 10px;
+  font-weight: 400;
+}
+
+.server-card .n-card__content {
+  padding-top: 3px;
+}
+
+.server-card .n-form-item {
+  margin-bottom: 8px;
+}
+
+.server-card .n-form-item-label {
+  padding-bottom: 3px;
+  font-size: 11px;
+}
+
+.settings-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 30px;
+  color: #475467;
+  font-size: 12px;
+}
+
+.timeout-row {
+  justify-content: flex-start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.timeout-row > span:first-child {
+  flex: 1;
+}
+
+.timeout-row .unit {
+  color: #98a2b3;
+  font-size: 11px;
+}
+
+.provider-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.provider-tile {
+  position: relative;
+  display: flex;
+  min-height: 89px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding: 9px 5px 7px;
+  border: 1px solid #e7ebf2;
+  border-radius: 10px;
+  background: #fafbfc;
+  color: #a6afbd;
+  cursor: pointer;
+  filter: grayscale(1);
+  opacity: 0.58;
+  transition:
+    transform 140ms ease,
+    border-color 140ms ease,
+    opacity 140ms ease,
+    box-shadow 140ms ease;
+}
+
+.provider-tile:hover {
+  transform: translateY(-1px);
+  border-color: #b8c9e8;
+}
+
+.provider-tile.active {
+  border-color: #d9e6fb;
+  background: #f6f9ff;
+  color: #344054;
+  filter: none;
+  opacity: 1;
+}
+
+.provider-tile.disabled {
+  background: #f0f1f3;
+}
+
+.provider-logo {
+  display: grid;
+  width: 31px;
+  height: 31px;
+  place-items: center;
+  border-radius: 10px;
+  background: #d7dce4;
+  color: white;
+  font-size: 17px;
+  font-weight: 750;
+}
+
+.active .provider-logo {
+  background: var(--provider-color, #547bd4);
+  box-shadow: 0 3px 9px color-mix(in srgb, var(--provider-color, #547bd4) 30%, transparent);
+}
+
+.logo-deepseek-web {
+  --provider-color: #5079e8;
+}
+
+.logo-chatgpt-web {
+  --provider-color: #159b78;
+}
+
+.logo-claude-web {
+  --provider-color: #c77943;
+}
+
+.logo-gemini-web {
+  --provider-color: #637ce8;
+}
+
+.logo-kimi-web {
+  --provider-color: #5b78de;
+}
+
+.logo-qwen-web {
+  --provider-color: #7956cf;
+}
+
+.provider-label {
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.provider-status {
+  font-size: 9px;
+}
+
+.credential-mark {
+  position: absolute;
+  top: 5px;
+  right: 7px;
+  color: #18a058;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.provider-help,
+.empty-state {
+  margin-top: 9px;
+  color: #98a2b3;
+  font-size: 10px;
+  line-height: 1.5;
+  text-align: center;
 }

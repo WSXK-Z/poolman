@@ -19,6 +19,11 @@ export default defineContentScript({
   world: 'MAIN',
   runAt: 'document_start',
   main() {
+    // 防重复注入：服务端触发的兜底注入可能与 manifest 正常注入重叠
+    const w = window as unknown as { __aiGatewayMainWorld?: boolean };
+    if (w.__aiGatewayMainWorld) return;
+    w.__aiGatewayMainWorld = true;
+
     function detectProvider(hostname: string): string | null {
       if (hostname.includes('deepseek')) return 'deepseek-web';
       if (hostname.includes('chatgpt') || hostname.includes('openai')) return 'chatgpt-web';

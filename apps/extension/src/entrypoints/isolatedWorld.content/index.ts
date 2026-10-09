@@ -75,6 +75,11 @@ export default defineContentScript({
   world: 'ISOLATED',
   runAt: 'document_idle',
   main() {
+    // 防重复注入：服务端触发的兜底注入可能与 manifest 正常注入重叠
+    const w = window as unknown as { __aiGatewayIsolatedWorld?: boolean };
+    if (w.__aiGatewayIsolatedWorld) return;
+    w.__aiGatewayIsolatedWorld = true;
+
     // 1) 转发主世界捕获的 Token / 接口模板 + 执行回包（EXECUTE_CHUNK / RESULT / ERROR）
     window.addEventListener('message', (event) => {
       // 单一宽对象类型：主世界会发送多种 payload，字段全部可选，避免联合类型窄化失败
