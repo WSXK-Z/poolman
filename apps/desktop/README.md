@@ -107,10 +107,10 @@ pnpm tauri build
 
 | 字段 | 说明 |
 |------|------|
-| `productName` | 产品名称（`poolmen`） |
+| `productName` | 产品名称（`poolman`） |
 | `version` | 应用版本 |
-| `identifier` | 应用唯一标识（`com.wushi.poolmen`） |
-| `app.windows` | 主窗口默认尺寸和标题（标题为“穷门”） |
+| `identifier` | 应用唯一标识（`com.wushi.poolman`） |
+| `app.windows` | 主窗口默认尺寸和标题 |
 | `bundle.resources` | 打包时额外包含的资源（此处将扩展输出目录映射为 `chrome-mv3`） |
 | `bundle.icon` | 应用图标路径 |
 
