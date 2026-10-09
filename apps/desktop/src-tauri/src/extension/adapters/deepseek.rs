@@ -34,8 +34,16 @@ const MARKER_INVOKE: &str = "invoke";
 /// invoke 内部参数字段标签名
 const PARAM_TAG_NAME: &str = "parameter";
 /// 可独立标识「工具调用开始」的标签名：DSML 外层标记标签（真实输出里外层名即 calls）、
-/// 工具标签与自有围栏变体（parameter 只是内部字段，不算起始标记）。
-const TOOL_TAG_NAMES: [&str; 5] = ["tool_call", "toolcall", "tool_calls", "calls", MARKER_INVOKE];
+/// 工具标签与自有围栏变体；含模型错写（call / call_call）。parameter 只是内部字段，不算起始标记。
+const TOOL_TAG_NAMES: [&str; 7] = [
+    "tool_call",
+    "toolcall",
+    "tool_calls",
+    "calls",
+    "call",
+    "call_call",
+    MARKER_INVOKE,
+];
 const SEND_INTERVAL_MS: u64 = 1_000;
 
 /* ------------------------------ 辅助函数 ------------------------------ */
@@ -256,6 +264,34 @@ fn find_close_marker(text: &str, from: usize, marker: &str) -> Option<usize> {
     None
 }
 
+/// 是否属于「工具调用围栏」标签家族（含模型常见错写：call / call_call / toolcalls / tool_calls）
+fn is_fence_family(marker: Option<&str>) -> bool {
+    matches!(
+        marker,
+        Some("tool_call")
+            | Some("toolcall")
+            | Some("tool_calls")
+            | Some("call")
+            | Some("call_call")
+            | Some("calls")
+    )
+}
+
+/// 找围栏块内容结束位置：下一个「工具调用围栏」闭合标签的 '<' 下标。
+/// 容忍模型错写闭标签（如把闭合标签写成 call_call）；内容里其它闭合标签（html 等）不算。
+fn find_fence_close_tag(text: &str) -> Option<usize> {
+    let mut i = 0;
+    while i < text.len() {
+        let tag = next_tag(text, i)?;
+        if tag.closing && is_fence_family(tag.marker) {
+            return Some(tag.start);
+        }
+        // 只前进一个字节：内容里出现 '<'（代码/XML 片段）时不能跳过真正的闭合标签
+        i = tag.start + 1;
+    }
+    None
+}
+
 /// 是否出现工具调用开标签的【完整】形态（<tool_call> / <tool_calls> / <invoke name="X"> /
 /// <|DSML| invoke name="X"> 等）。只认完整标签；被增量拆分的前缀由 tool_fence_remaining 处理。
 fn contains_tool_open_tag(buf: &str) -> bool {
@@ -314,6 +350,11 @@ fn xml_fence_remaining(tail: &str) -> Option<usize> {
 /// 工具名校验：非空且不含空白/尖括号（挡住畸形标签，避免产生假工具调用）
 fn is_valid_tool_name(name: &str) -> bool {
     !name.is_empty() && !name.chars().any(|c| c.is_whitespace() || c == '<' || c == '>')
+}
+
+/// 文本里是否留有「像工具调用但没被解析」的痕迹（用于告警：判断模型是否未按提示词围栏格式输出）
+fn looks_like_unparsed_tool_call(text: &str) -> bool {
+    text.contains("tool_call") || text.contains("invoke") || text.contains("arguments:")
 }
 
 /// XML/DSML 参数值：去掉独占多行布局引入的首尾换行；
@@ -448,7 +489,21 @@ fn parse_tool_call_blocks(text: &str) -> Option<Vec<(String, Value)>> {
                 if let Some(Value::String(s)) = &args {
                     args = serde_json::from_str::<Value>(s).ok();
                 }
-                let args = args.filter(|v| v.is_object()).unwrap_or_else(|| json!({}));
+                let mut args = args.filter(|v| v.is_object()).unwrap_or_else(|| json!({}));
+                // arguments 缺失/为空时，把同级其它键当作参数：
+                // 模型常把参数与 arguments 写在同一层级（arguments 为空 → 参数挂到外层，参数会丢）
+                if args.as_object().map_or(true, |m| m.is_empty()) {
+                    let hoisted: serde_json::Map<String, Value> = obj
+                        .iter()
+                        .filter(|(k, _)| {
+                            !matches!(k.as_str(), "name" | "function" | "arguments" | "parameters" | "args")
+                        })
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    if !hoisted.is_empty() {
+                        args = Value::Object(hoisted);
+                    }
+                }
                 results.push((name, args));
             }
         }
@@ -464,8 +519,11 @@ fn parse_tool_call_blocks(text: &str) -> Option<Vec<(String, Value)>> {
         // 找最近的下一个开围栏（任意变体，可带 name 属性）
         let Some((_pos, fence_end, attr_name)) = find_open_fence(rest) else { break };
         let after = &rest[fence_end..];
-        // 闭围栏 </tool_call> 是独特 XML 标签，参数内容里几乎不可能出现 → find 即可
-        let end = after.find(TOOL_FENCE_CLOSE).unwrap_or(after.len());
+        // 闭围栏优先按标准 </tool_call> 精确匹配；模型错写（</call_call> 等）时退回按标签名扫描同一家族
+        let end = after
+            .find(TOOL_FENCE_CLOSE)
+            .or_else(|| find_fence_close_tag(after))
+            .unwrap_or(after.len());
         let inner = after[..end].trim();
         if let Some(name) = attr_name {
             // 属性形式：<tool_call name="X"> 内是参数 YAML（无 name 字段）
@@ -1394,6 +1452,11 @@ impl DeepSeekService {
     /// 非流式聊天
     pub async fn chat(&self, messages: Vec<Value>, options: Option<Value>) -> Result<ChatResponsePayload> {
         let options = options.unwrap_or_else(|| json!({}));
+        // 是否带工具（用于告警观察模型是否未按提示词围栏格式输出）
+        let has_tools = options
+            .get("tools")
+            .and_then(|t| t.as_array())
+            .map_or(false, |a| !a.is_empty());
         let built = self.build_request(&messages, &options).await?;
         self.record_session(&built, &messages, &options).await;
         let ts = format_ts_ms();
@@ -1424,6 +1487,12 @@ impl DeepSeekService {
                 finished_reason: Some("tool_calls".to_string()),
                 tool_calls: Some(tool_calls),
             });
+        }
+        if has_tools && looks_like_unparsed_tool_call(&text) {
+            warn!(
+                "本次请求带工具，但未解析出工具调用（模型可能未按提示词围栏格式输出）: {}",
+                text.chars().take(300).collect::<String>()
+            );
         }
         // 只在首次回答添加「回答时间 + 会话」前缀；追问通过反向查找历史里的前缀定位会话
         let final_content = if built.is_first_turn {
@@ -1725,6 +1794,11 @@ impl StreamProcessor {
                 if let Some(calls) = parse_tool_calls(&response_text) {
                     out.push(json!({ "tool_calls": calls }).to_string());
                 } else if !response_text.is_empty() {
+                    // 已按工具模式缓冲却解析不出工具调用：模型很可能没按提示词的围栏格式输出
+                    warn!(
+                        "工具模式下未解析出工具调用，按普通文本回退（模型可能未按提示词格式输出）: {}",
+                        response_text.chars().take(300).collect::<String>()
+                    );
                     let body = if self.prefix_sent {
                         response_text
                     } else {
@@ -1741,6 +1815,12 @@ impl StreamProcessor {
                     if let Some(calls) = parse_tool_calls(&sniff) {
                         out.push(json!({ "tool_calls": calls }).to_string());
                     } else {
+                        if looks_like_unparsed_tool_call(&sniff) {
+                            warn!(
+                                "嗅探到像工具调用的内容但未解析成功（模型可能未按提示词格式输出）: {}",
+                                sniff.chars().take(300).collect::<String>()
+                            );
+                        }
                         let body = if self.prefix_sent {
                             sniff
                         } else {
@@ -2447,6 +2527,78 @@ mod tests {
             "<tool_calls><invoke><parameter name=\"a\">1</parameter></invoke></tool_calls>"
         )
         .is_none());
+    }
+
+    /// 闭标签错写（写成 call_call 而非 tool_call）→ 仍能解析出围栏块
+    #[test]
+    fn parse_misspelled_close_tag() {
+        let text = "<tool_call>\nname: read_file\narguments:\n  filePath: a.rs\n  startLine: 1\n</call_call>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "read_file");
+        assert_eq!(calls[0].1["filePath"], "a.rs");
+        assert_eq!(calls[0].1["startLine"], 1);
+    }
+
+    /// 参数与 arguments 写在同一层级（arguments 为空）→ 同级键提升为参数
+    #[test]
+    fn parse_args_siblings_hoisted() {
+        let text = "<tool_call>\nname: grep_search\narguments:\nquery: MainButtonDef\nisRegexp: false\n</tool_call>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 1, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "grep_search");
+        assert_eq!(calls[0].1["query"], "MainButtonDef");
+        assert_eq!(calls[0].1["isRegexp"], false);
+    }
+
+    /// 真实样本：闭合标签错写为 call_call + 参数与 arguments 同级 → 3 个工具全部解析
+    #[test]
+    fn parse_real_sample_misspelled_close_and_hoisted_args() {
+        let text = "<tool_call>\nname: file_search\narguments:\nquery: f:/SteamLibrary/steamapps/common/RimWorld/Data/Core/Defs/**/MainButtonDefs*.xml\n</call_call>\n<tool_call>\nname: grep_search\narguments:\nquery: MainButtonDef\nisRegexp: false\nincludePattern: f:/SteamLibrary/steamapps/workshop/content/294100/**/About/About.xml\n</call_call>\n<tool_call>\nname: file_search\narguments:\nquery: f:/SteamLibrary/steamapps/common/RimWorld/Data/**/MainButtonDefs/**/*.xml\n</call_call>\n</call_call>";
+        let calls = parse_tool_call_blocks(text).unwrap();
+        assert_eq!(calls.len(), 3, "实际: {:?}", calls);
+        assert_eq!(calls[0].0, "file_search");
+        assert_eq!(
+            calls[0].1["query"],
+            "f:/SteamLibrary/steamapps/common/RimWorld/Data/Core/Defs/**/MainButtonDefs*.xml"
+        );
+        assert_eq!(calls[1].0, "grep_search");
+        assert_eq!(calls[1].1["query"], "MainButtonDef");
+        assert_eq!(calls[1].1["isRegexp"], false);
+        assert_eq!(
+            calls[1].1["includePattern"],
+            "f:/SteamLibrary/steamapps/workshop/content/294100/**/About/About.xml"
+        );
+        assert_eq!(calls[2].0, "file_search");
+        assert_eq!(
+            calls[2].1["query"],
+            "f:/SteamLibrary/steamapps/common/RimWorld/Data/**/MainButtonDefs/**/*.xml"
+        );
+    }
+
+    /// 真实样本走完整链路：parse_tool_calls（非流式）+ StreamProcessor（流式）
+    #[test]
+    fn user_sample_through_openai_and_stream() {
+        let text = "<tool_call>\nname: read_file\narguments:\nquery: f:/a/**/*.xml\n</call_call>";
+        let arr = parse_tool_calls(text).unwrap();
+        let arr = arr.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["function"]["name"], "read_file");
+        let args: serde_json::Value =
+            serde_json::from_str(arr[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["query"], "f:/a/**/*.xml");
+
+        let mut sp = super::StreamProcessor::new(true, String::new());
+        let content = format!("先搜索一下。\n{}", text);
+        let payload = serde_json::json!({
+            "v": { "response": { "fragments": [ { "type": "RESPONSE", "content": content } ] } }
+        });
+        sp.feed(&format!("data: {}\n", payload));
+        let deltas = sp.finish();
+        let has_tool = deltas
+            .iter()
+            .any(|d| serde_json::from_str::<serde_json::Value>(d).map(|v| v.get("tool_calls").is_some()).unwrap_or(false));
+        assert!(has_tool, "流式应识别出 tool_calls, 实际: {:?}", deltas);
     }
 
     /// 流式嗅探：XML 开标签（完整形态 / 未闭合不算）

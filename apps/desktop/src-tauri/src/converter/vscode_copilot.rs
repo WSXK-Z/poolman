@@ -221,19 +221,23 @@ impl Converter for VscodeCopilotConverter {
     fn convert_tools(&self, tools: &Value) -> String {
         let instruction = r#"
         1. 你可以在一次回答中调用多个工具，但必须一个工具对应一个完整的 tool_call 块。
-        2. 调用工具时，必须把每个工具输出成一个独立的 <tool_call> ... </tool_call> 围栏 YAML 块，且这是【唯一合法格式】，格式如下：
+        2. 调用工具时，必须把每个工具输出成一个独立的 <tool_call> ... </tool_call> 围栏 YAML 块，且这是【唯一合法格式】，示例如下：
             <tool_call>
-            name: <工具名>
+            name: read_file
             arguments:
-              <参数名>: <值>
+              filePath: d:/project/src/main.rs
+              startLine: 1
+              endLine: 20
             </tool_call>
         3. 格式硬性要求，违反任何一条都会导致你的工具调用无法被解析、任务失败：
-           - 每个块必须以开围栏 <tool_call> 开始、以闭围栏 </tool_call> 结束，开闭标签必须成对；不能漏下划线、不能改写成 <toolcall> 或其他任何变体；
-           - 块内第一行必须是 name: <工具名>，第二行必须是 arguments:，所有参数必须放在 arguments 键下面；禁止把工具名裸写在首行、禁止省略 name 或 arguments 键；
+           - 开标签与闭标签必须同名成对、逐字符写成 tool_call；围栏名不能改成其它任何写法，也不能漏写下划线；
+           - 块内第一行必须是 name: 加工具名，第二行必须是 arguments:，所有参数都放在 arguments 下面并缩进两个空格；不要把工具名裸写在首行，不要省略 name/arguments 键，不要把参数写成与 arguments: 同一缩进；
            - 每个工具块独占一个完整的开/闭围栏；多个工具块之间用换行分隔；
            - 多行参数（代码内容等）用块标量 |- 原样直写，不要转义引号/反斜杠/换行；参数里出现三反引号 ```（如 markdown 代码块）不影响围栏，正常书写即可；
-           - 路径用正斜杠或原样反斜杠均可；只能调用已定义工具；编辑类工具先读取文件最新内容再改。
-        4. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。"#;
+           - 路径用正斜杠或原样反斜杠均可；只能调用已定义工具；编辑类工具先读取文件最新内容再改；
+           - 除上面这一种围栏外，不要使用任何其它形式的工具调用标记。
+        4. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。
+        5. 输出前自检，任一条不符就重写：① 开/闭标签是否都是 tool_call？② 参数是否都缩进在 arguments: 下面？③ 是否夹带了普通文本？④ 工具名与参数名是否与工具定义完全一致、必填参数是否补齐？"#;
         format!(
             "\n{}\n以下是你可以调用的工具：\n{}",
             //render_tools(tools),
@@ -242,15 +246,17 @@ impl Converter for VscodeCopilotConverter {
         )
     }
 
-    /// 追问轮次：再次强调工具调用格式（简短提醒，不重复完整工具列表）
+    /// 追问轮次：再次强调工具调用格式（放在提示词末尾，用具体示例而非占位符）
     fn tool_format_reminder(&self) -> String {
-        r#"再次提醒：只要需要调用工具，就必须严格按下面的格式输出（唯一合法格式）：
-            <tool_call>
-            name: <工具名>
-            arguments:
-              <参数名>: <值>
-            </tool_call>
-        要求：开围栏 <tool_call> 与闭围栏 </tool_call> 必须成对，不能漏下划线、不能改写成 <toolcall> 或其他变体；第一行必须 name:、第二行必须 arguments:，参数放在 arguments 键下；不要省略 name/arguments 键、不要把工具名裸写在首行；每个工具块独占完整开/闭围栏，多个工具块用换行分隔；多行参数用 |- 块标量原样直写。调用工具时只输出 <tool_call> 块，不要夹带任何普通文本；普通文本与工具调用不可同时出现。"#
+        r#"【工具调用格式】只要需要调用工具，就只输出下面这种块（可以有多个），不要夹带任何其它文字：
+                <tool_call>
+                name: read_file
+                arguments:
+                  filePath: d:/project/src/main.rs
+                  startLine: 1
+                  endLine: 20
+                </tool_call>
+            要点：开标签和闭标签都必须逐字符写成 tool_call；每个参数都要缩进在 arguments: 下面（两个空格）；只能使用这一种围栏。"#
             .to_string()
     }
 
@@ -328,6 +334,32 @@ mod tests {
     use super::{split_tagged_sections, VscodeCopilotConverter};
     use crate::converter::{ConvertContext, Converter};
     use serde_json::json;
+
+    /// 工具提示词：必须有具体示例与硬性要求，且不得出现错误写法/占位符字面量
+    /// （在提示词里演示错误写法会把错误格式“教”给模型）
+    #[test]
+    fn tool_prompt_contains_hard_requirements() {
+        let tools = json!([{ "type": "function", "function": { "name": "read_file", "parameters": json!({ "type": "object" }) } }]);
+        let text = VscodeCopilotConverter.convert_tools(&tools);
+        for needle in [
+            "<tool_call>",
+            "name: read_file",
+            "缩进两个空格",
+            "逐字符写成 tool_call",
+            "输出前自检",
+        ] {
+            assert!(text.contains(needle), "工具段缺少内容: {}\n实际: {}", needle, text);
+        }
+        let reminder = VscodeCopilotConverter.tool_format_reminder();
+        assert!(reminder.contains("缩进"), "提醒段应强调参数缩进: {}", reminder);
+        assert!(reminder.contains("逐字符写成 tool_call"), "提醒段应强调围栏名: {}", reminder);
+        assert!(reminder.contains("name: read_file"), "提醒段应给出具体示例: {}", reminder);
+        assert!(reminder.contains("filePath:"), "提醒段示例应含参数行: {}", reminder);
+        for bad in ["<toolcall>", "call_call", "<工具名>", "<参数名>"] {
+            assert!(!reminder.contains(bad), "提醒段不应出现错误写法/占位符: {}", bad);
+            assert!(!text.contains(bad), "工具段不应出现错误写法/占位符: {}", bad);
+        }
+    }
 
     #[test]
     fn split_basic_tagged() {
@@ -479,9 +511,22 @@ mod tests {
             is_first_turn: false,
         };
         let c = VscodeCopilotConverter.assemble(&ctx);
-        assert!(c.contains("再次提醒"), "追问应再次强调格式, 实际: {}", c);
+        assert!(c.contains("【工具调用格式】"), "追问应再次强调格式, 实际: {}", c);
         assert!(c.contains("<tool_call>"), "提醒应含 <tool_call> 围栏");
         assert!(c.contains("</tool_call>"));
+        // 提醒必须放在提示词末尾（紧跟在用户提问之后，贴近生成位置）
+        let user_pos = c.find("用户：").expect("应含用户提问");
+        let reminder_pos = c.find("【工具调用格式】").unwrap();
+        assert!(
+            reminder_pos > user_pos,
+            "格式提醒应在用户提问之后（末尾），实际: {}",
+            c
+        );
+        assert!(
+            c.trim_end().ends_with("只能使用这一种围栏。"),
+            "格式提醒应在提示词末尾，实际: {}",
+            c
+        );
         // 首轮：完整工具段，不注入提醒
         let ctx_first = ConvertContext {
             messages: &messages,
@@ -490,6 +535,7 @@ mod tests {
         };
         let cf = VscodeCopilotConverter.assemble(&ctx_first);
         assert!(cf.contains("以下是你可以调用的工具"));
-        assert!(!cf.contains("再次提醒"), "首轮不应注入提醒, 实际: {}", cf);
+        assert!(cf.contains("输出前自检"), "首轮工具段应含完整格式要求, 实际: {}", cf);
+        assert!(!cf.contains("【工具调用格式】"), "首轮不应再注入提醒, 实际: {}", cf);
     }
 }

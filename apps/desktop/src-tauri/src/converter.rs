@@ -49,16 +49,17 @@ pub trait Converter: Send + Sync {
                     parts.push(t);
                 }
             }
-        } else if ctx.tools.is_some() {
-            // 追问轮且仍带工具：再次强调工具调用格式（避免模型忘记 <tool_call> 围栏规范）
-            let r = self.tool_format_reminder();
-            if !r.is_empty() {
-                parts.push(r);
-            }
         }
         let user = self.convert_user(ctx);
         if !user.is_empty() {
             parts.push(user);
+        }
+        // 追问轮且仍带工具：格式提醒放在【最末尾】（贴近生成位置，遵守率高于放前部）
+        if !ctx.is_first_turn && ctx.tools.is_some() {
+            let r = self.tool_format_reminder();
+            if !r.is_empty() {
+                parts.push(r);
+            }
         }
         parts.join("\n")
     }
