@@ -58,10 +58,11 @@ fn init_logging() {
 
 use apikey::ApiKeyStore;
 use config::ServerConfig;
+use extension::adapters::deepseek::DeepSeekService;
 use extension::credentials::CredentialStore;
+use extension::provider_control::{ManagedProvider, ProviderControl};
 use extension::websocket::WebSocketBridge;
 use openai::chat_router::ChatRouter;
-use extension::adapters::deepseek::DeepSeekService;
 use session::manager::SessionManager;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
@@ -125,7 +126,10 @@ async fn create_api_key(
     platform: String,
     note: Option<String>,
 ) -> Result<apikey::ApiKey, String> {
-    state.create(&platform, note).await.map_err(|e| e.to_string())
+    state
+        .create(&platform, note)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -149,7 +153,10 @@ async fn list_sessions(
     state: tauri::State<'_, Arc<SessionManager>>,
     api_key: Option<String>,
 ) -> Result<Vec<session::manager::SessionInfo>, String> {
-    state.list_sessions(api_key.as_deref()).await.map_err(|e| e.to_string())
+    state
+        .list_sessions(api_key.as_deref())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -168,10 +175,128 @@ async fn delete_session(
     state.delete_session(&id).await.map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn list_managed_providers(
+    state: tauri::State<'_, Arc<ProviderControl>>,
+    bridge: tauri::State<'_, Arc<WebSocketBridge>>,
+) -> Result<Vec<ManagedProvider>, String> {
+    let status = bridge.latest_status.read().await;
+    Ok(state.list(&status))
+}
+
+#[tauri::command]
+async fn set_provider_enabled(
+    state: tauri::State<'_, Arc<ProviderControl>>,
+    bridge: tauri::State<'_, Arc<WebSocketBridge>>,
+    provider: String,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        let status = bridge.latest_status.read().await;
+        let authed = status
+            .get(&provider)
+            .and_then(|item| item.get("authed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !authed {
+            return Err(format!("供应商 {} 尚未登录，不能启用", provider));
+        }
+    }
+    state
+        .set_enabled(&provider, enabled)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_plugins(
+    state: tauri::State<'_, Arc<WebSocketBridge>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    Ok(state.list_plugins().await)
+}
+
+#[tauri::command]
+async fn set_plugin_enabled(
+    state: tauri::State<'_, Arc<WebSocketBridge>>,
+    plugin_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    state
+        .set_plugin_enabled(&plugin_id, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn set_plugin_provider_enabled(
+    state: tauri::State<'_, Arc<WebSocketBridge>>,
+    plugin_id: String,
+    provider: String,
+    enabled: bool,
+) -> Result<(), String> {
+    if enabled {
+        let statuses = state.plugin_statuses.read().await;
+        let authed = statuses
+            .get(&plugin_id)
+            .and_then(|status| status.get(&provider))
+            .and_then(|status| status.get("authed"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if !authed {
+            return Err(format!("插件中的供应商 {} 尚未登录，不能启用", provider));
+        }
+    }
+    state
+        .set_plugin_provider_enabled(&plugin_id, &provider, enabled)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn control_plugin_provider(
+    state: tauri::State<'_, Arc<WebSocketBridge>>,
+    plugin_id: String,
+    provider: String,
+    action: String,
+) -> Result<(), String> {
+    if !matches!(action.as_str(), "connect" | "disconnect" | "open") {
+        return Err("不支持的供应商操作".to_string());
+    }
+    state
+        .send_provider_control(&plugin_id, &provider, &action)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn list_provider_sessions(
+    provider: String,
+    deepseek: tauri::State<'_, Arc<DeepSeekService>>,
+) -> Result<Vec<serde_json::Value>, String> {
+    if provider != "deepseek-web" {
+        return Err(format!("{} 尚未实现网页会话管理", provider));
+    }
+    deepseek.list_provider_sessions().await.map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_provider_session(
+    provider: String,
+    session_id: String,
+    deepseek: tauri::State<'_, Arc<DeepSeekService>>,
+) -> Result<(), String> {
+    if provider != "deepseek-web" {
+        return Err(format!("{} 尚未实现网页会话管理", provider));
+    }
+    deepseek.delete_provider_session(&session_id).await.map_err(|e| e.to_string())
+}
+
 /// 启动内置网关服务端：连接扩展 WebSocket → 组装 DeepSeek provider → 起 HTTP API
 async fn start_server(
     api_keys: Arc<ApiKeyStore>,
-    sessions: Arc<SessionManager>,
+    provider_control: Arc<ProviderControl>,
+    credentials: Arc<CredentialStore>,
+    bridge: Arc<WebSocketBridge>,
+    deepseek: Arc<DeepSeekService>,
 ) -> anyhow::Result<()> {
     init_logging();
     info!("正在启动 Rust AI 网关服务端（Tauri 集成）...");
@@ -181,12 +306,6 @@ async fn start_server(
         "配置已加载: host={}, port={}, ws_port={}",
         config.host, config.port, config.ws_port
     );
-
-    // 凭证存储（扩展通过 CREDENTIAL_SYNC 上报）
-    let credentials = Arc::new(CredentialStore::new());
-
-    // WebSocket 桥接（与浏览器扩展通信，捕获凭证 + 执行 fetch）
-    let bridge = Arc::new(WebSocketBridge::new(credentials.clone()));
 
     // 监听扩展 WebSocket（服务端模式，后台任务）：扩展作为客户端连接 ws://host:ws_port
     let ws_addr = format!("{}:{}", config.host, config.ws_port);
@@ -202,16 +321,11 @@ async fn start_server(
     info!("WebSocket 服务端正在监听 ws://{}", ws_addr_log);
 
     // DeepSeek 网页版服务端直管（请求组装 / PoW / SSE / 会话 / 工具）
-    let deepseek = Arc::new(DeepSeekService::new(
-        bridge.clone(),
-        credentials.clone(),
-        config.request_timeout_ms,
-        Some(sessions.clone()),
-    ));
     let chat_router = Arc::new(ChatRouter::new(
         bridge.clone(),
         Some(deepseek),
         config.request_timeout_ms,
+        provider_control,
     ));
 
     // HTTP API（OpenAI 兼容）
@@ -238,8 +352,8 @@ pub fn run() {
     // 默认放 data 目录：开发在项目 data/，打包后随安装的软件目录）
     let data_dir = data_dir();
     let _ = std::fs::create_dir_all(&data_dir);
-    let db_path = std::env::var("AI_GATEWAY_DB")
-        .unwrap_or_else(|_| format!("{}/gateway.db", data_dir));
+    let db_path =
+        std::env::var("AI_GATEWAY_DB").unwrap_or_else(|_| format!("{}/gateway.db", data_dir));
     let init_rt = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
     let api_keys = Arc::new(
         init_rt
@@ -253,12 +367,31 @@ pub fn run() {
     );
     drop(init_rt);
     let api_keys_server = api_keys.clone();
-    let sessions_server = sessions.clone();
+    let provider_control = Arc::new(ProviderControl::new(&data_dir));
+    let provider_control_server = provider_control.clone();
+    let credentials = Arc::new(CredentialStore::new());
+    let bridge = Arc::new(WebSocketBridge::new(credentials.clone()));
+    let bridge_server = bridge.clone();
+    let credentials_server = credentials.clone();
+    let startup_config = ServerConfig::from_env();
+    let deepseek = Arc::new(DeepSeekService::new(
+        bridge.clone(),
+        credentials.clone(),
+        startup_config.request_timeout_ms,
+        Some(sessions.clone()),
+    ));
+    let deepseek_server = deepseek.clone();
 
     // 在独立线程中启动 HTTP 服务器（避免阻塞 Tauri UI）
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().expect("创建 tokio 运行时失败");
-        if let Err(e) = rt.block_on(start_server(api_keys_server, sessions_server)) {
+        if let Err(e) = rt.block_on(start_server(
+            api_keys_server,
+            provider_control_server,
+            credentials_server,
+            bridge_server,
+            deepseek_server,
+        )) {
             eprintln!("HTTP 服务端错误: {}", e);
         }
     });
@@ -267,6 +400,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .manage(api_keys)
         .manage(sessions)
+        .manage(provider_control)
+        .manage(bridge)
+        .manage(deepseek)
         .invoke_handler(tauri::generate_handler![
             greet,
             plugin_extension_dir,
@@ -275,7 +411,15 @@ pub fn run() {
             revoke_api_key,
             list_sessions,
             get_session,
-            delete_session
+            delete_session,
+            list_managed_providers,
+            set_provider_enabled,
+            list_plugins,
+            set_plugin_enabled,
+            set_plugin_provider_enabled,
+            control_plugin_provider,
+            list_provider_sessions,
+            delete_provider_session
         ])
         .run(tauri::generate_context!())
         .expect("运行 tauri 应用出错");

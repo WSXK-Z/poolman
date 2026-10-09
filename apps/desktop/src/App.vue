@@ -15,12 +15,14 @@ import HelpView from "./views/HelpView.vue";
 import KeysView from "./views/KeysView.vue";
 import SessionView from "./views/SessionView.vue";
 import StatusView from "./views/StatusView.vue";
+import PluginManagementView from "./views/PluginManagementView.vue";
 
 const activeMenu = ref("keys");
 const menuOptions = [
   { label: "密钥", key: "keys" },
   { label: "会话", key: "sessions" },
   { label: "状态", key: "status" },
+  { label: "插件管理", key: "plugins" },
   { label: "配置", key: "config" },
   { label: "帮助", key: "help" },
 ];
@@ -41,6 +43,7 @@ const menuOptions = [
           <HelpView v-else-if="activeMenu === 'help'" />
           <KeysView v-else-if="activeMenu === 'keys'" />
           <SessionView v-else-if="activeMenu === 'sessions'" />
+          <PluginManagementView v-else-if="activeMenu === 'plugins'" />
           <StatusView v-else />
         </n-layout-content>
       </n-layout>

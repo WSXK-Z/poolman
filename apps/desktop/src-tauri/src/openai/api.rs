@@ -156,16 +156,21 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     AxumJson(status)
 }
 
-pub async fn models_handler() -> impl IntoResponse {
+pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let models = vec![
-        serde_json::json!({ "id": "deepseek-chat", "object": "model" }),
-        serde_json::json!({ "id": "deepseek-reasoner", "object": "model" }),
-        serde_json::json!({ "id": "gpt-4", "object": "model" }),
-        serde_json::json!({ "id": "gpt-3.5-turbo", "object": "model" }),
-        serde_json::json!({ "id": "claude-3-opus", "object": "model" }),
-        serde_json::json!({ "id": "claude-3-sonnet", "object": "model" }),
-        serde_json::json!({ "id": "gemini-pro", "object": "model" }),
+        ("deepseek-chat", "deepseek-web"),
+        ("deepseek-reasoner", "deepseek-web"),
+        ("gpt-4", "chatgpt-web"),
+        ("gpt-3.5-turbo", "chatgpt-web"),
+        ("claude-3-opus", "claude-web"),
+        ("claude-3-sonnet", "claude-web"),
+        ("gemini-pro", "gemini-web"),
     ];
+    let models: Vec<_> = models
+        .into_iter()
+        .filter(|(_, provider)| state.chat_router.is_provider_enabled(provider))
+        .map(|(model, _)| serde_json::json!({ "id": model, "object": "model" }))
+        .collect();
     AxumJson(serde_json::json!({ "object": "list", "data": models }))
 }
 
@@ -201,10 +206,9 @@ pub async fn chat_completions_handler(
 ) -> impl IntoResponse {
     // 原始消息与转换后提示词在 deepseek.rs 转换处一并保存（同一文件）
     // API Key 鉴权 → (key, 绑定平台)：key 用于会话归属，平台决定转换器
-    let (api_key, platform) =
-        match resolve_api_key_platform(&headers, &state.api_keys).await {
-            Ok(p) => p,
-            Err(status) => {
+    let (api_key, platform) = match resolve_api_key_platform(&headers, &state.api_keys).await {
+        Ok(p) => p,
+        Err(status) => {
             return (
                 status,
                 AxumJson(serde_json::json!({
@@ -333,7 +337,11 @@ pub async fn chat_completions_handler(
     }
 
     // 非流式
-    match state.chat_router.handle(&model, messages, Some(options)).await {
+    match state
+        .chat_router
+        .handle(&model, messages, Some(options))
+        .await
+    {
         Ok(result) => {
             let content = result.content;
             let tool_calls = result.tool_calls;
@@ -342,7 +350,11 @@ pub async fn chat_completions_handler(
 
             let message = Message {
                 role: "assistant".to_string(),
-                content: if tool_calls.is_some() { None } else { Some(content) },
+                content: if tool_calls.is_some() {
+                    None
+                } else {
+                    Some(content)
+                },
                 tool_calls: tool_calls.and_then(|tc| serde_json::from_value(tc).ok()),
             };
 

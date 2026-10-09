@@ -164,6 +164,34 @@ export async function handleServerMessage(
       }
       break;
     }
+    case MessageType.PROVIDER_CONTROL: {
+      const { provider, action } = msg.payload;
+      try {
+        if (action === 'open') {
+          await getProvider(provider).open();
+          break;
+        }
+        const enabledProviders = {
+          ...backgroundState.settings.enabledProviders,
+          [provider]: action === 'connect',
+        };
+        backgroundState.setSettings({ enabledProviders });
+        await browser.storage.local.set(backgroundState.settings as unknown as Record<string, unknown>);
+        if (action === 'connect') {
+          await getProvider(provider).open();
+          backgroundState.setProviderStatus(provider, {
+            connected: true,
+            authed: !!backgroundState.getToken(provider),
+            tokenCaptured: !!backgroundState.getToken(provider),
+          });
+        } else {
+          backgroundState.setProviderStatus(provider, { connected: false, authed: false });
+        }
+      } catch (err) {
+        log.error(`供应商控制失败：${provider}`, errorMessage(err));
+      }
+      break;
+    }
     default:
       // 所有协议消息类型都已在上面覆盖；此处仅防御性兜底（msg 已被窄化为 never）
       log.warn('收到未处理的服务端消息类型', msg);

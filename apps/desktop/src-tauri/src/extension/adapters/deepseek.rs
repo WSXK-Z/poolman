@@ -19,6 +19,8 @@ const DEEPSEEK_API_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion
 const DEEPSEEK_SESSION_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
 const DEEPSEEK_HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 const DEEPSEEK_TITLE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/update_title";
+const DEEPSEEK_SESSION_LIST_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/fetch_page";
+const DEEPSEEK_SESSION_DELETE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/delete";
 const POW_CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
 const DEEPSEEK_MODEL_TYPE: &str = "default";
 const DEEPSEEK_THINK: bool = true;
@@ -940,6 +942,56 @@ impl DeepSeekService {
             last_raw_snippet: StdMutex::new(String::new()),
             session_manager,
         }
+    }
+
+    pub async fn list_provider_sessions(&self) -> Result<Vec<Value>> {
+        let token = self.ensure_token().await?;
+        let settings_token = self.credentials.get_settings_token(PROVIDER_ID);
+        let headers = self.default_headers(&token, settings_token.as_deref());
+        let url = format!("{DEEPSEEK_SESSION_LIST_URL}?lte_cursor.pinned=false");
+        let response = self
+            .execute_once("GET", &url, headers, None, AUX_TIMEOUT)
+            .await?;
+        if !response.ok {
+            anyhow::bail!(
+                "获取 DeepSeek 会话失败（HTTP {}）：{}",
+                response.status,
+                response.body
+            );
+        }
+        let body: Value = serde_json::from_str(&response.body)?;
+        let data = body
+            .get("data")
+            .and_then(|value| value.get("biz_data"))
+            .or_else(|| body.get("data"))
+            .unwrap_or(&body);
+        let sessions = data
+            .get("chat_sessions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("DeepSeek 会话列表响应格式无法识别：{}", response.body))?;
+        Ok(sessions.clone())
+    }
+
+    pub async fn delete_provider_session(&self, session_id: &str) -> Result<()> {
+        let token = self.ensure_token().await?;
+        let settings_token = self.credentials.get_settings_token(PROVIDER_ID);
+        let response = self.execute_once(
+            "POST",
+            DEEPSEEK_SESSION_DELETE_URL,
+            self.default_headers(&token, settings_token.as_deref()),
+            Some(json!({ "chat_session_id": session_id }).to_string()),
+            AUX_TIMEOUT,
+        ).await?;
+        if !response.ok {
+            anyhow::bail!("删除 DeepSeek 会话失败（HTTP {}）", response.status);
+        }
+        let body: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+        if body.get("code").and_then(Value::as_i64).is_some_and(|code| code != 0)
+            || body.get("data").and_then(|v| v.get("biz_code")).and_then(Value::as_i64).is_some_and(|code| code != 0)
+        {
+            anyhow::bail!("DeepSeek 拒绝删除会话：{}", response.body);
+        }
+        Ok(())
     }
 
     /* ------------------------- 凭证与节流 ------------------------- */
@@ -2940,5 +2992,3 @@ graph TB
         assert!(has_tool, "DSML 工具调用应解析出 tool_calls, 实际: {:?}", final_deltas);
     }
 }
-
-

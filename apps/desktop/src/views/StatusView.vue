@@ -7,8 +7,19 @@ import {
   NDescriptionsItem,
   NSpin,
   NTag,
+  NButton,
 } from "naive-ui";
 import { getHealthUrl } from "../config";
+import { invoke } from "@tauri-apps/api/core";
+
+interface ManagedProvider {
+  id: string;
+  name: string;
+  connected: boolean;
+  authed: boolean;
+  token_captured: boolean;
+  enabled: boolean;
+}
 
 interface ProviderCred {
   token_captured?: boolean;
@@ -26,6 +37,8 @@ const status = ref<{
 } | null>(null);
 const error = ref("");
 let timer: number | undefined;
+const providers = ref<ManagedProvider[]>([]);
+const updatingProvider = ref<string | null>(null);
 
 async function load() {
   try {
@@ -36,6 +49,26 @@ async function load() {
   } catch (e: unknown) {
     error.value = e instanceof Error ? e.message : String(e);
     status.value = null;
+  }
+  try {
+    providers.value = await invoke<ManagedProvider[]>("list_managed_providers");
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : String(e);
+  }
+}
+
+async function toggleProvider(provider: ManagedProvider) {
+  updatingProvider.value = provider.id;
+  try {
+    await invoke("set_provider_enabled", {
+      provider: provider.id,
+      enabled: !provider.enabled,
+    });
+    provider.enabled = !provider.enabled;
+  } catch (e: unknown) {
+    error.value = e instanceof Error ? e.message : String(e);
+  } finally {
+    updatingProvider.value = null;
   }
 }
 
@@ -74,6 +107,31 @@ onUnmounted(() => window.clearInterval(timer));
     </n-card>
 
     <n-card v-if="status" title="凭证状态" style="max-width: 720px; margin-top: 16px">
+      <div class="provider-list">
+        <div v-for="provider in providers" :key="provider.id" class="provider-row">
+          <div class="provider-info">
+            <strong>{{ provider.name }}</strong>
+            <n-tag :type="provider.connected ? 'success' : 'default'" size="small">
+              {{ provider.connected ? '插件已连接' : '插件未连接' }}
+            </n-tag>
+            <n-tag :type="provider.authed ? 'success' : 'warning'" size="small">
+              {{ provider.authed ? '已登录' : '未检测到登录凭证' }}
+            </n-tag>
+          </div>
+          <n-button
+            size="small"
+            :type="provider.enabled ? 'warning' : 'success'"
+            :loading="updatingProvider === provider.id"
+            :disabled="!provider.authed"
+            @click="toggleProvider(provider)"
+          >
+            {{ provider.enabled ? '桌面端停用' : '桌面端启用' }}
+          </n-button>
+        </div>
+      </div>
+      <n-alert type="info" :show-icon="true" style="margin: 12px 0">
+        桌面端停用只会阻止网关 API 使用该供应商，不会更改插件端的连接开关。
+      </n-alert>
       <n-descriptions v-if="Object.keys(status.credentials || {}).length" :column="1" bordered>
         <n-descriptions-item
           v-for="(v, p) in status.credentials"
@@ -93,3 +151,26 @@ onUnmounted(() => window.clearInterval(timer));
 </div>
 
 </template>
+
+<style scoped>
+.provider-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.provider-row,
+.provider-info {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-row {
+  justify-content: space-between;
+  padding: 10px 12px;
+  border: 1px solid rgba(128, 128, 128, 0.2);
+  border-radius: 6px;
+}
+</style>

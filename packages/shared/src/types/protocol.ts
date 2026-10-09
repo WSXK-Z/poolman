@@ -28,6 +28,8 @@ export const MessageType = {
   EXECUTE_RESULT: 'EXECUTE_RESULT',
   /** 插件 -> 服务：执行失败（网络错误、页面不可达等） */
   EXECUTE_ERROR: 'EXECUTE_ERROR',
+  /** 服务 -> 插件：控制指定供应商的连接状态 */
+  PROVIDER_CONTROL: 'PROVIDER_CONTROL',
 } as const;
 
 export type MessageType = (typeof MessageType)[keyof typeof MessageType];
@@ -180,6 +182,11 @@ export interface ExecuteError extends BaseMessage {
   payload: { error: string; code?: string };
 }
 
+export interface ProviderControlMessage extends BaseMessage {
+  type: typeof MessageType.PROVIDER_CONTROL;
+  payload: { provider: ModelProvider; action: 'connect' | 'disconnect' };
+}
+
 export type ProtocolMessage =
   | ChatRequest
   | ChatChunk
@@ -192,4 +199,5 @@ export type ProtocolMessage =
   | CredentialSync
   | ExecuteChunk
   | ExecuteResult
-  | ExecuteError;
+  | ExecuteError
+  | ProviderControlMessage;

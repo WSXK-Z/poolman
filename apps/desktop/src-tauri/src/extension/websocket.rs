@@ -1,14 +1,14 @@
+use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::{accept_async, connect_async, tungstenite::Message};
-use futures_util::{SinkExt, StreamExt};
 use tracing::{error, info, warn};
 use uuid::Uuid;
-use serde_json::Value;
 
-use super::handler::handle_bridge_message;
 use super::credentials::CredentialStore;
+use super::handler::handle_bridge_message;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
@@ -34,8 +34,10 @@ pub struct ChatRequestPayload {
     pub options: Option<serde_json::Value>,
 }
 
-pub type PendingRequests = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChatResponsePayload>>>>;
-pub type ChunkCallbacks = Arc<Mutex<HashMap<String, Box<dyn FnMut(ChatChunkPayload) + Send + Sync>>>>;
+pub type PendingRequests =
+    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChatResponsePayload>>>>;
+pub type ChunkCallbacks =
+    Arc<Mutex<HashMap<String, Box<dyn FnMut(ChatChunkPayload) + Send + Sync>>>>;
 
 #[derive(Debug, Clone)]
 pub struct ExecuteRequestPayload {
@@ -53,16 +55,22 @@ pub struct ExecuteResultPayload {
     pub body: String,
 }
 
-pub type PendingExecute = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecuteResultPayload>>>>;
+pub type PendingExecute =
+    Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ExecuteResultPayload>>>>;
 pub type ExecuteChunkCallbacks = Arc<Mutex<HashMap<String, Box<dyn FnMut(String) + Send + Sync>>>>;
 pub type PendingCapture = Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<()>>>>;
 
-type WsStream = tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 type WsSplitStream = futures_util::stream::SplitStream<WsStream>;
 
 pub struct WebSocketBridge {
     pub sender: Arc<Mutex<Option<WsSink>>>,
+    pub senders: Arc<Mutex<HashMap<String, WsSink>>>,
+    pub plugin_statuses: Arc<RwLock<HashMap<String, serde_json::Value>>>,
+    pub enabled_plugins: Arc<RwLock<HashMap<String, bool>>>,
+    pub enabled_providers: Arc<RwLock<HashMap<String, bool>>>,
     pub pending: PendingRequests,
     pub chunk_callbacks: ChunkCallbacks,
     pub pending_execute: PendingExecute,
@@ -77,6 +85,10 @@ impl WebSocketBridge {
     pub fn new(credentials: Arc<CredentialStore>) -> Self {
         Self {
             sender: Arc::new(Mutex::new(None)),
+            senders: Arc::new(Mutex::new(HashMap::new())),
+            plugin_statuses: Arc::new(RwLock::new(HashMap::new())),
+            enabled_plugins: Arc::new(RwLock::new(HashMap::new())),
+            enabled_providers: Arc::new(RwLock::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             chunk_callbacks: Arc::new(Mutex::new(HashMap::new())),
             pending_execute: Arc::new(Mutex::new(HashMap::new())),
@@ -86,6 +98,79 @@ impl WebSocketBridge {
             latest_status: Arc::new(RwLock::new(serde_json::json!({}))),
             credentials,
         }
+    }
+
+    pub async fn list_plugins(&self) -> Vec<serde_json::Value> {
+        let statuses = self.plugin_statuses.read().await;
+        let enabled = self.enabled_plugins.read().await;
+        let provider_enabled = self.enabled_providers.read().await;
+        statuses
+            .iter()
+            .map(|(id, providers)| {
+                let mut provider_states = providers.clone();
+                if let Some(map) = provider_states.as_object_mut() {
+                    for (provider, item) in map.iter_mut() {
+                        if let Some(item) = item.as_object_mut() {
+                            item.insert(
+                                "desktopEnabled".to_string(),
+                                serde_json::json!(provider_enabled
+                                    .get(&format!("{id}:{provider}"))
+                                    .copied()
+                                    .unwrap_or(true)),
+                            );
+                        }
+                    }
+                }
+                serde_json::json!({
+                    "id": id,
+                    "enabled": enabled.get(id).copied().unwrap_or(true),
+                    "providers": provider_states,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn set_plugin_enabled(&self, id: &str, value: bool) -> anyhow::Result<()> {
+        if !self.plugin_statuses.read().await.contains_key(id) {
+            anyhow::bail!("插件连接已断开");
+        }
+        self.enabled_plugins
+            .write()
+            .await
+            .insert(id.to_string(), value);
+        Ok(())
+    }
+
+    pub async fn set_plugin_provider_enabled(
+        &self,
+        id: &str,
+        provider: &str,
+        value: bool,
+    ) -> anyhow::Result<()> {
+        let key = format!("{id}:{provider}");
+        self.enabled_providers.write().await.insert(key, value);
+        Ok(())
+    }
+
+    pub async fn send_provider_control(
+        &self,
+        id: &str,
+        provider: &str,
+        action: &str,
+    ) -> anyhow::Result<()> {
+        let message = serde_json::json!({
+            "id": Uuid::new_v4().to_string(),
+            "type": "PROVIDER_CONTROL",
+            "timestamp": chrono::Utc::now().timestamp_millis(),
+            "payload": { "provider": provider, "action": action }
+        });
+        let text = serde_json::to_string(&message)?;
+        let mut senders = self.senders.lock().await;
+        let sink = senders
+            .get_mut(id)
+            .ok_or_else(|| anyhow::anyhow!("插件连接已断开"))?;
+        sink.send(Message::Text(text)).await?;
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -114,15 +199,16 @@ impl WebSocketBridge {
             };
             match accept_async(tokio_tungstenite::MaybeTlsStream::Plain(tcp)).await {
                 Ok(ws) => {
-                    // 拆分：发送端存共享供下行发送；接收端交给 run_listener 收消息
                     let (sink, stream) = ws.split();
-                    if let Some(mut old) = self.sender.lock().await.take() {
-                        let _ = old.close().await;
-                    }
-                    *self.sender.lock().await = Some(sink);
+                    let plugin_id = Uuid::new_v4().to_string();
+                    self.senders.lock().await.insert(plugin_id.clone(), sink);
+                    self.plugin_statuses
+                        .write()
+                        .await
+                        .insert(plugin_id.clone(), serde_json::json!({}));
                     *self.connected.write().await = true;
-                    info!("WebSocket 客户端已连接");
-                    if let Err(e) = self.run_listener(stream).await {
+                    info!("WebSocket 插件已连接: {}", plugin_id);
+                    if let Err(e) = self.run_listener(stream, plugin_id).await {
                         warn!("WebSocket 监听错误: {}", e);
                     }
                 }
@@ -159,10 +245,59 @@ impl WebSocketBridge {
         }
 
         let json = serde_json::to_string(&message)?;
-        if let Some(sink) = self.sender.lock().await.as_mut() {
-            sink.send(Message::Text(json)).await?;
+        let provider = match payload.model.as_str() {
+            "openai" | "chatgpt" => "chatgpt-web",
+            "claude" => "claude-web",
+            "gemini" => "gemini-web",
+            "kimi" => "kimi-web",
+            "qwen" => "qwen-web",
+            "deepseek" => "deepseek-web",
+            other => other,
+        };
+        let selected = {
+            let statuses = self.plugin_statuses.read().await;
+            let enabled = self.enabled_plugins.read().await;
+            let provider_enabled = self.enabled_providers.read().await;
+            statuses.iter().find_map(|(id, status)| {
+                if !enabled.get(id).copied().unwrap_or(true) {
+                    return None;
+                }
+                if !provider_enabled
+                    .get(&format!("{id}:{provider}"))
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    return None;
+                }
+                status
+                    .get(provider)
+                    .and_then(|item| item.get("authed"))
+                    .and_then(serde_json::Value::as_bool)
+                    .filter(|authed| *authed)
+                    .map(|_| id.clone())
+            })
+        };
+        let sent = if let Some(plugin_id) = selected {
+            if let Some(sink) = self.senders.lock().await.get_mut(&plugin_id) {
+                sink.send(Message::Text(json)).await?;
+                true
+            } else {
+                false
+            }
+        } else if self.senders.lock().await.is_empty() {
+            if let Some(sink) = self.sender.lock().await.as_mut() {
+                sink.send(Message::Text(json)).await?;
+                true
+            } else {
+                false
+            }
         } else {
-            return Err(anyhow::anyhow!("WebSocket 未连接"));
+            false
+        };
+        if !sent {
+            self.pending.lock().await.remove(&id);
+            self.chunk_callbacks.lock().await.remove(&id);
+            return Err(anyhow::anyhow!("没有可分配该供应商请求的已连接插件"));
         }
 
         tokio::select! {
@@ -211,7 +346,11 @@ impl WebSocketBridge {
         self.chunk_callbacks.lock().await.remove(id);
     }
 
-    pub async fn run_listener(&self, mut stream: WsSplitStream) -> anyhow::Result<()> {
+    pub async fn run_listener(
+        &self,
+        mut stream: WsSplitStream,
+        plugin_id: String,
+    ) -> anyhow::Result<()> {
         let connected = self.connected.clone();
         let pending = self.pending.clone();
         let chunk_callbacks = self.chunk_callbacks.clone();
@@ -219,6 +358,10 @@ impl WebSocketBridge {
         let execute_chunk_callbacks = self.execute_chunk_callbacks.clone();
         let pending_capture = self.pending_capture.clone();
         let latest_status = self.latest_status.clone();
+        let plugin_statuses = self.plugin_statuses.clone();
+        let senders = self.senders.clone();
+        let enabled_plugins = self.enabled_plugins.clone();
+        let listener_plugin_id = plugin_id.clone();
         let credentials = self.credentials.clone();
 
         tokio::spawn(async move {
@@ -234,23 +377,36 @@ impl WebSocketBridge {
                                 &execute_chunk_callbacks,
                                 &pending_capture,
                                 &latest_status,
+                                &plugin_statuses,
+                                &listener_plugin_id,
                                 &credentials,
                             )
                             .await;
                         }
                     }
                     Ok(Message::Close(_)) => {
-                        *connected.write().await = false;
+                        plugin_statuses.write().await.remove(&listener_plugin_id);
+                        senders.lock().await.remove(&listener_plugin_id);
+                        enabled_plugins.write().await.remove(&listener_plugin_id);
+                        plugin_statuses.write().await.remove(&listener_plugin_id);
+                        *connected.write().await = !senders.lock().await.is_empty();
                         break;
                     }
                     Err(e) => {
                         error!("WebSocket 错误: {}", e);
-                        *connected.write().await = false;
+                        plugin_statuses.write().await.remove(&listener_plugin_id);
+                        senders.lock().await.remove(&listener_plugin_id);
+                        enabled_plugins.write().await.remove(&listener_plugin_id);
+                        *connected.write().await = !senders.lock().await.is_empty();
                         break;
                     }
                     _ => {}
                 }
             }
+            plugin_statuses.write().await.remove(&plugin_id);
+            senders.lock().await.remove(&plugin_id);
+            enabled_plugins.write().await.remove(&plugin_id);
+            *connected.write().await = !senders.lock().await.is_empty();
         });
         Ok(())
     }
@@ -295,14 +451,57 @@ impl WebSocketBridge {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.pending_execute.lock().await.insert(id.clone(), tx);
         if let Some(cb) = on_chunk {
-            self.execute_chunk_callbacks.lock().await.insert(id.clone(), cb);
+            self.execute_chunk_callbacks
+                .lock()
+                .await
+                .insert(id.clone(), cb);
         }
 
         let json = serde_json::to_string(&message)?;
-        if let Some(sink) = self.sender.lock().await.as_mut() {
-            sink.send(Message::Text(json)).await?;
+        let target = {
+            let statuses = self.plugin_statuses.read().await;
+            let enabled = self.enabled_plugins.read().await;
+            let provider_enabled = self.enabled_providers.read().await;
+            statuses.iter().find_map(|(id, status)| {
+                if !enabled.get(id).copied().unwrap_or(true) {
+                    return None;
+                }
+                if !provider_enabled
+                    .get(&format!("{id}:{}", payload.provider))
+                    .copied()
+                    .unwrap_or(true)
+                {
+                    return None;
+                }
+                status
+                    .get(&payload.provider)
+                    .and_then(|item| item.get("authed"))
+                    .and_then(serde_json::Value::as_bool)
+                    .filter(|authed| *authed)
+                    .map(|_| id.clone())
+            })
+        };
+        let sent = if let Some(id) = target {
+            if let Some(sink) = self.senders.lock().await.get_mut(&id) {
+                sink.send(Message::Text(json)).await?;
+                true
+            } else {
+                false
+            }
+        } else if self.senders.lock().await.is_empty() {
+            if let Some(sink) = self.sender.lock().await.as_mut() {
+                sink.send(Message::Text(json)).await?;
+                true
+            } else {
+                false
+            }
         } else {
-            return Err(anyhow::anyhow!("WebSocket 未连接"));
+            false
+        };
+        if !sent {
+            self.pending_execute.lock().await.remove(&id);
+            self.execute_chunk_callbacks.lock().await.remove(&id);
+            return Err(anyhow::anyhow!("没有可分配该供应商请求的已连接插件"));
         }
 
         tokio::select! {
@@ -335,10 +534,33 @@ impl WebSocketBridge {
         self.pending_capture.lock().await.insert(id.clone(), tx);
 
         let json = serde_json::to_string(&message)?;
-        if let Some(sink) = self.sender.lock().await.as_mut() {
+        let target = {
+            let statuses = self.plugin_statuses.read().await;
+            statuses.iter().find_map(|(id, status)| {
+                status
+                    .get(provider)
+                    .and_then(|item| item.get("connected"))
+                    .and_then(serde_json::Value::as_bool)
+                    .filter(|connected| *connected)
+                    .map(|_| id.clone())
+            })
+        };
+        let sent = if let Some(id) = target {
+            if let Some(sink) = self.senders.lock().await.get_mut(&id) {
+                sink.send(Message::Text(json)).await?;
+                true
+            } else {
+                false
+            }
+        } else if let Some(sink) = self.sender.lock().await.as_mut() {
             sink.send(Message::Text(json)).await?;
+            true
         } else {
-            return Err(anyhow::anyhow!("WebSocket 未连接"));
+            false
+        };
+        if !sent {
+            self.pending_capture.lock().await.remove(&id);
+            return Err(anyhow::anyhow!("没有可用的已连接插件"));
         }
 
         tokio::select! {

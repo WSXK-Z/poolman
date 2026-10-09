@@ -2,4 +2,5 @@
 pub mod adapters;
 pub mod credentials;
 pub mod handler;
+pub mod provider_control;
 pub mod websocket;
