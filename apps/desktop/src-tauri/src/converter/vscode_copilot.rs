@@ -236,8 +236,10 @@ impl Converter for VscodeCopilotConverter {
            - 多行参数（代码内容等）用块标量 |- 原样直写，不要转义引号/反斜杠/换行；参数里出现三反引号 ```（如 markdown 代码块）不影响围栏，正常书写即可；
            - 路径用正斜杠或原样反斜杠均可；只能调用已定义工具；编辑类工具先读取文件最新内容再改；
            - 除上面这一种围栏外，不要使用任何其它形式的工具调用标记。
+           - 除上面这一种围栏外，不要使用任何其它形式的工具调用标记：禁止出现 <parameter>、<invoke>、<calls>、|DSML|、||DSML||、｜｜DSML｜｜ 及其任何闭合形式，块内不得混入任何 XML 或 DSML 标签。
+           - 开闭标签数量必须严格一一对应：每个 <tool_call> 恰好配一个 </tool_call>，全文 </tool_call> 的数量等于 <tool_call> 的数量；输出结束后不得再补写任何多余的 </tool_call>。
         4. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。
-        5. 输出前自检，任一条不符就重写：① 开/闭标签是否都是 tool_call？② 参数是否都缩进在 arguments: 下面？③ 是否夹带了普通文本？④ 工具名与参数名是否与工具定义完全一致、必填参数是否补齐？"#;
+        5. 输出前自检，任一条不符就重写：① 开/闭标签是否都是 tool_call？② 参数是否都缩进在 arguments: 下面？③ 是否夹带了普通文本？④ 工具名与参数名是否与工具定义完全一致、必填参数是否补齐？⑤ 数一遍 <tool_call> 与 </tool_call> 是否数量相等、末尾是否多写了闭合标签？"#;
         format!(
             "\n{}\n以下是你可以调用的工具：\n{}",
             //render_tools(tools),
@@ -256,7 +258,7 @@ impl Converter for VscodeCopilotConverter {
                   startLine: 1
                   endLine: 20
                 </tool_call>
-            要点：开标签和闭标签都必须逐字符写成 tool_call；每个参数都要缩进在 arguments: 下面（两个空格）；只能使用这一种围栏。"#
+            要点：开标签和闭标签都必须逐字符写成 tool_call；每个参数都要缩进在 arguments: 下面（两个空格）；禁止出现 <parameter>、<invoke>、<calls>、|DSML|、||DSML||、｜｜DSML｜｜ 及其任何闭合形式；开闭标签数量必须一一对应，禁止在末尾补写多余的 </tool_call>；只能使用这一种围栏。"#
             .to_string()
     }
 
@@ -355,6 +357,9 @@ mod tests {
         assert!(reminder.contains("逐字符写成 tool_call"), "提醒段应强调围栏名: {}", reminder);
         assert!(reminder.contains("name: read_file"), "提醒段应给出具体示例: {}", reminder);
         assert!(reminder.contains("filePath:"), "提醒段示例应含参数行: {}", reminder);
+        // 禁止清单必须点名 DSML/XML 标签，否则模型会混写
+        assert!(reminder.contains("DSML"), "提醒段应显式禁止 DSML: {}", reminder);
+        assert!(reminder.contains("parameter"), "提醒段应显式禁止 parameter 标签: {}", reminder);
         for bad in ["<toolcall>", "call_call", "<工具名>", "<参数名>"] {
             assert!(!reminder.contains(bad), "提醒段不应出现错误写法/占位符: {}", bad);
             assert!(!text.contains(bad), "工具段不应出现错误写法/占位符: {}", bad);

@@ -10,6 +10,7 @@ use std::sync::Mutex as StdMutex;
 use tracing::{debug, error, info, warn};
 
 use crate::extension::credentials::CredentialStore;
+use crate::extension::adapters::dsml;
 use crate::extension::adapters::pow::{build_pow_header, solve_pow};
 use crate::extension::websocket::{ChatResponsePayload, ExecuteRequestPayload, WebSocketBridge};
 use crate::session::manager::SessionManager;
@@ -37,14 +38,8 @@ const MARKER_INVOKE: &str = "invoke";
 const PARAM_TAG_NAME: &str = "parameter";
 /// 可独立标识「工具调用开始」的标签名：DSML 外层标记标签（真实输出里外层名即 calls）、
 /// 工具标签与自有围栏变体；含模型错写（call / call_call）。parameter 只是内部字段，不算起始标记。
-const TOOL_TAG_NAMES: [&str; 7] = [
-    "tool_call",
-    "toolcall",
-    "tool_calls",
-    "calls",
-    "call",
-    "call_call",
-    MARKER_INVOKE,
+const TOOL_TAG_NAMES: [&str; 1] = [
+    "tool_call"
 ];
 const SEND_INTERVAL_MS: u64 = 1_000;
 
@@ -539,6 +534,15 @@ fn parse_tool_call_blocks(text: &str) -> Option<Vec<(String, Value)>> {
     if results.is_empty() {
         if let Some(v) = parse_tool_block_yaml(text) {
             push(&mut results, &v);
+        }
+    }
+    // 3) DSML 兜底：全角/半角 `<...DSML... calls>` 形态（<｜｜DSML｜｜ calls> 等）
+    if results.is_empty() {
+        let parsed = dsml::parse(text);
+        for tc in parsed.tool_calls {
+            let args = serde_json::from_str::<Value>(&tc.function.arguments)
+                .unwrap_or_else(|_| json!({}));
+            results.push((tc.function.name, args));
         }
     }
     if results.is_empty() {

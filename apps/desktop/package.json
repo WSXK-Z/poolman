@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "vue-tsc --noEmit && vite build",
     "build:extension": "cd ../extension && pnpm build",
-    "build:all": "npm run build:extension && npm run build",
+    "build:all": "pnpm build:extension && pnpm build",
     "preview": "vite preview",
     "tauri": "tauri"
   },
