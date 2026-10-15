@@ -8,7 +8,7 @@
 
 ```
 外部调用方 (OpenAI 客户端 / Cursor / Chatbox)
-        │  HTTP / SSE  (localhost:3000)
+        │  HTTP / SSE  (localhost:13213)
         ▼
   Tauri 桌面应用 (Vue3 + NaiveUI + Rust)
    - 提供 OpenAI 兼容 HTTP 服务（基于 Rust 的 axum 或类似）
@@ -48,27 +48,27 @@ pnpm --filter @ai-gateway/desktop dev
 pnpm --filter @ai-gateway/extension dev
 ```
 
-- **桌面应用**：启动后提供 HTTP 服务，默认监听 `http://127.0.0.1:3000`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。同时打开 GUI 窗口用于状态查看和配置。
+- **桌面应用**：启动后提供 HTTP 服务，默认监听 `http://127.0.0.1:13213`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。同时打开 GUI 窗口用于状态查看和配置。
 - **插件**：在 Chrome 扩展程序页（`chrome://extensions`）开启“开发者模式”，加载已解压扩展，选择 `apps/extension/.output/chrome-mv3`（开发模式）或 `apps/extension/dist`（构建后）。插件会自动连接桌面应用的 WebSocket。
 
 ## 调用示例
 
 ```bash
 # 列出模型
-curl http://127.0.0.1:3000/v1/models
+curl http://127.0.0.1:13213/v1/models
 
 # 非流式
-curl http://127.0.0.1:3000/v1/chat/completions \
+curl http://127.0.0.1:13213/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"deepseek-web","messages":[{"role":"user","content":"你好"}]}'
 
 # 流式 (SSE)
-curl -N http://127.0.0.1:3000/v1/chat/completions \
+curl -N http://127.0.0.1:13213/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -d '{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"讲个笑话"}]}'
 ```
 
-也可直接使用任意 OpenAI SDK，把 `baseURL` 指向 `http://127.0.0.1:3000/v1`，填入任意假 key。
+也可直接使用任意 OpenAI SDK，把 `baseURL` 指向 `http://127.0.0.1:13213/v1`，填入任意假 key。
 
 ## 支持平台与模型映射
 

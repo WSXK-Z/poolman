@@ -1,5 +1,11 @@
+/**
+ * Background Service Worker 到本地桌面网关的 WebSocket 客户端。
+ *
+ * 管理连接、重连与状态心跳；具体协议消息交由 background message router 处理。
+ */
 import { MessageType, type ProtocolMessage, type ProviderStatusMap, type StatusSync } from '@ai-gateway/shared';
 import { createLogger } from '@ai-gateway/utils';
+import { browser } from 'wxt/browser';
 import { backgroundState } from './state';
 
 const log = createLogger('ext:connection');
@@ -38,6 +44,7 @@ export class GatewayConnection {
   }
 
   start(): void {
+    // 状态周期发送器与 WebSocket 生命周期一致，stop() 同时关闭两者。
     this.manualClosed = false;
     this.connect();
     this.statusTimer = setInterval(() => this.sendStatus(), STATUS_INTERVAL);
@@ -61,15 +68,22 @@ export class GatewayConnection {
   }
 
   private connect(): void {
+    // 防止并发重连创建多条 socket；CONNECTING 状态也视为已有连接尝试。
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return;
     }
 
     let url = this.opts.url;
     try {
-      if (this.opts.token) {
-        url += (url.includes('?') ? '&' : '?') + `token=${encodeURIComponent(this.opts.token)}`;
-      }
+      const params = new URLSearchParams();
+      if (this.opts.token) params.set('token', this.opts.token);
+      // 自报稳定身份：桌面端据此登记插件实例并复用其启用选择
+      const manifest = browser.runtime.getManifest();
+      params.set('clientId', browser.runtime.id);
+      params.set('name', manifest.name);
+      params.set('version', manifest.version);
+      params.set('platform', manifest.manifest_version === 3 ? 'mv3' : 'mv2');
+      url += (url.includes('?') ? '&' : '?') + params.toString();
       const ws = new WebSocket(url);
       this.ws = ws;
 

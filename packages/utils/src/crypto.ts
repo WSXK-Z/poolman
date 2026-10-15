@@ -1,3 +1,8 @@
+/**
+ * 基于 Web Crypto 的标识与 token 生成及常量时间比较。
+ *
+ * 随机字节来自 `crypto.getRandomValues`，适用于浏览器和支持 Web Crypto 的 Node 运行时。
+ */
 const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
 
 function getRandomValues(len: number): Uint8Array {

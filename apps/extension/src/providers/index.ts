@@ -1,3 +1,4 @@
+/** 集中注册扩展可识别的平台元信息，并按稳定 provider ID 提供查询。 */
 import type { ModelProvider } from '@ai-gateway/shared';
 import { ProviderError } from './base';
 import { deepseekProvider } from './deepseek';

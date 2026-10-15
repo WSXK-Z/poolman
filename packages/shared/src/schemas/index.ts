@@ -1,3 +1,9 @@
+/**
+ * WebSocket 消息和 OpenAI 兼容 HTTP 请求的运行时校验。
+ *
+ * 协议消息由 `type` 判别并在入口统一校验；HTTP 请求 schema 与扩展内部消息
+ * 保持分离，避免不同传输边界共享不相干的约束。
+ */
 import { z } from 'zod';
 import { MessageType } from '../types/protocol.js';
 import { PROVIDERS } from '../types/models.js';
@@ -70,40 +76,6 @@ export const providerStatusMapSchema = z.record(z.string(), providerStatusSchema
 const baseMessageSchema = z.object({
   id: z.string().min(1),
   timestamp: z.number(),
-});
-
-export const chatRequestSchema = baseMessageSchema.extend({
-  type: z.literal(MessageType.CHAT_REQUEST),
-  payload: z.object({
-    model: providerIdSchema,
-    messages: z.array(chatMessageSchema).min(1),
-    options: chatOptionsSchema.optional(),
-  }),
-});
-
-export const chatChunkSchema = baseMessageSchema.extend({
-  type: z.literal(MessageType.CHAT_CHUNK),
-  payload: z.object({
-    delta: z.string(),
-  }),
-});
-
-export const chatResponseSchema = baseMessageSchema.extend({
-  type: z.literal(MessageType.CHAT_RESPONSE),
-  payload: z.object({
-    content: z.string(),
-    model: z.string(),
-    usage: tokenUsageSchema.optional(),
-    finishedReason: z.string().optional(),
-  }),
-});
-
-export const chatErrorSchema = baseMessageSchema.extend({
-  type: z.literal(MessageType.CHAT_ERROR),
-  payload: z.object({
-    error: z.string(),
-    code: z.string().optional(),
-  }),
 });
 
 export const statusSyncSchema = baseMessageSchema.extend({
@@ -192,10 +164,6 @@ export const executeErrorSchema = baseMessageSchema.extend({
 
 /** 协议消息校验器（WebSocket 入口统一使用） */
 export const protocolMessageSchema = z.discriminatedUnion('type', [
-  chatRequestSchema,
-  chatChunkSchema,
-  chatResponseSchema,
-  chatErrorSchema,
   statusSyncSchema,
   diagnosticMessageSchema,
   captureRequestSchema,
@@ -232,5 +200,3 @@ export type ChatCompletionRequest = z.infer<typeof chatCompletionRequestSchema>;
 export type ChatMessageInput = z.infer<typeof chatMessageSchema>;
 export type ChatOptionsInput = z.infer<typeof chatOptionsSchema>;
 export type ProviderStatusMapInput = z.infer<typeof providerStatusMapSchema>;
-
-

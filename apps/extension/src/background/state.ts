@@ -1,5 +1,11 @@
 import type { ModelProvider, ProviderStatusMap } from '@ai-gateway/shared';
 import { randomId } from '@ai-gateway/utils';
+/**
+ * 扩展后台共享状态及其持久化边界。
+ *
+ * 页面凭证和接口模板保存到扩展本地存储，连接状态与诊断日志只驻留内存；
+ * UI 通过 snapshot 读取，不直接访问本类内部可变集合。
+ */
 import { browser } from 'wxt/browser';
 import {
   DEFAULT_SETTINGS,
@@ -11,6 +17,7 @@ import {
 
 /** 持久化存储 key（避免 Service Worker 重启 / 扩展重载后丢失捕获结果） */
 const STORE_KEYS = {
+  id: '__ai_gateway_id',
   tokens: '__ai_gateway_tokens',
   settingsTokens: '__ai_gateway_settings_tokens',
   templates: '__ai_gateway_templates',
@@ -24,6 +31,7 @@ const STORE_KEYS = {
  * 扩展重载后自动恢复，无需反复捕获。
  */
 class BackgroundState {
+  id: string | null = null;
   settings: AppSettings = { ...DEFAULT_SETTINGS };
   connected = false;
   providers: ProviderStatusMap = {};
@@ -44,6 +52,7 @@ class BackgroundState {
   async loadPersisted(): Promise<void> {
     try {
       const stored = await browser.storage.local.get([
+        STORE_KEYS.id,
         STORE_KEYS.tokens,
         STORE_KEYS.settingsTokens,
         STORE_KEYS.templates,
@@ -57,16 +66,23 @@ class BackgroundState {
       if (settingsTokens) this.settingsTokens = { ...this.settingsTokens, ...settingsTokens };
       if (templates) this.apiTemplates = { ...this.apiTemplates, ...templates };
       if (hif) this.hifHeaders = { ...this.hifHeaders, ...hif };
+      if (!this.id) this.saveId(randomId(16));
     } catch {
       /* ignore */
     }
+  }
+
+  /** 保存扩展唯一 ID（用于服务端识别插件实例） */
+  saveId(id: string): void {
+    this.id = id;
+    browser.storage.local.set({ [STORE_KEYS.id]: id }).catch(() => { });
   }
 
   /** 保存平台访问凭证 */
   setToken(provider: ModelProvider, token: string): void {
     this.tokens[provider] = token;
     this.notify();
-    void browser.storage.local.set({ [STORE_KEYS.tokens]: this.tokens }).catch(() => {});
+    void browser.storage.local.set({ [STORE_KEYS.tokens]: this.tokens }).catch(() => { });
   }
 
   /** 读取平台访问凭证 */
@@ -77,7 +93,7 @@ class BackgroundState {
   /** 保存平台 settingsToken */
   setSettingsToken(provider: ModelProvider, token: string): void {
     this.settingsTokens[provider] = token;
-    void browser.storage.local.set({ [STORE_KEYS.settingsTokens]: this.settingsTokens }).catch(() => {});
+    void browser.storage.local.set({ [STORE_KEYS.settingsTokens]: this.settingsTokens }).catch(() => { });
   }
 
   /** 读取平台 settingsToken */
@@ -87,9 +103,10 @@ class BackgroundState {
 
   /** 保存平台聊天接口模板 */
   setApiTemplate(provider: ModelProvider, api: CapturedChatApi): void {
+    // 模板随 provider 整体持久化，避免 Service Worker 休眠后丢失网页观察结果。
     this.apiTemplates[provider] = api;
     this.notify();
-    void browser.storage.local.set({ [STORE_KEYS.templates]: this.apiTemplates }).catch(() => {});
+    void browser.storage.local.set({ [STORE_KEYS.templates]: this.apiTemplates }).catch(() => { });
   }
 
   /** 读取平台聊天接口模板 */
@@ -100,7 +117,7 @@ class BackgroundState {
   /** 保存平台 x-hif-leim / x-hif-dliq */
   setHifHeaders(provider: ModelProvider, hif: { leim?: string; dliq?: string }): void {
     this.hifHeaders[provider] = { ...this.hifHeaders[provider], ...hif };
-    void browser.storage.local.set({ [STORE_KEYS.hif]: this.hifHeaders }).catch(() => {});
+    void browser.storage.local.set({ [STORE_KEYS.hif]: this.hifHeaders }).catch(() => { });
   }
 
   /** 读取平台 x-hif-leim / x-hif-dliq */

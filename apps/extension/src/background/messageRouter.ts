@@ -1,4 +1,10 @@
-import { MessageType, type ChatResult, type ModelProvider, type ProtocolMessage } from '@ai-gateway/shared';
+/**
+ * 桌面网关下行协议的路由入口。
+ *
+ * 网页执行指令转发给对应供应商标签页，凭证捕获请求交给内容脚本；
+ * 网页响应的原始分块则由 background 消息监听器直接回送桌面端。
+ */
+import { MessageType, type ModelProvider, type ProtocolMessage } from '@ai-gateway/shared';
 import { createLogger, errorMessage } from '@ai-gateway/utils';
 import { browser } from 'wxt/browser';
 import { diag } from '~/background/diagnostics';
@@ -11,6 +17,7 @@ const log = createLogger('ext:router');
 
 /** 查找 provider 对应的已打开标签页（只查询，不创建标签页） */
 async function findProviderTab(provider: ModelProvider): Promise<{ id?: number } | undefined> {
+  // 只选择已打开页面：实际登录态和浏览器会话由用户现有标签页提供。
   const p = getProvider(provider);
   for (const pattern of p.matches) {
     try {
@@ -26,9 +33,7 @@ async function findProviderTab(provider: ModelProvider): Promise<{ id?: number }
 
 /**
  * 处理来自本地服务的协议消息，并把响应通过 send 回传。
- * 连接器化后：
- *   - CHAT_REQUEST：仅 DOM 平台（chatgpt/claude/gemini/kimi/qwen）；DeepSeek 已被服务端直管
- *   - EXECUTE_REQUEST：下发到 content 网页执行器（插件只作"执行器"，业务逻辑全在服务端）
+ * 连接器化后，EXECUTE_REQUEST 由网页执行器执行并原样转发响应。
  *   - CAPTURE_REQUEST：触发内容脚本主动捕获凭证（结果经 CREDENTIAL_SYNC 上报服务端）
  * @param msg  服务端下发的消息
  * @param send 回传函数
@@ -38,76 +43,6 @@ export async function handleServerMessage(
   send: (msg: ProtocolMessage) => void,
 ): Promise<void> {
   switch (msg.type) {
-    case MessageType.CHAT_REQUEST: {
-      const { id, payload } = msg;
-      log.info(`收到聊天请求 ${id}，模型=${payload.model}`);
-      backgroundState.addLog('info', `收到请求 ${id} (${payload.model})`);
-      diag('info', 'router', `收到请求 ${id}`, {
-        id,
-        model: payload.model,
-        messages: payload.messages.length,
-        options: payload.options,
-      });
-      try {
-        // DeepSeek 已由服务端直管（走 EXECUTE 通道），插件不再处理其 CHAT_REQUEST
-        if (payload.model === 'deepseek-web') {
-          throw new ProviderError('DeepSeek 已由服务端直管', 'deepseek_server_managed');
-        }
-        const provider = getProvider(payload.model);
-        const started = Date.now();
-        // 流式：优先使用 provider.chatStream，把增量文本逐块回传为 CHAT_CHUNK
-        const streaming = !!payload.options?.stream;
-        let result: ChatResult;
-        if (streaming && provider.chatStream) {
-          result = await provider.chatStream(
-            payload.model,
-            payload.messages,
-            (delta) => {
-              send({
-                id,
-                type: MessageType.CHAT_CHUNK,
-                timestamp: Date.now(),
-                payload: { delta },
-              });
-            },
-            payload.options,
-          );
-        } else {
-          result = await provider.chat(payload.model, payload.messages, payload.options);
-        }
-        send({
-          id,
-          type: MessageType.CHAT_RESPONSE,
-          timestamp: Date.now(),
-          payload: {
-            content: result.content,
-            model: result.model,
-            usage: result.usage,
-            finishedReason: result.finishedReason,
-          },
-        });
-        backgroundState.addLog('info', `请求 ${id} 完成${streaming ? '（流式）' : ''}`);
-        diag('info', 'router', `请求 ${id} 完成`, {
-          id,
-          elapsedMs: Date.now() - started,
-          contentLength: result.content?.length ?? 0,
-          streaming,
-        });
-      } catch (err) {
-        const message = errorMessage(err);
-        const code = (err as { code?: string })?.code;
-        log.error(`聊天请求 ${id} 失败`, message);
-        backgroundState.addLog('error', `请求 ${id} 失败: ${message}`);
-        diag('error', 'router', `请求 ${id} 失败`, { id, error: message, code });
-        send({
-          id,
-          type: MessageType.CHAT_ERROR,
-          timestamp: Date.now(),
-          payload: { error: message, code },
-        });
-      }
-      break;
-    }
     case MessageType.EXECUTE_REQUEST: {
       // 服务端下发的「网页执行」指令：插件只在对应平台网页机械执行 fetch 并回传原始流
       const { id, payload } = msg;

@@ -5,6 +5,9 @@
  *      generation_settings / 会话字段等）
  * 通过 window.postMessage 上报给 isolated world，再由其转发给 background。
  * 这样插件能「自己学会」各平台当前的接口格式，网站改版也能自适应，无需人工配置。
+ *
+ * 服务端下发的执行命令也在此调用原始 fetch，以保留页面来源、浏览器网络环境
+ * 和同源凭证；响应体只按原始文本块发送，不在页面侧做供应商协议解析。
  */
 export default defineContentScript({
   matches: [

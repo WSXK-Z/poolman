@@ -2,7 +2,7 @@
  * DeepSeek 网页版适配器（连接器化后仅保留元信息）。
  *
  * 重构后，请求组装 / PoW 求解 / SSE 解析 / 422 自愈 / 会话管理等业务逻辑
- * 已全部迁移到服务端（apps/server/src/providers/deepseek.ts）。
+ * 已全部迁移到桌面端（apps/desktop/src-tauri/src/extension/adapters/deepseek）。
  * 插件只承担两类机械职责：
  *   1) 内容脚本捕获凭证/接口模板 → 同步服务端（CREDENTIAL_SYNC）
  *   2) 收到 EXECUTE_REQUEST 后在网页 context 执行 fetch 并回传原始流
@@ -10,9 +10,9 @@
  * 因此这里的 chat / chatStream 不再被 messageRouter 调用（DeepSeek 走 EXECUTE 通道），
  * 仅保留元信息供 UI 展示 / 标签页查找 / open()。
  */
-import type { ChatMessage, ChatOptions, ChatResult, ModelProvider } from '@ai-gateway/shared';
+import type { ModelProvider } from '@ai-gateway/shared';
 import { backgroundState } from '~/background/state';
-import { ensureTab, type AIProvider, ProviderError } from './base';
+import { ensureTab, type AIProvider } from './base';
 
 const PROVIDER_ID: ModelProvider = 'deepseek-web';
 
@@ -31,21 +31,5 @@ export const deepseekProvider: AIProvider = {
   async checkAuth(): Promise<boolean> {
     // 连接器化后凭证的权威存储与服务端一致（经 CREDENTIAL_SYNC 同步）；这里读本地副本判断
     return !!backgroundState.getToken(PROVIDER_ID);
-  },
-
-  async chat(model: ModelProvider, _messages: ChatMessage[], _options?: ChatOptions): Promise<ChatResult> {
-    // 连接器化后插件不再直接聊天：DeepSeek 请求由服务端直管（EXECUTE 通道）
-    void model;
-    throw new ProviderError('DeepSeek 已由服务端直管，请直接调用 /v1/chat/completions', 'deepseek_server_managed');
-  },
-
-  async chatStream(
-    model: ModelProvider,
-    _messages: ChatMessage[],
-    _onChunk: (delta: string) => void,
-    _options?: ChatOptions,
-  ): Promise<ChatResult> {
-    void model;
-    throw new ProviderError('DeepSeek 已由服务端直管，请直接调用 /v1/chat/completions', 'deepseek_server_managed');
   },
 };

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// Popup 根组件只负责应用级中文语言环境和全局消息提示上下文。
 import { dateZhCN, zhCN, NConfigProvider, NMessageProvider } from 'naive-ui';
 import PopupContent from './PopupContent.vue';
 </script>

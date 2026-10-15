@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 展示指定网页供应商的远端会话，并将删除操作委托给对应的桌面适配器。
 import { onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import { NAlert, NButton, NCard, NEmpty, NPopconfirm, NScrollbar, useMessage } from "naive-ui";

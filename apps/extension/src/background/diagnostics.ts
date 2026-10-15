@@ -1,3 +1,9 @@
+/**
+ * Background 诊断消息发送端。
+ *
+ * WebSocket 建立后由连接入口注入发送函数；尚未连接时诊断信息不排队，
+ * 以免 Service Worker 在离线期间无限累积日志消息。
+ */
 import { MessageType, type DiagnosticMessage } from '@ai-gateway/shared';
 
 type Sender = (msg: DiagnosticMessage) => void;

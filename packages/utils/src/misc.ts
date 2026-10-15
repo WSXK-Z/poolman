@@ -1,3 +1,9 @@
+/**
+ * 跨运行环境通用的小型辅助函数。
+ *
+ * 只包含不依赖扩展 API、Tauri 或 Node 专属对象的时间和错误格式工具。
+ */
+
 /** Promise 版 sleep */
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));

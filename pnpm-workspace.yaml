@@ -7,6 +7,3 @@ allowBuilds:
   esbuild: true
   '@parcel/watcher': true
   unrs-resolver: true
-
-minimumReleaseAgeExclude:
-  - hono@4.13.5

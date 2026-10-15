@@ -13,7 +13,8 @@
 
 use serde_json::{json, Value};
 
-use crate::converter::{ConvertContext, Converter};
+use crate::agent::input::AgentInput;
+use crate::prompts::Converter;
 
 pub const PLATFORM: &str = "trae_work";
 
@@ -72,15 +73,6 @@ fn split_tagged_sections(content: &str) -> Vec<(Option<String>, String)> {
         sections.push((None, plain.trim().to_string()));
     }
     sections
-}
-
-/// 取最后一条 user 消息内容
-fn last_user_content(messages: &[Value]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-        .and_then(|m| m.get("content").and_then(|v| v.as_str()).map(String::from))
 }
 
 /// 将 Trae(SOLO)实际上下文中的标签名转换为中文（未知标签保留原名）
@@ -146,63 +138,60 @@ fn render_tools(tools: &Value) -> String {
     lines.join("\n")
 }
 
-/// 追问用户段：阶段引导 + 工具结果 + 最后一条 user 的规则段(<system-reminder>)/提问(<user_input>)
-fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
+/// 追问用户段：阶段引导 + 工具结果 + 最新提问的规则段(<system-reminder>)/提问(<user_input>)
+fn build_follow_up_user(input: &AgentInput) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut tool_results: Vec<String> = Vec::new();
-    for m in messages.iter().rev() {
-        if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-            if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
-                let label = m
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
-                    .map(|id| format!("工具({})返回的结果：", id))
-                    .unwrap_or_else(|| "工具返回的结果：".to_string());
-                tool_results.push(format!("{}\n{}", label, c));
+
+    // 工具结果：内部输入里已按原顺序取出（带 tool_call_id）
+    if !input.tool_results.is_empty() {
+        let rendered: Vec<String> = input
+            .tool_results
+            .iter()
+            .map(|turn| {
+                let label = match &turn.tool_call_id {
+                    Some(id) => format!("工具({})返回的结果：", id),
+                    None => "工具返回的结果：".to_string(),
+                };
+                format!("{}\n{}", label, turn.content)
+            })
+            .collect();
+        parts.push(rendered.join("\n\n"));
+    }
+
+    // 最新提问：按标签拆分，<user_input> → 提问，其余(<system-reminder> 等) → 规则段
+    let mut question: Option<String> = None;
+    let sections = split_tagged_sections(&input.question);
+    if sections.is_empty() {
+        if !input.question.is_empty() {
+            question = Some(input.question.clone());
+        }
+    } else {
+        for (tag, body) in sections {
+            match tag.as_deref() {
+                Some("user_input") => question = Some(body),
+                Some(t) => parts.push(format!("以下是 {} 内容：\n{}", tag_cn(t), body)),
+                None => parts.push(format!("以下是用户的环境信息：\n{}", body)),
             }
+        }
+    }
+    if let Some(q) = question {
+        parts.push(format!("用户：\n{}", q));
+    }
+
+    // 阶段引导插到最前
+    if input.has_tools() {
+        if input.tool_results.is_empty() {
+            parts.insert(
+                0,
+                "根据用户问题，结合已有工具，判断是否要使用工具来完成任务，并且你应该优先使用工具完成任务，只有纯问答才直接回答。"
+                    .to_string(),
+            );
         } else {
-            break;
-        }
-    }
-    if !tool_results.is_empty() {
-        tool_results.reverse();
-        parts.push(tool_results.join("\n\n"));
-    }
-    // 最后一条 user：按标签拆分，<user_input> → 提问，其余(<system-reminder> 等) → 规则段
-    if let Some(c) = last_user_content(messages) {
-        let sections = split_tagged_sections(&c);
-        let mut question: Option<String> = None;
-        if sections.is_empty() {
-            question = Some(c);
-        } else {
-            for (tag, body) in sections {
-                match tag.as_deref() {
-                    Some("user_input") => question = Some(body),
-                    Some(t) => parts.push(format!("以下是 {} 内容：\n{}", tag_cn(t), body)),
-                    None => parts.push(format!("以下是用户的环境信息：\n{}", body)),
-                }
-            }
-        }
-        if let Some(q) = question {
-            parts.push(format!("用户：\n{}", q));
-        }
-    }
-    if let Some(tools) = tools {
-        if tools.as_array().map_or(false, |a| !a.is_empty()) {
-            let has_tool_results = !tool_results.is_empty();
-            if has_tool_results {
-                parts.insert(
-                    0,
-                    "结合工具结果，以及历史对话，判断任务是否已经可以完成：如果还需要调用工具才能完成就继续调用工具；只有任务已全部完成才给出最终答案；不要编造工具执行结果。"
-                        .to_string(),
-                );
-            } else {
-                parts.insert(
-                    0,
-                    "根据用户问题，结合已有工具，判断是否要使用工具来完成任务，并且你应该优先使用工具完成任务，只有纯问答才直接回答。"
-                        .to_string(),
-                );
-            }
+            parts.insert(
+                0,
+                "结合工具结果，以及历史对话，判断任务是否已经可以完成：如果还需要调用工具才能完成就继续调用工具；只有任务已全部完成才给出最终答案；不要编造工具执行结果。"
+                    .to_string(),
+            );
         }
     }
     parts.join("\n\n")
@@ -211,66 +200,44 @@ fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
 pub struct TraeWorkConverter;
 
 impl Converter for TraeWorkConverter {
+    fn platform(&self) -> &'static str {
+        PLATFORM
+    }
+
     /// 工具转换：工具定义 → 平台工具「记住」段（与 vscode_copilot 一致的 YAML 工具调用格式）
     fn convert_tools(&self, tools: &Value) -> String {
-        let instruction = r#"
-        1. 你可以在一次回答中调用多个工具，但必须一个工具对应一个完整的 tool_call 块。
-        2. 调用工具时，必须把每个工具输出成一个独立的 <tool_call> ... </tool_call> 围栏 YAML 块，且这是【唯一合法格式】，示例如下：
-            <tool_call>
-            name: read_file
-            arguments:
-              filePath: d:/project/src/main.rs
-              startLine: 1
-              endLine: 20
-            </tool_call>
-        3. 格式硬性要求，违反任何一条都会导致你的工具调用无法被解析、任务失败：
-           - 开标签与闭标签必须同名成对、逐字符写成 tool_call；围栏名不能改成其它任何写法，也不能漏写下划线；
-           - 块内第一行必须是 name: 加工具名，第二行必须是 arguments:，所有参数都放在 arguments 下面并缩进两个空格；不要把工具名裸写在首行，不要省略 name/arguments 键，不要把参数写成与 arguments: 同一缩进；
-           - 每个工具块独占一个完整的开/闭围栏；多个工具块之间用换行分隔；
-           - 多行参数（代码内容等）用块标量 |- 原样直写，不要转义引号/反斜杠/换行；参数里出现三反引号 ```（如 markdown 代码块）不影响围栏，正常书写即可；
-           - 路径用正斜杠或原样反斜杠均可；只能调用已定义工具；编辑类工具先读取文件最新内容再改；
-           - 除上面这一种围栏外，不要使用任何其它形式的工具调用标记。
-        4. 普通文本与工具调用不可同时出现：一旦决定调用工具，就【只】输出工具调用块（可多个），不要夹带任何普通文本、解释、前言或总结；反之，若你在输出普通回答，就不要再输出工具调用块。
-        5. 输出前自检，任一条不符就重写：① 开/闭标签是否都是 tool_call？② 参数是否都缩进在 arguments: 下面？③ 是否夹带了普通文本？④ 工具名与参数名是否与工具定义完全一致、必填参数是否补齐？"#;
-        format!(
-            "以下是你可以调用的工具：\n{}\n{}",
-            render_tools(tools),
-            instruction
-        )
+        // 工具调用格式要求由 poolman 系统段统一给出（见 Converter::assemble），
+        // 这里只声明可用工具，避免同一段规则在提示词里重复出现。
+        format!("以下是你可以调用的工具：\n{}", render_tools(tools))
     }
 
     /// 追问轮次：再次强调工具调用格式（放在提示词末尾，用具体示例而非占位符）
     fn tool_format_reminder(&self) -> String {
-        r#"【工具调用格式】只要需要调用工具，就只输出下面这种块（可以有多个），不要夹带任何其它文字：
-                <tool_call>
-                name: read_file
-                arguments:
-                  filePath: d:/project/src/main.rs
-                  startLine: 1
-                  endLine: 20
-                </tool_call>
-            要点：开标签和闭标签都必须逐字符写成 tool_call；每个参数都要缩进在 arguments: 下面（两个空格）；只能使用这一种围栏。"#
-            .to_string()
+        crate::prompts::poolman::tool_format_reminder().to_string()
     }
 
     /// 系统提示词转换：SOLO 身份 system 按顶层 <xxx> 标签拆分，每块以中文标签名独立包装成规则段
-    fn convert_system(&self, messages: &[Value]) -> String {
+    fn convert_system(&self, input: &AgentInput) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for m in messages {
-            if m.get("role").and_then(|v| v.as_str()) == Some("system") {
-                if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
-                    for (tag, body) in split_tagged_sections(c) {
-                        match tag {
-                            Some(t) => parts.push(format!(
-                                "以下是 {} 内容，不管用户问题是什么，你都得结合{}回答：\n{}",
-                                tag_cn(&t),
-                                tag_cn(&t),
-                                body
-                            )),
-                            None => parts.insert(0, format!("以下是你必须牢记的身份：\n{}", body)),
-                        }
-                    }
-                }
+        if input.system_prompt.is_empty() {
+            return String::new();
+        }
+        for (tag, body) in split_tagged_sections(&input.system_prompt) {
+            // 与 poolman 系统段重复的规则段丢弃：工具/输出格式统一由 poolman 段给出
+            if tag
+                .as_deref()
+                .map_or(false, |t| crate::prompts::POOLMAN_OWNED_TAGS.contains(&t))
+            {
+                continue;
+            }
+            match tag {
+                Some(t) => parts.push(format!(
+                    "以下是 {} 内容，不管用户问题是什么，你都得结合{}回答：\n{}",
+                    tag_cn(&t),
+                    tag_cn(&t),
+                    body
+                )),
+                None => parts.insert(0, format!("以下是你必须牢记的身份：\n{}", body)),
             }
         }
         parts.join("\n\n")
@@ -278,24 +245,27 @@ impl Converter for TraeWorkConverter {
 
     /// 用户提示词转换：首轮 = 上下文提醒(<system-reminder>)规则段 + <user_input> 真实提问；
     /// 追问 = 阶段引导 + 工具结果 + 提问
-    fn convert_user(&self, ctx: &ConvertContext) -> String {
-        if ctx.is_first_turn {
+    fn convert_user(&self, input: &AgentInput) -> String {
+        if input.is_first_turn() {
             let mut parts: Vec<String> = Vec::new();
             let mut question: Option<String> = None;
-            // 遍历所有 user 消息，按 <xxx> 标签拆分：
+            // 历史对话里的 user 段 + 用户最新提问，按 <xxx> 标签拆分：
             // - <user_input> 块 → 真实提问（单独段，保留最后一条）
             // - <system-reminder> 等标签块 → 独立规则段
-            for m in ctx.messages {
-                if m.get("role").and_then(|v| v.as_str()) != Some("user") {
+            let contents = input
+                .history
+                .iter()
+                .filter(|turn| turn.role == "user")
+                .map(|turn| turn.content.as_str())
+                .chain(std::iter::once(input.question.as_str()));
+            for content in contents {
+                if content.is_empty() {
                     continue;
                 }
-                let Some(c) = m.get("content").and_then(|v| v.as_str()) else {
-                    continue;
-                };
-                let sections = split_tagged_sections(c);
+                let sections = split_tagged_sections(content);
                 if sections.is_empty() {
                     // 无标签的整条 user：作为环境规则段
-                    parts.push(format!("以下是用户的环境信息：\n{}", c));
+                    parts.push(format!("以下是用户的环境信息：\n{}", content));
                     continue;
                 }
                 for (tag, body) in sections {
@@ -315,7 +285,7 @@ impl Converter for TraeWorkConverter {
             }
             parts.join("\n\n")
         } else {
-            build_follow_up_user(ctx.messages, ctx.tools)
+            build_follow_up_user(input)
         }
     }
 
@@ -325,32 +295,31 @@ impl Converter for TraeWorkConverter {
 #[cfg(test)]
 mod tests {
     use super::{split_tagged_sections, TraeWorkConverter};
-    use crate::converter::{ConvertContext, Converter};
+    use crate::prompts::Converter;
     use serde_json::json;
 
-    /// 工具提示词：必须有具体示例与硬性要求，且不得出现错误写法/占位符字面量
-    /// （在提示词里演示错误写法会把错误格式“教”给模型）
+    /// 工具段只列可用工具：格式硬性要求由 poolman 系统段统一给出，不在工具段重复。
     #[test]
-    fn tool_prompt_contains_hard_requirements() {
+    fn tool_prompt_lists_tools_without_repeating_format() {
         let tools = json!([{ "type": "function", "function": { "name": "read_file", "parameters": json!({ "type": "object" }) } }]);
         let text = TraeWorkConverter.convert_tools(&tools);
-        for needle in [
-            "<tool_call>",
-            "name: read_file",
-            "缩进两个空格",
-            "逐字符写成 tool_call",
-            "输出前自检",
-        ] {
-            assert!(text.contains(needle), "工具段缺少内容: {}\n实际: {}", needle, text);
-        }
+        assert!(text.contains("以下是你可以调用的工具"), "工具段应声明可用工具: {}", text);
+        assert!(text.contains("read_file"), "工具段应列出工具名: {}", text);
+        assert!(!text.contains("<tool_call>"), "工具段不应重复围栏示例: {}", text);
+        assert!(!text.contains("输出前自检"), "工具段不应重复格式要求: {}", text);
+    }
+
+    /// 追问轮提醒：仍要用具体示例强调围栏格式，且不得出现错误写法/占位符字面量
+    /// （在提示词里演示错误写法会把错误格式“教”给模型）
+    #[test]
+    fn follow_up_reminder_states_fence_rules() {
         let reminder = TraeWorkConverter.tool_format_reminder();
         assert!(reminder.contains("缩进"), "提醒段应强调参数缩进: {}", reminder);
         assert!(reminder.contains("逐字符写成 tool_call"), "提醒段应强调围栏名: {}", reminder);
-        assert!(reminder.contains("name: read_file"), "提醒段应给出具体示例: {}", reminder);
-        assert!(reminder.contains("filePath:"), "提醒段示例应含参数行: {}", reminder);
+        assert!(reminder.contains("\"name\": \"read_file\""), "提醒段应给出具体示例: {}", reminder);
+        assert!(reminder.contains("\"filePath\":"), "提醒段示例应含参数行: {}", reminder);
         for bad in ["<toolcall>", "call_call", "<工具名>", "<参数名>"] {
             assert!(!reminder.contains(bad), "提醒段不应出现错误写法/占位符: {}", bad);
-            assert!(!text.contains(bad), "工具段不应出现错误写法/占位符: {}", bad);
         }
     }
 
@@ -379,7 +348,9 @@ mod tests {
             "role": "system",
             "content": "<application_details>\nYou are SOLO.\n</application_details>\n<todo_write_tool>\nUse TodoWrite for steps.\n</todo_write_tool>"
         })];
-        let c = TraeWorkConverter.convert_system(&messages);
+        let input =
+            crate::converters::api::openai::to_agent_input(&messages, None, Default::default());
+        let c = TraeWorkConverter.convert_system(&input);
         assert!(c.contains("以下是 应用详情 内容，不管用户问题是什么，你都得结合应用详情回答：\nYou are SOLO."));
         assert!(c.contains("以下是 待办清单工具 内容，不管用户问题是什么，你都得结合待办清单工具回答：\nUse TodoWrite for steps."));
     }
@@ -391,12 +362,9 @@ mod tests {
             json!({"role": "system", "content": "<application_details>身份</application_details>"}),
             json!({"role": "user", "content": "<system-reminder>\nIMPORTANT: context may be relevant.\n</system-reminder>\n\n<system-reminder>\n# Response Language Settings\nAlways use same language.\n</system-reminder>\n\n<user_input>\n你好\n</user_input>\n"}),
         ];
-        let ctx = ConvertContext {
-            messages: &messages,
-            tools: None,
-            is_first_turn: true,
-        };
-        let c = TraeWorkConverter.convert_user(&ctx);
+        let input =
+            crate::converters::api::openai::to_agent_input(&messages, None, Default::default());
+        let c = TraeWorkConverter.convert_user(&input);
         // 两个 system-reminder 都作为规则段，user_input 作为提问
         assert!(c.contains("以下是 系统提醒 内容：\nIMPORTANT: context may be relevant."));
         assert!(c.contains("以下是 系统提醒 内容：\n# Response Language Settings"));
@@ -412,12 +380,9 @@ mod tests {
             json!({"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}]}),
             json!({"role": "tool", "tool_call_id": "call_1", "content": "文件内容 ABC"}),
         ];
-        let ctx = ConvertContext {
-            messages: &messages,
-            tools: None,
-            is_first_turn: false,
-        };
-        let c = TraeWorkConverter.convert_user(&ctx);
+        let input =
+            crate::converters::api::openai::to_agent_input(&messages, None, Default::default());
+        let c = TraeWorkConverter.convert_user(&input);
         // 末尾 tool 结果被收集，原始提问从 user_input 提取
         assert!(c.contains("工具(call_1)返回的结果：\n文件内容 ABC"));
         assert!(c.contains("用户：\n请读取文件"));

@@ -1,5 +1,4 @@
 //! DeepSeek 网页版 PoW（Proof-of-Work）—— 纯计算模块。
-//! 移植自 apps/server/src/providers/deepseek-pow.ts（该模块源自浏览器插件）。
 //!
 //! DeepSeek 每次聊天请求都要求携带 `x-ds-pow-response` 头，其值 =
 //! base64(JSON{algorithm, challenge, salt, answer, signature, target_path})。

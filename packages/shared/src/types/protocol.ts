@@ -1,17 +1,8 @@
-import type { ChatMessage, ChatOptions, TokenUsage, ToolCall } from './requests.js';
 import type { ModelProvider, ProviderStatusMap } from './models.js';
 import type { CapturedChatApi } from './capture.js';
 
 /** WebSocket 消息类型（服务端 <-> 插件） */
 export const MessageType = {
-  /** 服务 -> 插件：发起一次聊天请求（DOM 平台使用；DeepSeek 服务端自管，不再走此消息） */
-  CHAT_REQUEST: 'CHAT_REQUEST',
-  /** 插件 -> 服务：流式增量文本块（DOM 平台使用，id 与对应 CHAT_REQUEST 相同） */
-  CHAT_CHUNK: 'CHAT_CHUNK',
-  /** 插件 -> 服务：聊天成功响应（DOM 平台使用） */
-  CHAT_RESPONSE: 'CHAT_RESPONSE',
-  /** 插件 -> 服务：聊天失败（DOM 平台使用） */
-  CHAT_ERROR: 'CHAT_ERROR',
   /** 插件 -> 服务：定期同步各平台状态 */
   STATUS_SYNC: 'STATUS_SYNC',
   /** 插件 -> 服务端：诊断日志（捕获信息 / 请求响应 / 报错），服务端打印到终端 */
@@ -38,55 +29,6 @@ export interface BaseMessage {
   id: string;
   type: MessageType;
   timestamp: number;
-}
-
-/** 服务 -> 插件：发起一次聊天请求 */
-export interface ChatRequest extends BaseMessage {
-  type: typeof MessageType.CHAT_REQUEST;
-  payload: ChatRequestPayload;
-}
-
-export interface ChatRequestPayload {
-  model: ModelProvider;
-  messages: ChatMessage[];
-  options?: ChatOptions;
-}
-
-/** 插件 -> 服务：流式增量文本块（id 与对应 CHAT_REQUEST 相同） */
-export interface ChatChunk extends BaseMessage {
-  type: typeof MessageType.CHAT_CHUNK;
-  payload: ChatChunkPayload;
-}
-
-export interface ChatChunkPayload {
-  /** 本次新增的答案文本 */
-  delta: string;
-}
-
-/** 插件 -> 服务：聊天成功响应 */
-export interface ChatResponse extends BaseMessage {
-  type: typeof MessageType.CHAT_RESPONSE;
-  payload: ChatResponsePayload;
-}
-
-export interface ChatResponsePayload {
-  id?: string;
-  content?: string;
-  tool_calls?: ToolCall[];
-  model: string;
-  usage?: TokenUsage;
-  finishedReason?: string;
-  // 流式增量（旧版兼容）
-  delta?: string;
-}
-
-/** 插件 -> 服务：聊天失败 */
-export interface ChatError extends BaseMessage {
-  type: typeof MessageType.CHAT_ERROR;
-  payload: {
-    error: string;
-    code?: string;
-  };
 }
 
 /** 插件 -> 服务：定期同步各平台状态 */
@@ -184,14 +126,10 @@ export interface ExecuteError extends BaseMessage {
 
 export interface ProviderControlMessage extends BaseMessage {
   type: typeof MessageType.PROVIDER_CONTROL;
-  payload: { provider: ModelProvider; action: 'connect' | 'disconnect' };
+  payload: { provider: ModelProvider; action: 'connect' | 'disconnect' | 'open' };
 }
 
 export type ProtocolMessage =
-  | ChatRequest
-  | ChatChunk
-  | ChatResponse
-  | ChatError
   | StatusSync
   | DiagnosticMessage
   | CaptureRequest

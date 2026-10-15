@@ -6,7 +6,8 @@
 
 use serde_json::{json, Value};
 
-use crate::converter::{ConvertContext, Converter};
+use crate::agent::input::AgentInput;
+use crate::prompts::Converter;
 
 pub const PLATFORM: &str = "vscode-copilot";
 
@@ -65,15 +66,6 @@ fn split_tagged_sections(content: &str) -> Vec<(Option<String>, String)> {
         sections.push((None, plain.trim().to_string()));
     }
     sections
-}
-
-/// 取最后一条 user 消息内容
-fn last_user_content(messages: &[Value]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-        .and_then(|m| m.get("content").and_then(|v| v.as_str()).map(String::from))
 }
 
 /// 将真实 Copilot 上下文中的嵌套标签名转换为中文（未知标签保留原名）
@@ -152,34 +144,31 @@ fn render_tools(tools: &Value) -> String {
     lines.join("\n")
 }
 
-/// 追问用户段：阶段引导 + 工具结果 + 最后一条 user 的规则段/提问
-fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
+/// 追问用户段：阶段引导 + 工具结果 + 提问（按标签拆分后的规则段/提问）
+fn build_follow_up_user(input: &AgentInput) -> String {
     let mut parts: Vec<String> = Vec::new();
-    let mut tool_results: Vec<String> = Vec::new();
-    for m in messages.iter().rev() {
-        if m.get("role").and_then(|v| v.as_str()) == Some("tool") {
-            if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
-                let label = m
-                    .get("tool_call_id")
-                    .and_then(|v| v.as_str())
+    // 工具结果：上一轮工具调用的回执（调用方已按顺序摆好）
+    if !input.tool_results.is_empty() {
+        let results: Vec<String> = input
+            .tool_results
+            .iter()
+            .map(|turn| {
+                let label = turn
+                    .tool_call_id
+                    .as_deref()
                     .map(|id| format!("工具({})返回的结果：", id))
                     .unwrap_or_else(|| "工具返回的结果：".to_string());
-                tool_results.push(format!("{}\n{}", label, c));
-            }
-        } else {
-            break;
-        }
+                format!("{}\n{}", label, turn.content)
+            })
+            .collect();
+        parts.push(results.join("\n\n"));
     }
-    if !tool_results.is_empty() {
-        tool_results.reverse();
-        parts.push(tool_results.join("\n\n"));
-    }
-    // 最后一条 user：按标签拆分，非 userRequest 块 → 规则段，userRequest → 提问
-    if let Some(c) = last_user_content(messages) {
-        let sections = split_tagged_sections(&c);
+    // 最新提问：按标签拆分，非 userRequest 块 → 规则段，userRequest → 提问
+    if !input.question.is_empty() {
+        let sections = split_tagged_sections(&input.question);
         let mut question: Option<String> = None;
         if sections.is_empty() {
-            question = Some(c);
+            question = Some(input.question.clone());
         } else {
             for (tag, body) in sections {
                 match tag.as_deref() {
@@ -193,22 +182,20 @@ fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
             parts.push(format!("用户：\n{}", q));
         }
     }
-    if let Some(tools) = tools {
-        if tools.as_array().map_or(false, |a| !a.is_empty()) {
-            let has_tool_results = !tool_results.is_empty();
-            if has_tool_results {
-                parts.insert(
-                    0,
-                    "结合工具结果，以及历史对话，判断任务是否已经可以完成：如果还需要调用工具才能完成就继续调用工具；只有任务已全部完成才给出最终答案；不要编造工具执行结果。"
-                        .to_string(),
-                );
-            } else {
-                parts.insert(
-                    0,
-                    "根据用户问题，结合已有工具，判断是否要使用工具来完成任务，并且你应该优先使用工具完成任务，只有纯问答才直接回答。"
-                        .to_string(),
-                );
-            }
+    if input.has_tools() {
+        let has_tool_results = !input.tool_results.is_empty();
+        if has_tool_results {
+            parts.insert(
+                0,
+                "结合工具结果，以及历史对话，判断任务是否已经可以完成：如果还需要调用工具才能完成就继续调用工具；只有任务已全部完成才给出最终答案；不要编造工具执行结果。"
+                    .to_string(),
+            );
+        } else {
+            parts.insert(
+                0,
+                "根据用户问题，结合已有工具，判断是否要使用工具来完成任务，并且你应该优先使用工具完成任务，只有纯问答才直接回答。"
+                    .to_string(),
+            );
         }
     }
     parts.join("\n\n")
@@ -217,6 +204,10 @@ fn build_follow_up_user(messages: &[Value], tools: Option<&Value>) -> String {
 pub struct VscodeCopilotConverter;
 
 impl Converter for VscodeCopilotConverter {
+    fn platform(&self) -> &'static str {
+        PLATFORM
+    }
+
     /// 工具转换：工具定义 → 平台工具「记住」段
     fn convert_tools(&self, tools: &Value) -> String {
         let instruction = r#"
@@ -262,44 +253,44 @@ impl Converter for VscodeCopilotConverter {
             .to_string()
     }
 
-    /// 系统提示词转换：system 消息按 <xxx> 标签拆分，每块去掉标签后以中文标签名独立包装成规则段
-    fn convert_system(&self, messages: &[Value]) -> String {
+    /// 系统提示词转换：system 原始提示词按 <xxx> 标签拆分，每块去掉标签后以中文标签名独立包装成规则段
+    fn convert_system(&self, input: &AgentInput) -> String {
         let mut parts: Vec<String> = Vec::new();
-        for m in messages {
-            if m.get("role").and_then(|v| v.as_str()) == Some("system") {
-                if let Some(c) = m.get("content").and_then(|v| v.as_str()) {
-                    for (tag, body) in split_tagged_sections(c) {
-                        match tag {
-                            Some(t) => parts.push(format!(
-                                "以下是 {} 内容，不管用户问题是什么，你都得结合{}回答：\n{}",
-                                tag_cn(&t),
-                                tag_cn(&t),
-                                body
-                            )),
-                            None => parts.insert(0, format!("以下是你必须牢记的身份：\n{}", body)),
-                        }
-                    }
-                }
+        if input.system_prompt.is_empty() {
+            return String::new();
+        }
+        for (tag, body) in split_tagged_sections(&input.system_prompt) {
+            match tag {
+                Some(t) => parts.push(format!(
+                    "以下是 {} 内容，不管用户问题是什么，你都得结合{}回答：\n{}",
+                    tag_cn(&t),
+                    tag_cn(&t),
+                    body
+                )),
+                None => parts.insert(0, format!("以下是你必须牢记的身份：\n{}", body)),
             }
         }
         parts.join("\n\n")
     }
 
     /// 用户提示词转换：首轮 = 环境/上下文各标签块(规则段) + 真实提问；追问 = 阶段引导 + 工具结果 + 提问
-    fn convert_user(&self, ctx: &ConvertContext) -> String {
-        if ctx.is_first_turn {
+    fn convert_user(&self, input: &AgentInput) -> String {
+        if input.is_first_turn() {
             let mut parts: Vec<String> = Vec::new();
             let mut question: Option<String> = None;
-            // 遍历所有 user 消息，按 <xxx> 标签拆分（真实 Copilot 单条 user 内平铺多标签块）：
+            // 历史里的 user 段 + 用户最新提问，按 <xxx> 标签拆分（真实 Copilot 单条 user 内平铺多标签块）：
             // - <userRequest> 块 → 真实提问（单独段）
             // - 其余标签块(environment/workspace/memory/context/editorContext 等) → 独立规则段
-            for m in ctx.messages {
-                if m.get("role").and_then(|v| v.as_str()) != Some("user") {
+            let contents = input
+                .history
+                .iter()
+                .filter(|turn| turn.role == "user")
+                .map(|turn| turn.content.as_str())
+                .chain(std::iter::once(input.question.as_str()));
+            for c in contents {
+                if c.is_empty() {
                     continue;
                 }
-                let Some(c) = m.get("content").and_then(|v| v.as_str()) else {
-                    continue;
-                };
                 let sections = split_tagged_sections(c);
                 if sections.is_empty() {
                     // 无标签的整条 user：作为环境规则段
@@ -324,7 +315,7 @@ impl Converter for VscodeCopilotConverter {
             }
             parts.join("\n\n")
         } else {
-            build_follow_up_user(ctx.messages, ctx.tools)
+            build_follow_up_user(input)
         }
     }
 
@@ -334,7 +325,8 @@ impl Converter for VscodeCopilotConverter {
 #[cfg(test)]
 mod tests {
     use super::{split_tagged_sections, VscodeCopilotConverter};
-    use crate::converter::{ConvertContext, Converter};
+    use crate::converters::api::openai::to_agent_input;
+    use crate::prompts::Converter;
     use serde_json::json;
 
     /// 工具提示词：必须有具体示例与硬性要求，且不得出现错误写法/占位符字面量
@@ -459,7 +451,7 @@ mod tests {
     }
 
     /// 基于真实捕获的 messages_20260901_005758_692.json 结构
-    /// [0]system + [1]user(env+workspace合并) + [2]user(userRequest) + 历史重试 + [12]assistant + [13]user(context+editor+reminder+userRequest合并)
+    /// [0]system + [1]user(env+workspace合并) + [2]user(userRequest) + 历史重试 + 最后一轮 user
     #[test]
     fn convert_user_real_messages_first_turn() {
         let messages = vec![
@@ -468,12 +460,9 @@ mod tests {
             json!({"role": "user", "content": "<userRequest>你好？</userRequest>"}),
             json!({"role": "user", "content": "<userRequest>Try Again</userRequest>"}),
         ];
-        let ctx = ConvertContext {
-            messages: &messages,
-            tools: None,
-            is_first_turn: true,
-        };
-        let c = VscodeCopilotConverter.convert_user(&ctx);
+        let input = to_agent_input(&messages, None, Default::default());
+        assert!(input.is_first_turn(), "无 assistant 历史应算首轮");
+        let c = VscodeCopilotConverter.convert_user(&input);
         // 环境/工作区 各成规则段；提问取最后一条 userRequest
         assert!(c.contains("以下是 环境信息 内容：\nWindows"));
         assert!(c.contains("以下是 工作区信息 内容：\n项目结构"));
@@ -488,12 +477,9 @@ mod tests {
             json!({"role": "assistant", "content": "回答时间: x\n会话: abc\ndef"}),
             json!({"role": "user", "content": "<context>当前日期</context>\n<editorContext>当前文件 api.rs</editorContext>\n<reminderInstructions>请检查</reminderInstructions>\n<userRequest>你好</userRequest>"}),
         ];
-        let ctx = ConvertContext {
-            messages: &messages,
-            tools: None,
-            is_first_turn: false,
-        };
-        let c = VscodeCopilotConverter.convert_user(&ctx);
+        let input = to_agent_input(&messages, None, Default::default());
+        assert!(!input.is_first_turn(), "有 assistant 历史应算追问轮");
+        let c = VscodeCopilotConverter.convert_user(&input);
         // context/editorContext/reminderInstructions 都作为规则段保留，userRequest 作为提问
         assert!(c.contains("以下是 上下文信息 内容：\n当前日期"));
         assert!(c.contains("以下是 编辑器上下文 内容：\n当前文件 api.rs"));
@@ -504,18 +490,15 @@ mod tests {
     /// 追问轮(带工具)应再次强调工具调用格式；首轮不注入提醒(已有完整工具段)
     #[test]
     fn assemble_follow_up_injects_format_reminder() {
-        let messages = vec![
+        let tools = json!([{"function": {"name": "read_file", "description": "读取文件", "parameters": {"type": "object", "properties": {}}}}]);
+        // 追问：注入格式提醒
+        let follow_up = vec![
             json!({"role": "assistant", "content": "回答时间: x\n会话: abc\ndef"}),
             json!({"role": "user", "content": "<userRequest>继续</userRequest>"}),
         ];
-        let tools = json!([{"function": {"name": "read_file", "description": "读取文件", "parameters": {"type": "object", "properties": {}}}}]);
-        // 追问：注入格式提醒
-        let ctx = ConvertContext {
-            messages: &messages,
-            tools: Some(&tools),
-            is_first_turn: false,
-        };
-        let c = VscodeCopilotConverter.assemble(&ctx);
+        let input = to_agent_input(&follow_up, Some(tools.clone()), Default::default());
+        assert!(!input.is_first_turn());
+        let c = VscodeCopilotConverter.assemble(&input);
         assert!(c.contains("【工具调用格式】"), "追问应再次强调格式, 实际: {}", c);
         assert!(c.contains("<tool_call>"), "提醒应含 <tool_call> 围栏");
         assert!(c.contains("</tool_call>"));
@@ -533,12 +516,10 @@ mod tests {
             c
         );
         // 首轮：完整工具段，不注入提醒
-        let ctx_first = ConvertContext {
-            messages: &messages,
-            tools: Some(&tools),
-            is_first_turn: true,
-        };
-        let cf = VscodeCopilotConverter.assemble(&ctx_first);
+        let first_turn = vec![json!({"role": "user", "content": "<userRequest>继续</userRequest>"})];
+        let input_first = to_agent_input(&first_turn, Some(tools), Default::default());
+        assert!(input_first.is_first_turn());
+        let cf = VscodeCopilotConverter.assemble(&input_first);
         assert!(cf.contains("以下是你可以调用的工具"));
         assert!(cf.contains("输出前自检"), "首轮工具段应含完整格式要求, 实际: {}", cf);
         assert!(!cf.contains("【工具调用格式】"), "首轮不应再注入提醒, 实际: {}", cf);

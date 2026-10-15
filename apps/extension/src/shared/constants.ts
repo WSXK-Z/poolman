@@ -1,3 +1,8 @@
+/**
+ * 扩展 UI 与后台共同使用的设置、状态和内部消息类型。
+ *
+ * 这里的内部消息只在扩展运行时内部流转；桌面端通信协议由共享协议包定义。
+ */
 import type { ModelProvider, ProviderStatusMap } from '@ai-gateway/shared';
 
 /** 默认本地服务 WebSocket 地址 */

@@ -16,3 +16,4 @@ export function setBaseUrl(url: string): void {
 export function getHealthUrl(): string {
   return `${getBaseUrl().replace(/\/+$/, "")}/health`;
 }
+/** 桌面端前端共享的应用级常量与配置默认值。 */

@@ -1,3 +1,9 @@
+/**
+ * 扩展 Manifest V3 后台入口。
+ *
+ * 初始化本地状态、桌面 WebSocket 和供应商登录轮询，并承接 popup 的内部消息；
+ * 页面凭证由内容脚本捕获后在此统一同步至桌面端。
+ */
 import { browser } from 'wxt/browser';
 import { MessageType, type ModelProvider, type ProviderStatusMap } from '@ai-gateway/shared';
 import { createLogger, errorMessage } from '@ai-gateway/utils';
@@ -24,6 +30,7 @@ function getStatus(): ProviderStatusMap {
 }
 
 function startConnection(): void {
+  // 配置变更时关闭旧 socket 后再建立新连接，保证只有当前配置对应的连接在运行。
   connection?.stop();
   connection = new GatewayConnection({
     url: backgroundState.settings.serverUrl,
@@ -44,6 +51,7 @@ function startConnection(): void {
  * 内容脚本捕获后本地缓存一份（供 UI 展示 / 重连重发），真正存储与使用在服务端。
  */
 function syncCredentialsToServer(provider?: ModelProvider): void {
+  // 指定 provider 用于捕获后增量同步；不指定时在连接建立/重连后发送完整快照。
   if (!connection) return;
   const creds = backgroundState.getAllCredentials();
   for (const c of creds) {
@@ -169,14 +177,10 @@ async function handleInternalMessage(msg: InternalMessage): Promise<InternalResp
       return { ok: true, data: backgroundState.settings };
     }
     case 'QUICK_TEST': {
-      try {
-        const provider = getProvider(msg.payload.model);
-        const started = Date.now();
-        const result = await provider.chat(msg.payload.model, [{ role: 'user', content: msg.payload.prompt }]);
-        return { ok: true, result: { content: result.content ?? '', elapsedMs: Date.now() - started } };
-      } catch (err) {
-        return { ok: false, error: errorMessage(err) };
-      }
+      return {
+        ok: false,
+        error: '扩展仅负责转发网页执行请求，请通过桌面端 API 测试供应商连接。',
+      };
     }
     case 'OPEN_PROVIDER': {
       try {

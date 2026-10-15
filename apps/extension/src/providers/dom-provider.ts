@@ -1,14 +1,12 @@
-import type { ChatMessage, ChatOptions, ChatResult, ModelProvider, PublicModel } from '@ai-gateway/shared';
+/** 通过平台 URL、模型列表和登录检测规则构造轻量供应商元信息。 */
+import type { ModelProvider, PublicModel } from '@ai-gateway/shared';
 import { createLogger } from '@ai-gateway/utils';
 import { browser } from 'wxt/browser';
 import {
   type AIProvider,
-  buildPrompt,
-  domChatInPage,
   domCheckAuthInPage,
   ensureTab,
   runInPage,
-  type DomChatConfig,
 } from './base';
 
 const log = createLogger('ext:provider');
@@ -21,10 +19,8 @@ export interface DomProviderOptions {
   models: PublicModel[];
   /** 登录态检测关键词（正则） */
   loginPattern: string;
-  /** 通用 DOM 聊天配置（prompt 会在调用时注入） */
-  dom: Omit<DomChatConfig, 'prompt'>;
-  /** DeepSeek 类“深度思考”预点击（可选） */
-  deepThink?: boolean;
+  /** 登录态检测使用的输入框选择器 */
+  dom: { inputSelectors: string[]; [key: string]: unknown };
 }
 
 /**
@@ -32,15 +28,6 @@ export interface DomProviderOptions {
  * 各平台只需提供页面选择器与匹配规则，即可获得完整的 chat / checkAuth 实现。
  */
 export function createDomProvider(opts: DomProviderOptions): AIProvider {
-  const domConfig: Omit<DomChatConfig, 'prompt'> = opts.deepThink
-    ? {
-        ...opts.dom,
-        preClickSelector: opts.dom.preClickSelector,
-        preClickLabelPattern: opts.dom.preClickLabelPattern ?? '深度思考|DeepThink',
-        preClickActivePattern: opts.dom.preClickActivePattern ?? 'active|开启',
-      }
-    : opts.dom;
-
   return {
     id: opts.id,
     name: opts.name,
@@ -68,25 +55,6 @@ export function createDomProvider(opts: DomProviderOptions): AIProvider {
         log.warn(`checkAuth ${opts.id} failed`, err);
         return false;
       }
-    },
-
-    async chat(model: ModelProvider, messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult> {
-      const tabId = await ensureTab(opts.url);
-      const prompt = buildPrompt(messages);
-      const started = Date.now();
-      const content = await runInPage<string>(tabId, domChatInPage, [
-        {
-          ...domConfig,
-          prompt,
-          maxWaitMs: options?.timeoutMs ?? domConfig.maxWaitMs,
-        } satisfies DomChatConfig,
-      ]);
-      log.info(`chat ${opts.id} done in ${Date.now() - started}ms`);
-      return {
-        content,
-        model,
-        finishedReason: 'stop',
-      };
     },
   };
 }

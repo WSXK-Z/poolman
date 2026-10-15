@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 展示网关记录的会话与合并对话列表（每条消息同时显示原始内容与转换后内容）。
 import { computed, h, onMounted, ref } from "vue";
 import {
   NButton,
@@ -33,14 +34,14 @@ interface SessionInfo {
   raw_count: number;
   converted_count: number;
 }
-interface MessageRecord {
+interface ConversationItem {
   role: string;
-  content: string;
+  raw_content: string;
+  converted_content: string;
   created_at: number;
 }
 interface SessionDetail extends SessionInfo {
-  raw_messages: MessageRecord[];
-  converted_messages: MessageRecord[];
+  conversation: ConversationItem[];
 }
 
 const message = useMessage();
@@ -65,6 +66,14 @@ function roleTagType(role: string): "info" | "warning" | "error" | "success" {
   if (role === "system") return "warning";
   if (role === "tool") return "error";
   return "success";
+}
+
+function roleLabel(role: string): string {
+  if (role === "user") return "用户提问";
+  if (role === "assistant") return "AI 回答";
+  if (role === "tool") return "工具结果";
+  if (role === "system") return "系统提示";
+  return role;
 }
 
 const columns: DataTableColumns<SessionInfo> = [
@@ -104,17 +113,31 @@ const columns: DataTableColumns<SessionInfo> = [
   },
 ];
 
-const msgColumns: DataTableColumns<MessageRecord> = [
+// 合并对话列表列：角色 / 原始内容 / 转换后内容 / 创建时间
+const convColumns: DataTableColumns<ConversationItem> = [
   {
     title: "角色",
     key: "role",
-    width: 90,
+    width: 110,
     render: (row) =>
-      h(NTag, { size: "small", type: roleTagType(row.role) }, { default: () => row.role }),
+      h(NTag, { size: "small", type: roleTagType(row.role) }, { default: () => roleLabel(row.role) }),
   },
-  { title: "内容", key: "content" },
   {
-    title: "时间",
+    title: "原始内容（客户端发送）",
+    key: "raw_content",
+    ellipsis: { tooltip: true },
+  },
+  {
+    title: "转换后内容（发给网页平台）",
+    key: "converted_content",
+    ellipsis: { tooltip: true },
+    render: (row) =>
+      row.converted_content
+        ? h("span", {}, row.converted_content)
+        : h("span", { style: "color:#999" }, "—"),
+  },
+  {
+    title: "创建时间",
     key: "created_at",
     width: 170,
     render: (row) => formatTime(row.created_at),
@@ -196,12 +219,12 @@ onMounted(() => {
     />
   </n-card>
 
-  <!-- 详情弹窗：表格显示对话记录 -->
+  <!-- 详情弹窗：合并对话列表，每条消息同时展示原始内容与转换后内容 -->
   <n-modal
     v-model:show="showDetail"
     preset="card"
     :title="detail ? `会话详情 - ${detail.title}` : '会话详情'"
-    style="width: 760px"
+    style="width: 960px"
   >
     <n-space v-if="detail" vertical>
       <n-descriptions :columns="2" size="small" label-placement="left">
@@ -211,23 +234,13 @@ onMounted(() => {
         <n-descriptions-item label="API Key">{{ detail.api_key }}</n-descriptions-item>
       </n-descriptions>
 
-      <n-card size="small" title="原始对话记录">
+      <n-card size="small" title="历史对话">
         <n-data-table
-          :columns="msgColumns"
-          :data="detail.raw_messages"
+          :columns="convColumns"
+          :data="detail.conversation"
           size="small"
-          :max-height="260"
-          :scroll-x="900"
-        />
-      </n-card>
-
-      <n-card size="small" title="转换后对话记录">
-        <n-data-table
-          :columns="msgColumns"
-          :data="detail.converted_messages"
-          size="small"
-          :max-height="260"
-          :scroll-x="900"
+          :max-height="480"
+          :scroll-x="1200"
         />
       </n-card>
     </n-space>

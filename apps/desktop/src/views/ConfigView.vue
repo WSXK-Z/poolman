@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 编辑本地网关监听地址、端口和运行选项，并通过 Tauri command 保存配置。
 import { onMounted, ref } from "vue";
 import {
   NAlert,

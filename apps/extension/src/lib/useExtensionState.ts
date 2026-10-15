@@ -1,3 +1,4 @@
+/** 将后台轮询状态封装为可在 Vue 组件中订阅的响应式状态。 */
 import { onUnmounted, ref } from 'vue';
 import { sendMessage } from './messaging';
 import type { ExtensionState } from '~/shared/constants';

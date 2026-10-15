@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 展示连接说明和诊断信息，并提供打开相关本地目录或网页的操作。
 import { onMounted, ref } from "vue";
 import { NAlert, NButton, NCard, NCode } from "naive-ui";
 import { invoke } from "@tauri-apps/api/core";

@@ -1,11 +1,16 @@
+//! WebSocket 上行消息分发器。
+//!
+//! 根据消息 ID 将网页执行的响应块、执行结果和捕获完成事件交还等待中的请求，
+//! 同时把供应商状态与凭证同步到桌面进程共享状态。
+
 use serde_json::Value;
 use std::sync::Arc;
 use tracing::{debug, info};
 
 use super::credentials::CredentialStore;
+use super::manager::ExtensionManager;
 use super::websocket::{
-    ChatChunkPayload, ChatResponsePayload, ChunkCallbacks, ExecuteChunkCallbacks,
-    ExecuteResultPayload, PendingCapture, PendingExecute, PendingRequests,
+    ExecuteChunkCallbacks, ExecuteResultPayload, PendingCapture, PendingExecute,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -20,16 +25,14 @@ struct BridgeMessage {
 
 pub async fn handle_bridge_message(
     text: &str,
-    pending: &PendingRequests,
-    chunk_callbacks: &ChunkCallbacks,
     pending_execute: &PendingExecute,
     execute_chunk_callbacks: &ExecuteChunkCallbacks,
     pending_capture: &PendingCapture,
-    latest_status: &Arc<tokio::sync::RwLock<Value>>,
-    plugin_statuses: &Arc<tokio::sync::RwLock<std::collections::HashMap<String, Value>>>,
+    manager: &Arc<ExtensionManager>,
     plugin_id: &str,
     credentials: &Arc<CredentialStore>,
 ) {
+    // 只有结构完整的协议消息才进入状态处理；解析错误在这里记录并丢弃。
     let msg: BridgeMessage = match serde_json::from_str(text) {
         Ok(m) => m,
         Err(e) => {
@@ -39,72 +42,6 @@ pub async fn handle_bridge_message(
     };
 
     match msg.type_.as_str() {
-        "CHAT_CHUNK" => {
-            // 流式增量块
-            let delta = msg
-                .payload
-                .get("delta")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let tool_calls = msg.payload.get("tool_calls").cloned();
-            let chunk = ChatChunkPayload { delta, tool_calls };
-            if let Some(mut cb) = chunk_callbacks.lock().await.remove(&msg.id) {
-                cb(chunk);
-            }
-        }
-        "CHAT_RESPONSE" => {
-            // 完整响应
-            let content = msg
-                .payload
-                .get("content")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let model = msg
-                .payload
-                .get("model")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string();
-            let usage = msg.payload.get("usage").cloned();
-            let finished_reason = msg
-                .payload
-                .get("finishedReason")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let tool_calls = msg.payload.get("tool_calls").cloned();
-
-            let response = ChatResponsePayload {
-                content,
-                model,
-                usage,
-                finished_reason,
-                tool_calls,
-            };
-            if let Some(sender) = pending.lock().await.remove(&msg.id) {
-                let _ = sender.send(response);
-            }
-            chunk_callbacks.lock().await.remove(&msg.id);
-        }
-        "CHAT_ERROR" => {
-            let error = msg
-                .payload
-                .get("error")
-                .and_then(|v| v.as_str())
-                .unwrap_or("未知错误")
-                .to_string();
-            if let Some(sender) = pending.lock().await.remove(&msg.id) {
-                let payload = ChatResponsePayload {
-                    content: format!("错误: {}", error),
-                    model: "unknown".to_string(),
-                    usage: None,
-                    finished_reason: Some("error".to_string()),
-                    tool_calls: None,
-                };
-                let _ = sender.send(payload);
-            }
-            chunk_callbacks.lock().await.remove(&msg.id);
-        }
         "EXECUTE_CHUNK" => {
             // 执行流式增量块（回调须保留至 EXECUTE_RESULT 才移除，否则后续块找不到回调被丢弃）
             let data = msg
@@ -191,14 +128,9 @@ pub async fn handle_bridge_message(
             }
         }
         "STATUS_SYNC" => {
-            let status = msg.payload.clone();
-            *latest_status.write().await = status.clone();
-            plugin_statuses
-                .write()
-                .await
-                .insert(plugin_id.to_string(), status);
+            manager.update_status(plugin_id, msg.payload.clone());
         }
-        "CHAT_REQUEST" | "CAPTURE_REQUEST" | "EXECUTE_REQUEST" => {
+        "CAPTURE_REQUEST" | "EXECUTE_REQUEST" => {
             // 服务端->插件下行消息，插件不应回发
             debug!("收到来自扩展的意外下行消息类型: {}", msg.type_);
         }

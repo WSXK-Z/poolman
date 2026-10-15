@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 管理客户端 API Key：创建时绑定平台，列表操作用于复制、编辑备注和删除。
 import { h, onMounted, ref } from "vue";
 import {
   NButton,

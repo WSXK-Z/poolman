@@ -1,5 +1,5 @@
 /**
- * 构建全部应用（共享包 -> 服务 -> 插件）。
+ * 构建全部应用（共享包 -> 插件）。
  * 用法：node scripts/build-all.js
  */
 const { spawnSync } = require('node:child_process');
@@ -10,7 +10,6 @@ const root = path.resolve(__dirname, '..');
 const steps = [
   { name: 'shared', args: ['--filter', '@ai-gateway/shared', 'build'] },
   { name: 'utils', args: ['--filter', '@ai-gateway/utils', 'build'] },
-  { name: 'server', args: ['--filter', '@ai-gateway/server', 'build'] },
   { name: 'extension', args: ['--filter', '@ai-gateway/extension', 'build'] },
 ];
 

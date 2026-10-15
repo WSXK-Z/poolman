@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 展示本地 HTTP/WebSocket 服务、插件连接与供应商登录状态的汇总视图。
 import { onMounted, onUnmounted, ref } from "vue";
 import {
   NAlert,

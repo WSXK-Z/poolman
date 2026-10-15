@@ -8,7 +8,7 @@
 
 ## 1. 产品简介
 
-AI Gateway（也称 PoolMen）是一个本地化的 API 网关，它将您已经登录的 AI 网页版（如 DeepSeek、ChatGPT 等）转换为标准的 OpenAI 兼容接口。您可以使用任何支持 OpenAI API 的客户端（如 Cursor、Chatbox、Postman 等）通过本网关调用 AI 能力，而无需购买官方 API Key。
+AI Gateway（也称 poolman）是一个本地化的 API 网关，它将您已经登录的 AI 网页版（如 DeepSeek、ChatGPT 等）转换为标准的 OpenAI 兼容接口。您可以使用任何支持 OpenAI API 的客户端（如 Cursor、Chatbox、Postman 等）通过本网关调用 AI 能力，而无需购买官方 API Key。
 
 **核心优势**：
 - ✅ 零成本：复用已有网页账号，无需额外付费。
@@ -29,12 +29,12 @@ AI Gateway（也称 PoolMen）是一个本地化的 API 网关，它将您已经
 - **Chrome 浏览器**（用于运行扩展，必须已登录目标 AI 网站）
 
 #### 2.1.2 下载与安装
-从 [Releases](https://github.com/your-repo/ai-gateway/releases) 页面下载对应操作系统的最新版本安装包（例如 `poolmen_0.1.8_x64-setup.exe`），然后按照安装向导完成安装。
+从 [Releases](https://github.com/your-repo/ai-gateway/releases) 页面下载对应操作系统的最新版本安装包（例如 `poolman_0.1.13_x64-setup.exe`），然后按照安装向导完成安装。
 
 #### 2.1.3 启动桌面端
-双击桌面快捷方式或从开始菜单启动应用（应用名称为 `PoolMen`）。启动后，桌面端会自动启动内置的网关服务：
+双击桌面快捷方式或从开始菜单启动应用（应用名称为 `poolman`）。启动后，桌面端会自动启动内置的网关服务：
 - HTTP 服务监听 `http://127.0.0.1:13213`
-- WebSocket 服务监听 `ws://127.0.0.1:13214`
+- WebSocket 服务监听 `ws://127.0.0.1:3001`
 
 > 端口可在桌面端设置界面中修改，修改后所有 API 调用需使用新端口。
 
@@ -42,7 +42,7 @@ AI Gateway（也称 PoolMen）是一个本地化的 API 网关，它将您已经
 桌面端安装包已包含浏览器扩展，但需要您手动加载：
 1. 打开 Chrome，访问 `chrome://extensions/`
 2. 开启“开发者模式”
-3. 点击“加载已解压的扩展程序”，选择桌面端安装目录下的 `chrome-mv3` 文件夹（通常位于 `C:\Program Files\PoolMen\resources\chrome-mv3` 或类似路径）
+3. 点击“加载已解压的扩展程序”，选择桌面端安装目录下的 `chrome-mv3` 文件夹（通常位于 `C:\Program Files\poolman\resources\chrome-mv3` 或类似路径）
 
 加载成功后，扩展图标会出现在浏览器右上角。
 
@@ -68,20 +68,20 @@ pnpm install
 
 #### 2.2.3 启动开发模式
 ```bash
-# 同时启动插件与服务（使用 pnpm 递归并行）
+# 同时启动桌面端与插件（使用 pnpm 递归并行）
 pnpm dev
 # 或分别启动
-pnpm --filter @ai-gateway/server dev
+pnpm --filter @ai-gateway/desktop dev
 pnpm --filter @ai-gateway/extension dev
 ```
 
-- 服务监听 `http://127.0.0.1:13213`（HTTP）和 `ws://127.0.0.1:13214`（WebSocket）
+- 网关监听 `http://127.0.0.1:13213`（HTTP）和 `ws://127.0.0.1:3001`（WebSocket）
 - 插件构建产物位于 `apps/extension/.output/chrome-mv3`，在 Chrome 扩展程序页面加载此文件夹即可。
 
 #### 2.2.4 构建生产版本
 ```bash
 pnpm build
-# 服务产物：apps/server/dist
+# 桌面端前端产物：apps/desktop/dist
 # 插件产物：apps/extension/dist
 ```
 
@@ -91,17 +91,36 @@ pnpm build
 
 AI Gateway 无需配置 API Key。您可以通过环境变量或桌面端界面调整行为。
 
-### 3.1 环境变量（服务端）
+### 3.1 环境变量（内置网关）
 
-配置文件位于 `apps/server/src/config/index.ts`，支持以下环境变量：
+配置读取自 `apps/desktop/src-tauri/src/config.rs`，支持以下环境变量：
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
+| `HOST` | 监听地址 | `127.0.0.1` |
 | `PORT` | HTTP 服务端口 | `13213` |
-| `WS_PORT` | WebSocket 端口 | `13214` |
+| `WS_PORT` | WebSocket 端口 | `3001` |
+| `REQUEST_TIMEOUT_MS` | 单次请求超时（毫秒） | `120000` |
+| `CORS_ORIGIN` | 允许的跨域来源 | `*` |
 | `LOG_LEVEL` | 日志级别（`debug`/`info`/`warn`/`error`） | `info` |
 
-### 3.2 桌面端配置
+### 3.2 落盘工具（开发期链路分段排查）
+
+链路分若干阶段，每个阶段都能单独落盘，便于逐段确认（对应关系见下表）。
+落盘文件含请求头（可能有 API Key），因此不入库。
+
+| 阶段 | 产物 | 行为 | 插入位置 |
+|------|------|------|----------|
+| ① 请求入口 | `chat-request-<时间戳>-<随机>.json`（方法 / 路径 / 查询 / 请求头 / 原始正文） | 落盘后按请求的接口格式与 `stream` 返回一份**形状正常的模型输出**（正文固定为「开发中」），其后的环节都不执行 | `apis.rs::create_app` 的 `route_layer`（默认注释掉，注释掉即放行到下一阶段） |
+| ② 响应解析完 | `response-<时间戳>-<随机>.json`（`SseFrameParser` 解析出的思考 / 正文 / 工具调用 + 状态、原始文本长度、结束原因） | 只落盘，链路照常跑完：结果照常返回客户端 | 模型内 `models/deepseek_web.rs::chat`，解析完成后落盘 |
+
+| 变量名 | 说明 | 默认值 |
+|--------|------|--------|
+| `AI_GATEWAY_DUMP_REQUESTS` | 请求入口阶段的落盘开关（`0`/`false`/`off`/`no` 关闭，其余值启用） | 启用 |
+| `AI_GATEWAY_RESPONSE_DUMP` | 响应阶段的落盘开关 | 未设置时跟随 `AI_GATEWAY_DUMP_REQUESTS` |
+| `AI_GATEWAY_DUMP_DIR` | 落盘目录（各阶段共用） | 应用数据目录（`data/`） |
+
+### 3.3 桌面端配置
 
 启动桌面端后，可在“配置管理”界面调整端口、超时时间等，修改后需重启服务生效。
 
@@ -285,14 +304,15 @@ pnpm tauri build  # 生成安装包（Windows 为 NSIS）
 
 | 问题现象 | 可能原因 | 解决方法 |
 |----------|----------|----------|
-| 服务启动失败，端口被占用 | 13213/13214 端口已被其他程序使用 | 修改 `PORT` 和 `WS_PORT` 环境变量或桌面端配置 |
+| 服务启动失败，端口被占用 | 13213/3001 端口已被其他程序使用 | 修改 `PORT` 和 `WS_PORT` 环境变量或桌面端配置 |
 | 扩展加载后无反应 | 未登录或会话过期 | 重新登录目标 AI 网页 |
 | 请求返回 `500 Internal Server Error` | 网页返回异常或选择器失效 | 查看终端/桌面端错误日志，更新对应 provider |
 | 桌面端构建失败 | Rust 工具链缺失 | 安装 [Tauri 系统依赖](https://tauri.app/start/prerequisites/) |
+| 请求返回空内容 | 网页返回的响应里没有正文帧（如网页端报错、会话失效） | 在 `data/gateway.log` 搜 `插件调用结果`（每次插件往返的状态、正文长度与正文开头）与 `网页回答为空`（未解析出正文的那次原始响应） |
 | 流式响应中断 | 网络不稳定或网页端限制 | 检查网络，尝试非流式调用 |
 | 桌面端找不到扩展资源 | 安装路径不正确或资源未打包 | 重新安装，或手动复制 `chrome-mv3` 到指定位置 |
 
-如果问题仍未解决，请提交 Issue 或查阅项目根目录下的 `架构设计.md` 了解更多实现细节。
+如果问题仍未解决，请提交 Issue 或查阅项目根目录下的 `链路设计.md` 了解更多实现细节。
 
 ---
 

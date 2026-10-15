@@ -605,6 +605,10 @@ fn parse_args_object(raw: &str) -> Value {
     v
 }
 
+/// 判断解析出的 Value 是否具备「工具调用」形状。
+///
+/// 数组取首元素判断；对象含 `name`（自有 YAML 格式）或 `function`（OpenAI 包装格式）
+/// 即视为工具形状。用于过滤普通对象/文本，避免误判为工具调用。
 fn has_tool_shape(v: &Value) -> bool {
     let obj = if v.is_array() {
         v.as_array().and_then(|a| a.first()).cloned().unwrap_or(json!({}))
@@ -614,7 +618,20 @@ fn has_tool_shape(v: &Value) -> bool {
     obj.get("name").is_some() || obj.get("function").is_some()
 }
 
-/// 从回答内容解析工具调用 → OpenAI 标准 tool_calls 数组
+/// 从回答内容解析工具调用，输出 OpenAI 标准 `tool_calls` 数组。
+///
+/// 输入 `content` 既可能是网关内部的 JSON 字符串（`{"THINK":..,"RESPONSE":..}`），
+/// 也可能是纯文本回答：先经 `extract_response_text` 取出 RESPONSE 纯文本，
+/// 再交给 `parse_tool_call_blocks` 做多格式容错解析（XML/DSML、
+/// `<tool_call>` 围栏内 YAML、无围栏整体 YAML、DSML 兜底）。
+///
+/// 命中时返回 `Some(Array)`，每项形如
+/// `{"id":"call_<毫秒时间戳hex>_<序号>","type":"function","function":{"name":..,"arguments":"<JSON字符串>"}}`：
+/// - `name` 为解析出的工具名；
+/// - `arguments` 为参数对象的 JSON 字符串（`serde_json::to_string` 失败时回退 `"{}"`）；
+/// - `id` 由同一次调用共用的毫秒级时间戳基数加序号拼成，保证同一轮内多个调用间唯一。
+///
+/// 未解析出任何工具调用时返回 `None`；本函数不修改输入，也不产生副作用。
 fn parse_tool_calls(content: &str) -> Option<Value> {
     let text = extract_response_text(content);
     let calls = parse_tool_call_blocks(&text)?;
@@ -636,7 +653,14 @@ fn parse_tool_calls(content: &str) -> Option<Value> {
     Some(Value::Array(arr))
 }
 
-/// 从回答内容（JSON 字符串 {THINK, RESPONSE} 或纯字符串）提取 RESPONSE 纯文本
+/// 从回答内容中取出应答纯文本（剥离思考内容，只保留正式回答）。
+///
+/// 按顺序尝试：
+/// 1. `content` 可解析为 JSON 且根节点是字符串 → 返回该字符串；
+/// 2. 可解析为 JSON 对象且含字符串字段 `RESPONSE` → 返回该字段值（`THINK` 等其它字段被丢弃）；
+/// 3. 其余情况（JSON 解析失败、无 `RESPONSE` 字段、或为数字/数组等其它 JSON 类型）→ 原样返回 `content`。
+///
+/// 输入不被修改，返回新分配的 `String`；对不合法输入也不报错，始终有返回值。
 fn extract_response_text(content: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(content) {
         if let Some(s) = v.as_str() {
@@ -649,7 +673,12 @@ fn extract_response_text(content: &str) -> String {
     content.to_string()
 }
 
-/// 返回前加「回答时间 + 会话」前缀
+/// 在回答正文前拼上「回答时间 + 会话」两行前缀。
+///
+/// 输出固定为 `回答时间: <ts>\n会话: <session_id>\n<content>`（`ts` 与 `session_id`
+/// 为调用方传入，本函数不做校验或转义）。前缀使下游可见本轮回答时间，
+/// 并让后续追问能经由 `extract_session_id` 从历史回答文本里回读会话 id，
+/// 从而复用同一个网页会话（该回读依赖此前缀的固定字节布局）。
 fn attach_answer_prefix(content: &str, ts: &str, session_id: &str) -> String {
     format!("回答时间: {}\n会话: {}\n{}", ts, session_id, content)
 }
@@ -699,8 +728,11 @@ fn delta_text(d: &str) -> String {
 
 /* ------------------------------ SSE 解析器 ------------------------------ */
 
+/// SSE 响应中的一个内容片段。
 struct Fragment {
+    /// 片段类型：`THINK`（思考）或 `RESPONSE`（正式回答）；缺省时为空串。
     ftype: String,
+    /// 片段累积内容（追加或整体设置，取决于事件操作符）。
     content: String,
 }
 
@@ -1991,6 +2023,7 @@ fn tool_fence_remaining(buf: &str) -> Option<usize> {
 
 /* ------------------------------ 其他辅助 ------------------------------ */
 
+/// 生成一个 UUID v4 形态的随机标识（用作创建会话失败时的本地会话 id 兜底）。
 fn uuid() -> String {
     format!(
         "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
@@ -2022,10 +2055,11 @@ fn extract_session_id_from_history(messages: &[Value]) -> Option<String> {
     None
 }
 
+/// 对字符串做 URL 百分号编码：保留 ASCII 字母数字与 `-` `_` `.`，其余字节编码为 `%XX`。
+/// 用于拼接查询参数（如会话 id 出现在 history 接口 URL 中）。
 fn urlencoding(s: &str) -> String {
     let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+    for b in s.bytes() {        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
             out.push(b as char);
         } else {
             out.push_str(&format!("%{:02X}", b));

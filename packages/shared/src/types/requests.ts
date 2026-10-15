@@ -1,3 +1,8 @@
+/**
+ * OpenAI 兼容聊天接口的领域类型。
+ *
+ * 这些类型描述 HTTP API 的请求与结果，不代表扩展和桌面 WebSocket 上的执行协议。
+ */
 export type ChatRole = 'system' | 'user' | 'assistant' | 'tool';
 
 export interface ChatMessage {

@@ -1,3 +1,9 @@
+/**
+ * 已打开标签页的内容脚本通信辅助工具。
+ *
+ * 扩展更新后既有标签页可能没有接收端；检测到此类连接错误时按 manifest
+ * 声明补注入脚本并重试，其他错误保持原样向调用方传播。
+ */
 import { browser } from 'wxt/browser';
 import { createLogger, errorMessage } from '@ai-gateway/utils';
 import { ProviderError } from '~/providers/base';

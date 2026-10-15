@@ -15,6 +15,8 @@ pub struct Model {
     pub platform: String,
     /// 关联的 API Key（用于按 key 分平台查看）
     pub api_key: String,
+    /// 最近一次执行该会话的插件 id（调度会话粘性的落库副本；尚无记录时为 NULL）
+    pub plugin_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }

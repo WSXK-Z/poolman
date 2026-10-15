@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// 将后台同步的供应商状态映射为卡片和操作菜单，菜单动作通过内部消息交给 background。
 import { computed, ref } from 'vue';
 import { NDropdown, NSpin, useMessage } from 'naive-ui';
 import type { ProviderStatusMap } from '@ai-gateway/shared';

@@ -1,4 +1,10 @@
-import type { ChatMessage, ChatOptions, ChatResult, ModelProvider } from '@ai-gateway/shared';
+/**
+ * 供应商页面元信息与通用标签页辅助逻辑。
+ *
+ * AIProvider 只为状态轮询和页面管理提供平台元数据；对话请求由桌面适配器处理，
+ * 扩展不从此接口直接生成或解析聊天内容。
+ */
+import type { ModelProvider } from '@ai-gateway/shared';
 import { browser } from 'wxt/browser';
 
 /** 统一 AI 平台适配器接口 */
@@ -11,18 +17,6 @@ export interface AIProvider {
   matches: string[];
   /** 检测是否已登录 */
   checkAuth(): Promise<boolean>;
-  /** 执行一次聊天 */
-  chat(model: ModelProvider, messages: ChatMessage[], options?: ChatOptions): Promise<ChatResult>;
-  /**
-   * 流式聊天：逐块调用 onChunk 产出增量文本，最后返回汇总结果。
-   * 可选实现 —— 未实现时 messageRouter 会回退到 chat()。
-   */
-  chatStream?(
-    model: ModelProvider,
-    messages: ChatMessage[],
-    onChunk: (delta: string) => void,
-    options?: ChatOptions,
-  ): Promise<ChatResult>;
   /** 平台支持的对外模型名 */
   getModels(): string[];
   /** 打开平台页面，返回 tabId */
@@ -62,22 +56,6 @@ export async function ensureTab(url: string, activate = false): Promise<number> 
   const tab = await browser.tabs.create({ url, active: activate });
   if (tab.id == null) throw new ProviderError('无法创建标签页');
   return tab.id;
-}
-
-/** 将多轮消息拼成单条提示词（网页版一次只发一条） */
-export function buildPrompt(messages: ChatMessage[]): string {
-  return messages
-    .map((m) => {
-      switch (m.role) {
-        case 'system':
-          return `System: ${m.content}`;
-        case 'assistant':
-          return `Assistant: ${m.content}`;
-        default:
-          return `User: ${m.content}`;
-      }
-    })
-    .join('\n\n');
 }
 
 /** 在指定标签页的 MAIN world 中执行自包含函数 */

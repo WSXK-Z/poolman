@@ -1,4 +1,5 @@
 <script setup lang="ts">
+// Popup 主界面：编辑桌面服务连接设置，并展示供应商登录和连接状态。
 import {
   NButton,
   NCard,
