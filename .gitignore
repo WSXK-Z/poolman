@@ -33,10 +33,5 @@ coverage/
 *.crx
 *.pem
 
-# 落盘工具的产物（含请求头 / 提示词 / 模型返回，不入库）
-apps/desktop/data/chat-request-*.json
-apps/desktop/data/prompt-*.json
-apps/desktop/data/response-*.json
-apps/desktop/data/**/chat-request-*.json
-apps/desktop/data/**/prompt-*.json
-apps/desktop/data/**/response-*.json
+# 运行时数据（数据库、日志、落盘产物：含请求头 / 提示词 / 模型返回），不入库
+apps/desktop/data/
