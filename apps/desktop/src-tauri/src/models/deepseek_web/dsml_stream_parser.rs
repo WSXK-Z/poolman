@@ -20,7 +20,9 @@
 //!    裸 `<invoke>` 这类没有标记的伪 XML 不算工具调用，免得正文里的普通尖括号被误吃；
 //! 3. 参数类型按 `string` 属性定：缺省 / `"true"` 原样当字符串，只有显式 `"false"` 才按 JSON 解析；
 //! 4. 一个流里出现多个 `calls` 块时结果累加、序号连续（设计文档按「一块一解析器」写，这里是超集）；
-//! 5. 未闭合的块在收尾时把原文当正文吐回——宁可多出文字，也不吞掉模型输出；
+//! 5. 未闭合的块在收尾时以 [`DsmlEvent::Markup`] 交给上层，不当正文外泄——模型写坏的标记
+//!    （半块、半个参数）落到客户端就是一条「看着像标记的回答」，既拿不到工具调用，又会被当成
+//!    历史回传回来；
 //! 6. 参数漏写闭合标签时按「遇到下一个 DSML 标签」截断当前参数值，并剪掉值末尾粘着的
 //!    写坏的标签碎片——否则标签会被并进值里，客户端拿它当命令执行。
 //!
@@ -44,6 +46,9 @@ const MAX_PENDING_BYTES: usize = 4 * 1024 * 1024;
 pub enum DsmlEvent {
     /// 工具调用标记之外的正文。调用方应原样转发（设计文档事件集之外的补充，见模块注释）。
     Text(String),
+    /// 收尾时块内没消费完的原文（半块、半个参数）。它是写坏的标记，不是正文：
+    /// 调用方不该转发，只用于判定本轮没有可用回答并说明原因。
+    Markup(String),
     /// `<…DSML… calls>`：一块工具调用开始。
     CallsStart,
     /// 一个 `invoke` 开标签出现；`index` 是这个调用在本块内的序号。
@@ -159,17 +164,26 @@ impl DsmlStreamParser {
         self.drive(out);
     }
 
-    /// 流结束：把没闭合的残料原样当正文吐出，再清空状态。
+    /// 流结束：把没闭合的残料交给上层，再清空状态。
     ///
-    /// 已经闭合的调用留在 [`Self::calls`] 里；没闭合的（半个块、半个 `invoke`、没收到闭合
-    /// 标签的参数值）连同标记一起吐回正文，不吞模型输出。
+    /// 已经闭合的调用留在 [`Self::calls`] 里。块没闭合时剩下的都是写坏的标记（半个块、半个
+    /// `invoke`、没收到闭合标签的参数值），按 [`DsmlEvent::Markup`] 吐出——不是正文，
+    /// 上层据此判定「模型想调工具但没写完」；块外没消费完的尾巴仍是正文。
     pub fn finish(&mut self, out: &mut Vec<DsmlEvent>) {
-        let text = self.pending_text();
-        if !text.is_empty() {
-            out.push(DsmlEvent::Text(text));
-        }
-        if !self.buf.is_empty() {
-            out.push(DsmlEvent::Text(std::mem::take(&mut self.buf)));
+        let leftover = self.pending_text();
+        let rest = std::mem::take(&mut self.buf);
+        if self.state == State::Outside {
+            if !leftover.is_empty() {
+                out.push(DsmlEvent::Text(leftover));
+            }
+            if !rest.is_empty() {
+                out.push(DsmlEvent::Text(rest));
+            }
+        } else {
+            let debris = format!("{leftover}{rest}");
+            if !debris.is_empty() {
+                out.push(DsmlEvent::Markup(debris));
+            }
         }
         self.state = State::Outside;
         self.cur_call = None;
@@ -545,21 +559,26 @@ fn attr(attrs: &str, key: &str) -> Option<String> {
     Some(unescape(&rest[..end]))
 }
 
-/// 剪掉值末尾粘着的写坏的标签碎片（`</｜｜DSML｜｜`、`</｜｜DSML｜｜ param>` 之类）。
+/// 剪掉值末尾粘着的写坏的标签碎片（`</｜｜DSML｜｜`、`</｜DSML｜｜ parameter>`、`</｜｜DSML｜｜ param>` 之类）。
 ///
-/// 模型漏写闭合标签、或闭合标签写错名字时，这些碎片会被当成参数值的一部分；
-/// 值本身不可能是我们的标记（参数值里出现 `<｜｜DSML｜｜` 只可能是这种残渣），
-/// 所以最后一个 `<` 之后只要带标记就整段丢掉。
+/// 模型漏写闭合标签、或闭合标签写坏时，这些碎片会被当成参数值的一部分；
+/// 值本身不可能是我们的标记（参数值里出现 `DSML` 只可能是这种残渣），
+/// 所以最后一个 `<` 之后只要带 `DSML` 就整段丢掉。
+/// 写坏的形态不止一种：标记少一根竖线、半角混全角、标签名写错——共同点是都带着 `DSML`。
 fn trim_broken_tag(text: &str) -> &str {
     let Some(pos) = text.rfind('<') else {
         return text;
     };
-    let tail = &text[pos..];
-    if MARKERS.iter().any(|marker| tail.contains(marker)) {
+    if is_broken_tag(&text[pos..]) {
         &text[..pos]
     } else {
         text
     }
+}
+
+/// 从最后一个 `<` 开始的那一段是不是写坏的标签碎片。
+fn is_broken_tag(tail: &str) -> bool {
+    tail.contains("DSML") || MARKERS.iter().any(|marker| tail.contains(marker))
 }
 
 /// 反转义传输层写法：只有 `\"` → `"` 与 `\\` → `\` 两种。
@@ -593,7 +612,7 @@ fn unescape(s: &str) -> String {
 /// - `as_string`：按纯文本处理，只做传输层反转义（`\"` → `"`、`\\` → `\`）；
 /// - 否则按 JSON 值处理：**先用原文**解析（JSON 的转义本就是给 JSON 用的），解析不了再退化成
 ///   反转义后的字符串，保证不丢内容。
-fn param_value(raw: &str, as_string: bool) -> Value {
+pub(crate) fn param_value(raw: &str, as_string: bool) -> Value {
     let raw = trim_layout(raw);
     if as_string {
         return Value::String(unescape(raw));
@@ -983,20 +1002,45 @@ mod tests {
         assert_eq!(calls[0].arguments["description"], json!("看最近四条"));
     }
 
-    /// 未闭合的块：收尾时原文当正文吐回，调用不成立。
+    /// 未闭合的块：收尾时残料按标记吐出（不是正文），调用不成立。
     #[test]
-    fn unclosed_block_rolls_back_to_text() {
+    fn unclosed_block_rolls_back_to_markup() {
         let payload = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"a\"><｜｜DSML｜｜ parameter name=\"n\">没写完";
         let (events, calls) = run(&[payload]);
         assert!(calls.is_empty());
-        let text: String = events
+        assert_eq!(text_of(&events), "", "写坏的标记不能当正文外泄");
+        let markup: String = events
             .iter()
             .filter_map(|event| match event {
-                DsmlEvent::Text(text) => Some(text.as_str()),
+                DsmlEvent::Markup(text) => Some(text.as_str()),
                 _ => None,
             })
             .collect();
-        assert_eq!(text, payload, "没闭合就原样回吐，不吞内容");
+        assert_eq!(markup, payload, "残料原样交给上层，供说明失败原因");
+    }
+
+    /// 闭合标签写坏（少一根竖线）：值末尾的碎片同样要剪掉。
+    #[test]
+    fn malformed_closing_tag_is_trimmed_from_value() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git status --short --branch",
+            "</｜DSML｜｜ parameter>",
+            "<｜｜DSML｜｜ parameter name=\"description\" string=\"true\">看提交后的剩余改动",
+            "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("git status --short --branch"),
+            "少一根竖线的闭合标签不能留在值里"
+        );
+        assert_eq!(
+            calls[0].arguments["description"],
+            json!("看提交后的剩余改动")
+        );
     }
 
     /// 块闭合但缓冲里还留着没换行的尾巴：尾巴照常当正文。
