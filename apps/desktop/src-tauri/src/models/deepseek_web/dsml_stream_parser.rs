@@ -20,7 +20,9 @@
 //!    裸 `<invoke>` 这类没有标记的伪 XML 不算工具调用，免得正文里的普通尖括号被误吃；
 //! 3. 参数类型按 `string` 属性定：缺省 / `"true"` 原样当字符串，只有显式 `"false"` 才按 JSON 解析；
 //! 4. 一个流里出现多个 `calls` 块时结果累加、序号连续（设计文档按「一块一解析器」写，这里是超集）；
-//! 5. 未闭合的块在收尾时把原文当正文吐回——宁可多出文字，也不吞掉模型输出。
+//! 5. 未闭合的块在收尾时把原文当正文吐回——宁可多出文字，也不吞掉模型输出；
+//! 6. 参数漏写闭合标签时按「遇到下一个 DSML 标签」截断当前参数值，并剪掉值末尾粘着的
+//!    写坏的标签碎片——否则标签会被并进值里，客户端拿它当命令执行。
 //!
 //! 未实现：设计文档 §1 的 `snapshot_to_json`（`{"type":"tool_calls",...}` 形状）。
 //! 本仓库的中间增量协议是 `{"FUNCTIONS":[OpenAI 形状的 tool_calls]}`（见 `apis::base::DeltaChunk`），
@@ -236,23 +238,22 @@ impl DsmlStreamParser {
     }
 
     /// 参数值收集：找到闭合标签就落定参数，没找齐就把能定的部分先收进值里。
+    ///
+    /// 值收集期间遇到的**任何** DSML 标签都算当前参数到此为止：正常的 `</parameter>` 直接消费掉，
+    /// 其余（下一个 `parameter`、`</invoke>`、`</calls>`）留给 [`Self::drive`] 正常派发。
+    /// 模型漏写 `</parameter>` 时，不这么做就会把下一个参数的标签整段吞进值里，
+    /// 客户端拿着这串标签当命令去执行（`command` 里出现 `<｜｜DSML｜｜ parameter name=…`）。
     fn advance_pending(&mut self, out: &mut Vec<DsmlEvent>) -> Progress {
-        match self.scan(&|tag: &Tag| tag.is_close && tag.name == "parameter") {
+        let terminator = self.scan(&|_| true);
+        match terminator {
             Scan::Found { pos, tag } => {
-                // 值分两处：已经吃进 pending 的部分 + 缓冲区里剩下的这一段；闭合标签也进原文
+                // 值分两处：已经吃进 pending 的部分 + 缓冲区里剩下的这一段
                 let tail = self.take_markup(pos);
-                self.take_markup(tag.len);
-                if let Some(mut pending) = self.pending.take() {
-                    pending.value.push_str(&tail);
-                    let value = param_value(&pending.value, pending.as_string);
-                    if let Some(call) = self.cur_call.as_mut() {
-                        call.arguments.insert(pending.name.clone(), value.clone());
-                    }
-                    out.push(DsmlEvent::Param {
-                        name: pending.name,
-                        value,
-                    });
+                // 正常闭合才把闭合标签一起消费掉并标记落定；其余标签留给外层正常派发
+                if tag.is_close && tag.name == "parameter" {
+                    self.take_markup(tag.len);
                 }
+                self.finish_pending(&tail, out);
                 Progress::Continue
             }
             // 值还没收完：先把能定的部分吃进值里，剩下的等下一块
@@ -262,6 +263,23 @@ impl DsmlStreamParser {
                 self.wait_or_rollback(len, out)
             }
         }
+    }
+
+    /// 落定当前参数：`tail` 是值里还没并进来的那一段。
+    fn finish_pending(&mut self, tail: &str, out: &mut Vec<DsmlEvent>) {
+        let Some(mut pending) = self.pending.take() else {
+            return;
+        };
+        pending.value.push_str(tail);
+        let cleaned = trim_broken_tag(&pending.value);
+        let value = param_value(cleaned, pending.as_string);
+        if let Some(call) = self.cur_call.as_mut() {
+            call.arguments.insert(pending.name.clone(), value.clone());
+        }
+        out.push(DsmlEvent::Param {
+            name: pending.name,
+            value,
+        });
     }
 
     /// 收下 `len` 字节的值；缓冲失控时把已吞的原文吐回正文并重置，好继续往下走。
@@ -525,6 +543,23 @@ fn attr(attrs: &str, key: &str) -> Option<String> {
     let rest = &attrs[start..];
     let end = rest.find('"')?;
     Some(unescape(&rest[..end]))
+}
+
+/// 剪掉值末尾粘着的写坏的标签碎片（`</｜｜DSML｜｜`、`</｜｜DSML｜｜ param>` 之类）。
+///
+/// 模型漏写闭合标签、或闭合标签写错名字时，这些碎片会被当成参数值的一部分；
+/// 值本身不可能是我们的标记（参数值里出现 `<｜｜DSML｜｜` 只可能是这种残渣），
+/// 所以最后一个 `<` 之后只要带标记就整段丢掉。
+fn trim_broken_tag(text: &str) -> &str {
+    let Some(pos) = text.rfind('<') else {
+        return text;
+    };
+    let tail = &text[pos..];
+    if MARKERS.iter().any(|marker| tail.contains(marker)) {
+        &text[..pos]
+    } else {
+        text
+    }
 }
 
 /// 反转义传输层写法：只有 `\"` → `"` 与 `\\` → `\` 两种。
@@ -847,6 +882,105 @@ mod tests {
         );
         let (_, calls) = run(&[payload]);
         assert_eq!(calls[0].arguments["n"], json!("7"));
+    }
+
+    /// 参数漏写 `</parameter>`：下一个 `parameter` 视为当前参数结束，标签不能并进值里。
+    #[test]
+    fn missing_parameter_close_does_not_swallow_next_parameter() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git --no-pager log --oneline -3",
+            "<｜｜DSML｜｜ parameter name=\"description\" string=\"true\">看最近三条提交",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "powershell");
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("git --no-pager log --oneline -3"),
+            "命令里不能混进标签"
+        );
+        assert_eq!(
+            calls[0].arguments["description"],
+            json!("看最近三条提交"),
+            "第二个参数照样要解析出来"
+        );
+    }
+
+    /// 闭合标签写坏（名字写错）时，值末尾的标签碎片要剪掉，别让客户端拿它去执行。
+    #[test]
+    fn broken_closing_tag_is_trimmed_from_value() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git --no-pager log -4</｜｜DSML｜｜ param>",
+            "<｜｜DSML｜｜ parameter name=\"description\" string=\"true\">看最近四条",
+            "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("git --no-pager log -4"),
+            "写坏的闭合标签不能留在值里"
+        );
+        assert_eq!(calls[0].arguments["description"], json!("看最近四条"));
+    }
+
+    /// 值没闭合就直接 `</invoke>`：值到此为止，调用照常闭合。
+    #[test]
+    fn invoke_close_terminates_unclosed_value() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git status --short --branch",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "powershell");
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("git status --short --branch")
+        );
+    }
+
+    /// 值里本来就有尖括号（shell 的重定向之类）时不能被这套裁剪误伤。
+    #[test]
+    fn angle_brackets_in_value_survive() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">Get-ChildItem > out.txt <b>",
+            "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("Get-ChildItem > out.txt <b>")
+        );
+    }
+
+    /// 闭合标签被截断（只剩 `</｜｜DSML｜｜`）时同样只留干净的命令。
+    #[test]
+    fn truncated_closing_tag_is_trimmed() {
+        let payload = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"powershell\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git --no-pager log --oneline -4</｜｜DSML｜｜",
+            "\n<｜｜DSML｜｜ parameter name=\"description\" string=\"true\">看最近四条",
+            "</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        let (_, calls) = run(&[payload]);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].arguments["command"],
+            json!("git --no-pager log --oneline -4"),
+            "截断的闭合标签不能留在命令里"
+        );
+        assert_eq!(calls[0].arguments["description"], json!("看最近四条"));
     }
 
     /// 未闭合的块：收尾时原文当正文吐回，调用不成立。

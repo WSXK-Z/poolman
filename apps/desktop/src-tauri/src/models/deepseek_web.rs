@@ -71,7 +71,7 @@ const TOOL_RULE: &str = r#"1. 需要调用工具时，调用写成 DSML 标记�
 <｜｜DSML｜｜ parameter name="path" string="true">d:/project/src/main.rs</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>
-2. 竖线必须逐字写成全角 ｜｜DSML｜｜，不能写成 ||DSML||、DSML，也不能漏写；尖括号、斜杠、等号、引号一律用半角；标签必须成对出现，不能改写、不能漏写、不能嵌套，不要套 Markdown 代码块。
+2. 竖线必须逐字写成全角 ｜｜DSML｜｜，不能写成 ||DSML||、DSML，也不能漏写；尖括号、斜杠、等号、引号一律用半角；标签必须成对出现，不能改写、不能漏写、不能嵌套，不要套 Markdown 代码块；每个参数写完值都要紧跟它自己的 </｜｜DSML｜｜ parameter>，不能省略、不能写错名字。
 3. string="true" 表示参数值是纯文本，照原样写；参数值不是字符串（数字、布尔、数组、对象）时写 string="false"，值按 JSON 写，例如 <｜｜DSML｜｜ parameter name="timeout" string="false">30</｜｜DSML｜｜ parameter>、<｜｜DSML｜｜ parameter name="view_range" string="false">[320,400]</｜｜DSML｜｜ parameter>。
 4. 参数值里不要出现 </｜｜DSML｜｜ parameter> 这样的片段；值里的反斜杠写成 \\、双引号写成 \"（Windows 路径也要写，例如 d:\\project\\a.rs）。
 5. 需要调用多个工具时，一个工具一层 invoke，平铺在同一个 calls 块里。
