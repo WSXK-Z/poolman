@@ -4,6 +4,7 @@
 //! 非流式返回 JSON，流式经 SSE 逐条输出正文 / 思考增量与终止状态。
 
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::{
@@ -197,6 +198,24 @@ pub async fn chat_completions_handler(
     }
 }
 
+/// 推理任务的兜底：任务异常退出（panic）时给客户端补一条错误，
+/// 否则发送端随任务一起消失，流会「正常结束」，客户端只看到空回答。
+struct TaskGuard {
+    tx: tokio::sync::mpsc::UnboundedSender<Result<String, String>>,
+    finished: Arc<AtomicBool>,
+}
+
+impl Drop for TaskGuard {
+    fn drop(&mut self) {
+        if !self.finished.load(Ordering::Relaxed) {
+            warn!("推理任务异常退出，向客户端补发错误");
+            let _ = self
+                .tx
+                .send(Err("网关内部错误：推理任务异常退出".to_string()));
+        }
+    }
+}
+
 /// 流式对话补全：SSE 逐条输出增量。
 fn sse_response(
     state: Arc<AppState>,
@@ -216,18 +235,29 @@ fn sse_response(
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
         let chunk_tx = tx.clone();
         let router = state.chat_router.clone();
+        let finished = Arc::new(AtomicBool::new(false));
 
-        tokio::spawn(async move {
-            let result = router
-                .chat_completions_stream(
-                    request,
-                    Box::new(move |delta: String| {
-                        let _ = chunk_tx.send(Ok(delta));
-                    }),
-                )
-                .await;
-            if let Err(error) = result {
-                let _ = tx.send(Err(error.to_string()));
+        tokio::spawn({
+            let guard = TaskGuard {
+                tx: tx.clone(),
+                finished: finished.clone(),
+            };
+            let finished = finished.clone();
+            async move {
+                // 任务异常退出（panic）时由它兜底报错，别让流无声结束成「空回答」
+                let _guard = guard;
+                let result = router
+                    .chat_completions_stream(
+                        request,
+                        Box::new(move |delta: String| {
+                            let _ = chunk_tx.send(Ok(delta));
+                        }),
+                    )
+                    .await;
+                if let Err(error) = result {
+                    let _ = tx.send(Err(error.to_string()));
+                }
+                finished.store(true, Ordering::Relaxed);
             }
         });
 
