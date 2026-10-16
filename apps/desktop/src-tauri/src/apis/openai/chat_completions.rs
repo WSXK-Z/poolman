@@ -244,6 +244,31 @@ fn sse_response(
                     warn!("出站中止 request_id={} frames={} err={}", response_id, frames, error);
                     let event = serde_json::json!({ "error": { "message": error, "type": "server_error" } });
                     yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&event).unwrap()));
+                    // 这一轮还没有任何正文与工具调用：忽略 `error` 的客户端（VS Code 内置对话即如此）
+                    // 只会看到「空响应」；补一条正文说明失败原因并正常收尾。
+                    if content_chars == 0 && tool_calls == 0 {
+                        let frame = serde_json::json!({
+                            "id": base["id"],
+                            "object": base["object"],
+                            "created": base["created"],
+                            "model": base["model"],
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "content": format!("网关错误：{}", error) },
+                                "finish_reason": null,
+                            }],
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&frame).unwrap()));
+                        let end = serde_json::json!({
+                            "id": base["id"],
+                            "object": base["object"],
+                            "created": base["created"],
+                            "model": base["model"],
+                            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }],
+                        });
+                        yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&end).unwrap()));
+                    }
+                    yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
                     return;
                 }
             };

@@ -169,6 +169,7 @@ fn build_plugin_models(
     bridge: Arc<WebSocketBridge>,
     credentials: Arc<CredentialStore>,
     timeout_ms: u64,
+    stream_idle_timeout_ms: u64,
     dump: Arc<dump::DumpConfig>,
     pool_store: Arc<dyn SessionPoolStore>,
 ) -> Vec<Arc<dyn PluginModel>> {
@@ -187,12 +188,15 @@ fn build_plugin_models(
         }
         match row.channel.as_str() {
             "deepseek-web" => {
-                let executor = Arc::new(PluginChannelExecutor::new(
-                    bridge.clone(),
-                    credentials.clone(),
-                    row.channel.clone(),
-                    timeout_ms,
-                ));
+                let executor = Arc::new(
+                    PluginChannelExecutor::new(
+                        bridge.clone(),
+                        credentials.clone(),
+                        row.channel.clone(),
+                        timeout_ms,
+                    )
+                    .with_stream_idle_timeout(stream_idle_timeout_ms),
+                );
                 let concurrency = providers::plugin::channel_concurrency(rows, &row.channel);
                 models.push(
                     Arc::new(
@@ -322,6 +326,7 @@ pub fn run() {
         bridge.clone(),
         credentials.clone(),
         startup_config.request_timeout_ms,
+        startup_config.stream_idle_timeout_ms,
         dump.clone(),
         provider_manager.clone() as Arc<dyn SessionPoolStore>,
     );

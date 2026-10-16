@@ -12,7 +12,10 @@ pub struct ServerConfig {
     pub port: u16,
     pub ws_port: u16,
     pub log_level: String,
+    /// 非流式请求的总超时（毫秒）。
     pub request_timeout_ms: u64,
+    /// 流式请求的静默容忍（毫秒）：这么久没有新数据才判定上游挂死。
+    pub stream_idle_timeout_ms: u64,
     pub cors_origin: String,
     pub ws_auth_token: Option<String>,
 }
@@ -34,6 +37,10 @@ impl ServerConfig {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(120_000),
+            stream_idle_timeout_ms: env::var("STREAM_IDLE_TIMEOUT_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(180_000),
             cors_origin: env::var("CORS_ORIGIN").unwrap_or_else(|_| "*".to_string()),
             ws_auth_token: env::var("WS_AUTH_TOKEN").ok(),
         }

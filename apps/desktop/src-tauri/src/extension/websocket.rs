@@ -7,7 +7,9 @@
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::handshake::server::{ErrorResponse, Request, Response};
 use tokio_tungstenite::{accept_hdr_async, connect_async, tungstenite::Message};
@@ -257,6 +259,9 @@ impl WebSocketBridge {
     /// 通过扩展在网页 context 执行一次请求（EXECUTE_REQUEST 下行 → 扩展 fetch → 回传）
     /// 按供应商登录与启用状态选择一个插件执行请求，并等待最终结果或超时。
     /// 流式正文通过 `on_chunk` 逐块送达；完成时由 EXECUTE_RESULT 解除等待。
+    ///
+    /// `timeout_ms` 的含义按是否流式区分：流式是「静默超时」（连续这么久没有任何分块才算挂死，
+    /// 有分块就继续等，网页端长思考 / 长回答可以远超它），非流式是整次请求的总超时。
     pub async fn send_execute(
         &self,
         payload: ExecuteRequestPayload,
@@ -293,13 +298,20 @@ impl WebSocketBridge {
             }
         });
 
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
         self.pending_execute.lock().await.insert(id.clone(), tx);
-        if let Some(cb) = on_chunk {
+        // 最近一次收到分块的时间：流式请求靠它把超时从「总耗时」改成「静默时长」。
+        let last_chunk_at = Arc::new(AtomicU64::new(now_millis()));
+        if let Some(mut cb) = on_chunk {
+            let activity = last_chunk_at.clone();
+            let tracked: Box<dyn FnMut(String) + Send + Sync> = Box::new(move |delta: String| {
+                activity.store(now_millis(), Ordering::Relaxed);
+                cb(delta);
+            });
             self.execute_chunk_callbacks
                 .lock()
                 .await
-                .insert(id.clone(), cb);
+                .insert(id.clone(), tracked);
         }
 
         let json = serde_json::to_string(&message)?;
@@ -443,18 +455,25 @@ impl WebSocketBridge {
             return Err(anyhow::anyhow!("没有可分配该供应商请求的已连接插件"));
         }
 
-        let outcome = tokio::select! {
-            result = rx => {
-                self.execute_chunk_callbacks.lock().await.remove(&id);
-                match result {
-                    Ok(payload) => Ok(payload),
-                    Err(_) => Err(anyhow::anyhow!("请求已取消")),
-                }
-            }
-            _ = tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms)) => {
+        let outcome = loop {
+            let idle_ms = now_millis().saturating_sub(last_chunk_at.load(Ordering::Relaxed));
+            if idle_ms >= timeout_ms {
                 self.pending_execute.lock().await.remove(&id);
                 self.execute_chunk_callbacks.lock().await.remove(&id);
-                Err(anyhow::anyhow!("请求超时"))
+                break Err(anyhow::anyhow!(
+                    "请求超时：上游已静默 {} 毫秒没有任何分块",
+                    idle_ms
+                ));
+            }
+            tokio::select! {
+                result = &mut rx => {
+                    self.execute_chunk_callbacks.lock().await.remove(&id);
+                    break match result {
+                        Ok(payload) => Ok(payload),
+                        Err(_) => Err(anyhow::anyhow!("请求已取消")),
+                    };
+                }
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(timeout_ms - idle_ms)) => {}
             }
         };
         // 释放在途计数
@@ -539,6 +558,14 @@ impl Default for WebSocketBridge {
             None,
         )
     }
+}
+
+/// 当前时间（毫秒）：只用于比较先后，不参与展示。
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or_default()
 }
 
 /// 从握手 URL 的查询串解析插件自报身份；未提供的字段保持 `None`。
@@ -840,6 +867,96 @@ mod tests {
             bridge.inflight.read().await.values().all(|n| *n == 0),
             "超时后应释放在途计数"
         );
+    }
+
+    /// 流式：分块持续到达时按「静默」判超时，整轮耗时超过 timeout_ms 也不中断。
+    #[tokio::test]
+    async fn streaming_survives_past_total_timeout() {
+        let bridge = test_bridge();
+        let (_addr, mut ws) = setup_bridge_with_plugin(&bridge).await;
+
+        let chunks = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = chunks.clone();
+        let exec = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .send_execute(
+                        execute_payload(),
+                        200,
+                        Some(Box::new(move |chunk: String| {
+                            sink.lock().unwrap().push(chunk);
+                        })),
+                    )
+                    .await
+            })
+        };
+
+        let request_id = read_request_id(&mut ws).await;
+        // 每 100ms 回一块，持续 800ms（远超 200ms 的总超时）：静默始终小于 200ms
+        for index in 0..8 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            ws.send(Message::Text(
+                serde_json::json!({
+                    "id": request_id,
+                    "type": "EXECUTE_CHUNK",
+                    "timestamp": 2,
+                    "payload": { "data": format!("块{}", index) }
+                })
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+        ws.send(Message::Text(
+            serde_json::json!({
+                "id": request_id,
+                "type": "EXECUTE_RESULT",
+                "timestamp": 3,
+                "payload": { "status": 200, "ok": true, "body": "" }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let outcome = exec.await.expect("任务未 panic").expect("持续出块时不应超时");
+        assert!(outcome.ok);
+        assert_eq!(chunks.lock().unwrap().len(), 8, "8 个分块都应送达");
+    }
+
+    /// 流式：收到分块后再次静默超过 timeout_ms，仍应超时失败（静默判定不是无超时）。
+    #[tokio::test]
+    async fn streaming_times_out_when_upstream_goes_silent() {
+        let bridge = test_bridge();
+        let (_addr, mut ws) = setup_bridge_with_plugin(&bridge).await;
+
+        let exec = {
+            let bridge = bridge.clone();
+            tokio::spawn(async move {
+                bridge
+                    .send_execute(execute_payload(), 200, Some(Box::new(|_delta: String| {})))
+                    .await
+            })
+        };
+
+        let request_id = read_request_id(&mut ws).await;
+        ws.send(Message::Text(
+            serde_json::json!({
+                "id": request_id,
+                "type": "EXECUTE_CHUNK",
+                "timestamp": 2,
+                "payload": { "data": "第一块" }
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+
+        let outcome = exec.await.expect("任务未 panic");
+        let message = format!("{}", outcome.expect_err("静默超过静默容忍时应失败"));
+        assert!(message.contains("静默"), "{}", message);
+        assert!(message.contains("超时"), "{}", message);
     }
 
     /// 并发上限：占满后新请求不是立刻失败，而是排队等空位，直到本次超时。

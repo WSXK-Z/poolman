@@ -23,8 +23,10 @@ pub struct PluginChannelExecutor {
     credentials: Arc<CredentialStore>,
     /// 渠道标识（同时作为 `EXECUTE_REQUEST` 的 provider 与凭证键）。
     channel: String,
-    /// 单次请求超时（毫秒）。
+    /// 单次请求超时（毫秒）：非流式是总超时，流式是静默超时。
     timeout_ms: u64,
+    /// 流式请求的静默容忍（毫秒）：这么久没有任何分块才算上游挂死。
+    stream_idle_timeout_ms: u64,
 }
 
 impl PluginChannelExecutor {
@@ -39,7 +41,15 @@ impl PluginChannelExecutor {
             credentials,
             channel: channel.into(),
             timeout_ms,
+            stream_idle_timeout_ms: timeout_ms,
         }
+    }
+
+    /// 单独指定流式请求的静默容忍：网页端长思考 / 长回答期间可以长时间不出内容，
+    /// 用非流式的总超时会把它掐断。
+    pub fn with_stream_idle_timeout(mut self, stream_idle_timeout_ms: u64) -> Self {
+        self.stream_idle_timeout_ms = stream_idle_timeout_ms;
+        self
     }
 
     /// 请求插件重新捕获本渠道凭证：CAPTURE_REQUEST 下行，插件上报 CREDENTIAL_SYNC 后返回。
@@ -124,7 +134,11 @@ impl ChannelExecutor for PluginChannelExecutor {
             });
             let result = self
                 .bridge
-                .send_execute(self.payload(request), self.timeout_ms, Some(counting))
+                .send_execute(
+                    self.payload(request),
+                    self.stream_idle_timeout_ms,
+                    Some(counting),
+                )
                 .await;
             let stream = (
                 chunks.load(Ordering::Relaxed).to_string(),

@@ -204,17 +204,19 @@ export default defineContentScript({
       body?: string | null;
       streaming?: boolean;
     }): Promise<void> {
-      // 防挂起：请求总超时 + 流式空闲超时。DeepSeek 偶发对 pow/会话接口挂起（不返回也不关闭），
-      // 无超时会让整个聊天流程无限等待。非流式 20s 总超时；流式按「空闲 30s 无新数据」终止。
-      const TOTAL_TIMEOUT = opts.streaming ? 120_000 : 20_000;
-      const IDLE_TIMEOUT = 30_000;
+      // 防挂起：非流式用总超时（页面偶发对 pow / 会话接口挂起，不返回也不关闭）；
+      // 流式只看空闲——长思考 / 长回答期间页面可以长时间不出内容，用总超时会掐断正常请求，
+      // 因此空闲计时贯穿整段流（首次出内容前同样受保护），每收到一块数据就重新计时。
+      const TOTAL_TIMEOUT = opts.streaming ? null : 20_000;
+      const IDLE_TIMEOUT = opts.streaming ? 180_000 : 20_000;
       const controller = new AbortController();
       let idleTimer: number | null = null;
       const armIdle = (): void => {
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = window.setTimeout(() => controller.abort(), IDLE_TIMEOUT);
       };
-      const totalTimer = window.setTimeout(() => controller.abort(), TOTAL_TIMEOUT);
+      const totalTimer =
+        TOTAL_TIMEOUT === null ? null : window.setTimeout(() => controller.abort(), TOTAL_TIMEOUT);
       armIdle();
       try {
         // 重要：这里必须用被拦截器保存的原始 origFetch，而不是被包装后的 window.fetch，
@@ -230,11 +232,8 @@ export default defineContentScript({
           credentials: 'same-origin',
           signal: controller.signal,
         });
-        // 收到响应头后取消初始空闲计时（后续按流式数据刷新）
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
+        // 收到响应头后继续沿用同一套空闲计时（后续每块数据都会重新计时）：
+        // 响应头已到但长时间没有数据同样是上游挂死。
         // 流式成功：把原始响应流逐块回传，服务端自行分行解析（不在此做任何协议解析）
         if (opts.streaming && res.ok && res.body) {
           const reader = res.body.getReader();
