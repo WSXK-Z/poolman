@@ -285,20 +285,25 @@ impl DeepSeekWebModel {
         Ok(created)
     }
 
-    /// 网页端说这个会话到长度上限了：删掉它，按同一个标题补建一个新会话顶上。
+    /// 这个池内会话说不能用了（`reason` 写明原因）：删掉它，按同一个标题补建一个新会话顶上。
     ///
-    /// 池内会话是长期复用的，累积的历史会把网页上下文顶到上限；换个新会话等于清空那段历史，
-    /// 后续请求才有地方落。新会话沿用原槽位标题（`poolman_<序号>`），方便在网页端辨认和回收。
+    /// 池内会话是长期复用的，累积的历史会把网页上下文顶到上限；消息链一旦和记下的 parent 对不上，
+    /// 沿用它继续问也只会一直回空。两种情况都只能换新会话，后续请求才有地方落。
+    /// 新会话沿用原槽位标题（`poolman_<序号>`），方便在网页端辨认和回收。
     /// 不在池内的会话（外部会话）不动，返回 None。
-    pub(super) async fn recycle_pool_session(&self, session_id: &str) -> Result<Option<String>> {
+    pub(super) async fn recycle_pool_session(
+        &self,
+        session_id: &str,
+        reason: &str,
+    ) -> Result<Option<String>> {
         let Some(slot) = self.pool_slot_of(session_id).await else {
             return Ok(None);
         };
         let title = pool_title(slot as u32);
         match self.delete_channel_session(session_id).await {
-            Ok(true) => info!("会话达到长度上限，已删除网页会话 {}", session_id),
-            Ok(false) => warn!("会话达到长度上限，删除网页会话 {} 未生效", session_id),
-            Err(error) => warn!("会话达到长度上限，删除网页会话 {} 失败: {}", session_id, error),
+            Ok(true) => info!("{}：已删除网页会话 {}", reason, session_id),
+            Ok(false) => warn!("{}：删除网页会话 {} 未生效", reason, session_id),
+            Err(error) => warn!("{}：删除网页会话 {} 失败: {}", reason, session_id, error),
         }
         let created = self.create_pool_session(slot as u32).await?;
         // 网页端在会话还没有内容时拒绝改名（EMPTY_CHAT_SESSION）：改不动就留给首轮对话成功后命名
@@ -318,7 +323,7 @@ impl DeepSeekWebModel {
         self.pool_titled.lock().unwrap().remove(session_id);
         self.session_map.lock().unwrap().remove(session_id);
         self.save_current_pool().await?;
-        info!("会话池槽位已换新会话 {}（原 {}）", created, session_id);
+        info!("会话池槽位已换新会话 {}（原 {}，原因：{}）", created, session_id, reason);
         Ok(Some(created))
     }
 

@@ -123,6 +123,15 @@ const THINKING_ENABLED: bool = true;
 /// 网页端报告的「对话达到长度上限」结束原因：这个池内会话要换新。
 const CONTEXT_LIMIT_REASON: &str = "context_length_exceeded";
 
+/// 网页端报告的「这条会话还有消息正在生成」结束原因。
+///
+/// 它说明这条会话身上挂着一轮我们没接住、也没记下消息 id 的生成：会话的消息链随即错位，
+/// 沿用它继续问只会一直回空，与「上下文到上限」一样只能换新会话。
+const PARALLEL_CHAT_LIMIT_REASON: &str = "parallel_chat_limit";
+
+/// 留存的流式原文长度上限（字符）：流式的响应体不随结果回传，空回答时靠这段原文排查。
+const RAW_HEAD_CHARS: usize = 600;
+
 /// DeepSeek 网页版模型。
 pub struct DeepSeekWebModel {
     /// 展示名。
@@ -635,6 +644,8 @@ impl DeepSeekWebModel {
     ///
     /// 每次请求是无状态的（整段对话都拼在提示词里），因此不绑定调用方会话：
     /// 先取并发闸门，再从会话池轮转一个网页会话独占使用，池容量即可并发的请求数。
+    /// 网页会话不能用时（上下文到上限、上游说还有消息正在生成、上游一个字都没回）
+    /// 换一个同标题的新会话重跑一轮，最多换一次。
     async fn chat(
         &self,
         request: InferRequest,
@@ -658,7 +669,7 @@ impl DeepSeekWebModel {
         let mut session_id = self.acquire_pool_slot().await?;
         // 用之前核对：槽位上的会话若已被网页端删掉，这里会补建一个，别让整轮请求白跑
         session_id = self.ensure_pool_session(session_id).await?;
-        // 增量出口只能移动一次，而「上下文到上限」时这一轮要换会话重跑：包一层共享单元转发，
+        // 增量出口只能移动一次，而「换会话重跑」时同一轮要问两次：包一层共享单元转发，
         // 每次尝试各取一个代理。
         let sink_cell = Arc::new(Mutex::new(on_chunk));
         let mut switched_session = false;
@@ -680,23 +691,33 @@ impl DeepSeekWebModel {
                     forwarding_sink(&sink_cell),
                 )
                 .await?;
-            // 网页端说上下文到顶了：这个池内会话的累积历史已经顶满。后台删掉它、按同标题换一个
-            // 新会话再跑一次，客户端看不到这次切换。
-            if !switched_session && hits_context_limit(&attempt) {
-                switched_session = true;
-                match self.recycle_pool_session(&session_id).await {
-                    Ok(Some(created)) => {
-                        info!(
-                            "网页上下文到上限，已换新会话 {}（原 {}）后重跑本轮",
-                            created, session_id
-                        );
-                        session_id = created;
-                        continue;
+            // 这一轮不能用：网页端说累积历史顶满了、说这条会话还有消息正在生成，或者它一个字都没回
+            //（后两者都说明会话的消息链已经和记下的 parent 对不上——上次请求在服务端留下了消息却没
+            // 记下 id，沿用它继续问只会一直回空）。三种情况都后台删掉这个会话、按同标题换一个新的再跑
+            // 一次，客户端看不到这次切换。
+            let unusable = if hits_context_limit(&attempt) {
+                Some("网页上下文到上限")
+            } else if hits_parallel_chat_limit(&attempt) {
+                Some("网页端还有消息正在生成")
+            } else if silent_round(&attempt) {
+                Some("网页端未返回任何内容")
+            } else {
+                None
+            };
+            if let Some(reason) = unusable {
+                if !switched_session {
+                    switched_session = true;
+                    match self.recycle_pool_session(&session_id, reason).await {
+                        Ok(Some(created)) => {
+                            info!("{}，已换新会话 {}（原 {}）后重跑本轮", reason, created, session_id);
+                            session_id = created;
+                            continue;
+                        }
+                        Ok(None) => {
+                            warn!("{}，但会话 {} 不在会话池内，未换新", reason, session_id)
+                        }
+                        Err(error) => warn!("{}，换新会话失败: {}", reason, error),
                     }
-                    Ok(None) => {
-                        warn!("网页上下文到上限，但会话 {} 不在会话池内，未换新", session_id)
-                    }
-                    Err(error) => warn!("网页上下文到上限，换新会话失败: {}", error),
                 }
             }
             break attempt;
@@ -770,8 +791,8 @@ impl DeepSeekWebModel {
         let has_calls = !tool_calls.is_empty();
         let finish_reason = if has_calls { "tool_calls" } else { "stop" };
         if text.trim().is_empty() && !has_calls {
-            // 整块（非流式）时响应体在手上；流式没有响应体，只能靠日志说明这轮没内容
-            let raw = head_chars(&raw_body, 300);
+            // 上游原文留一段打出来：否则「请求走完了但客户端什么都没有」无从排查
+            let raw = head_chars(&raw_body, RAW_HEAD_CHARS);
             if let Some(upstream) = upstream_error {
                 // 换会话重跑过还是这个错：把上游原因原样报给调用方（例如提示词本身就超长，
                 // 只能由调用方缩短），别只说「空回答」让它无从判断。
@@ -843,13 +864,22 @@ impl DeepSeekWebModel {
                         ChatStreamProcessor::new(user_sink, recognize_tools)
                             .with_tool_schemas(schemas.clone()),
                     ));
+                    // 流式的响应体不随结果回传（插件按块转发，`body` 为 null）：
+                    // 把上游原文留一段下来，空回答时日志里才看得到网页端到底回了什么。
+                    let raw_head = Arc::new(Mutex::new(String::new()));
                     let feeder_frames = frames.clone();
                     let feeder_processor = processor.clone();
+                    let feeder_raw = raw_head.clone();
                     let response = self
                         .executor
                         .execute_stream(
                             channel_request,
                             Box::new(move |raw| {
+                                if let Ok(mut head) = feeder_raw.lock() {
+                                    if head.chars().count() < RAW_HEAD_CHARS {
+                                        head.push_str(&head_chars(&raw, RAW_HEAD_CHARS));
+                                    }
+                                }
                                 let (Ok(mut frames), Ok(mut processor)) =
                                     (feeder_frames.lock(), feeder_processor.lock())
                                 else {
@@ -874,6 +904,11 @@ impl DeepSeekWebModel {
                     };
                     processor.feed(tail);
                     processor.finish();
+                    // 留存的原文优先：流式响应的 `body` 本来就是空的
+                    let raw_body = {
+                        let head = raw_head.lock().unwrap().clone();
+                        if head.is_empty() { response.body } else { head }
+                    };
                     (
                         processor.text().to_string(),
                         processor.reasoning().to_string(),
@@ -882,7 +917,7 @@ impl DeepSeekWebModel {
                         upstream_error,
                         message_id,
                         response.status,
-                        response.body,
+                        raw_body,
                     )
                 }
                 None => {
@@ -987,6 +1022,26 @@ fn hits_context_limit(round: &CompletionRound) -> bool {
             .as_ref()
             .and_then(|error| error.finish_reason.as_deref())
             == Some(CONTEXT_LIMIT_REASON)
+}
+
+/// 这一轮是不是「网页端说这条会话还有消息正在生成」：会话消息链已经错位的信号，换会话重跑。
+fn hits_parallel_chat_limit(round: &CompletionRound) -> bool {
+    round
+        .upstream_error
+        .as_ref()
+        .and_then(|error| error.finish_reason.as_deref())
+        == Some(PARALLEL_CHAT_LIMIT_REASON)
+}
+
+/// 这一轮是不是「网页端什么都没给」：没正文、没工具调用、没上游错误，也没有要修的坏块。
+///
+/// 网页端对一条消息链已经错位的会话就是这样回的（`status=200` 但流里没有内容），
+/// 沿用它继续问永远只有空回答，只能换新会话。
+fn silent_round(round: &CompletionRound) -> bool {
+    round.text.trim().is_empty()
+        && round.tool_calls.is_empty()
+        && round.upstream_error.is_none()
+        && round.parse_failure.is_none()
 }
 
 /// 取一个把增量转发到同一个出口的代理；请求不带出口时返回 None。
@@ -1249,6 +1304,13 @@ mod tests {
         "event: ready\n",
         "data: {\"request_message_id\":59,\"response_message_id\":60,\"model_type\":\"default\"}\n\n",
         "data: {\"type\":\"error\",\"content\":\"达到对话长度上限，请开启新对话\",\"clear_response\":true,\"finish_reason\":\"context_length_exceeded\"}\n",
+    );
+
+    /// 「这条会话还有消息正在生成」的响应体：网页端在 hint 负载里给出原因与结束原因。
+    const PARALLEL_LIMIT_BODY: &str = concat!(
+        "event: ready\n",
+        "data: {\"request_message_id\":61,\"response_message_id\":62,\"model_type\":\"default\"}\n\n",
+        "data: {\"type\":\"error\",\"content\":\"有消息正在生成，请稍后再试\",\"finish_reason\":\"parallel_chat_limit\"}\n",
     );
 
     impl MockExecutor {
@@ -2283,6 +2345,151 @@ mod tests {
         let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("网页回答为空"), "{}", logged);
         assert!(logged.contains("会话无效"), "应打出原始响应：{}", logged);
+    }
+
+    /// 网页端一个字都没回：这条会话的消息链已经和 parent 对不上（沿用它只会一直回空），
+    /// 后台换一个同标题的新会话重跑一轮，客户端只看到正常回答。
+    #[tokio::test]
+    async fn silent_round_switches_session_transparently() {
+        let executor = executor("", 0);
+        executor.seed_session("sess-silent", &format!("{POOL_TITLE_PREFIX}1"));
+        // 第一次完成请求回空（会话已失效），换会话后那轮正常回答
+        executor.queue_completions(&[String::new(), content_frame("答")]);
+        let store = Arc::new(MemoryStore::default());
+        store.slots.lock().unwrap().insert(
+            CHANNEL.to_string(),
+            vec![PooledSession {
+                slot: 0,
+                session_id: "sess-silent".to_string(),
+            }],
+        );
+
+        let response = pooled_model(&executor, &store, 1)
+            .infer(user_request())
+            .await
+            .expect("换会话后应正常回答，不向客户端报空回答");
+        assert_eq!(response.text, "答");
+
+        let slots = stored_sessions(&store);
+        assert_eq!(slots.len(), 1);
+        assert_ne!(slots[0], "sess-silent", "回空的会话要被换掉");
+        assert!(
+            !executor.sessions().contains_key("sess-silent"),
+            "旧会话应从网页端删除：{:?}",
+            executor.sessions()
+        );
+        let completions: Vec<String> = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/chat/completion"))
+            .map(|request| request.body.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(completions.len(), 2, "回空后应重跑一轮");
+        assert!(
+            completions[0].contains("sess-silent") && !completions[1].contains("sess-silent"),
+            "第二轮必须换到新会话上"
+        );
+    }
+
+    /// 上游说「这条会话还有消息正在生成」：那一刻留下的消息没记下 id，会话的消息链随即错位。
+    /// 与撞长度上限一样换新会话重跑，客户端只看到正常回答。
+    #[tokio::test]
+    async fn parallel_chat_limit_error_switches_session_transparently() {
+        let executor = executor("", 0);
+        executor.seed_session("sess-busy", &format!("{POOL_TITLE_PREFIX}1"));
+        executor.queue_completions(&[PARALLEL_LIMIT_BODY.to_string(), content_frame("答")]);
+        let store = Arc::new(MemoryStore::default());
+        store.slots.lock().unwrap().insert(
+            CHANNEL.to_string(),
+            vec![PooledSession {
+                slot: 0,
+                session_id: "sess-busy".to_string(),
+            }],
+        );
+
+        let response = pooled_model(&executor, &store, 1)
+            .infer(user_request())
+            .await
+            .expect("换会话后应正常回答，不把上游错误丢给客户端");
+        assert_eq!(response.text, "答");
+
+        assert_ne!(stored_sessions(&store)[0], "sess-busy", "忙着的会话要被换掉");
+        assert!(
+            !executor.sessions().contains_key("sess-busy"),
+            "旧会话应从网页端删除：{:?}",
+            executor.sessions()
+        );
+        let completions: Vec<String> = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/chat/completion"))
+            .map(|request| request.body.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(completions.len(), 2, "只重跑一次");
+        assert!(
+            completions[0].contains("sess-busy") && !completions[1].contains("sess-busy"),
+            "第二轮必须换到新会话上"
+        );
+    }
+
+    /// 换会话后还是回空：只换一次，不无限换会话，空回答照旧记日志。
+    #[tokio::test]
+    async fn silent_round_switches_session_only_once() {
+        let executor = executor("", 0);
+        executor.seed_session("sess-silent", &format!("{POOL_TITLE_PREFIX}1"));
+        let store = Arc::new(MemoryStore::default());
+        store.slots.lock().unwrap().insert(
+            CHANNEL.to_string(),
+            vec![PooledSession {
+                slot: 0,
+                session_id: "sess-silent".to_string(),
+            }],
+        );
+
+        let response = pooled_model(&executor, &store, 1)
+            .infer(user_request())
+            .await
+            .expect("空回答不作为错误上报");
+        assert!(response.text.is_empty());
+        assert_eq!(response.finish_reason.as_deref(), Some("stop"));
+        let completions = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/chat/completion"))
+            .count();
+        assert_eq!(completions, 2, "只重跑一次");
+        assert_ne!(stored_sessions(&store)[0], "sess-silent");
+    }
+
+    /// 流式的响应体不随结果回传：空回答时日志里要能看到这一轮收到的上游原文。
+    #[tokio::test]
+    async fn streaming_empty_answer_logs_raw_response() {
+        let logs = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let sink = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || LogSink(sink.clone()))
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // 上游回的是整段非 SSE 的错误 JSON：没有可解析的帧，正文与工具调用都空
+        let body = "data: {\"code\":1,\"msg\":\"会话无效\"}\n".to_string();
+        let executor = executor(&body, 0);
+        let response = DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>)
+            .infer_stream(user_request(), Box::new(|_| {}))
+            .await
+            .expect("推理应成功");
+
+        assert!(response.text.is_empty());
+        let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("网页回答为空"), "{}", logged);
+        assert!(logged.contains("会话无效"), "流式也要打出上游原文：{}", logged);
     }
 
     /// 日志写入内存缓冲（用例断言日志内容用）。
