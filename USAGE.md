@@ -40,7 +40,7 @@ AI Gateway（也称 poolman）是一个本地化的 API 网关，它将您已经
 
 #### 2.1.4 加载浏览器扩展
 桌面端安装包已包含浏览器扩展，但需要您手动加载：
-1. 打开 Chrome，访问 `chrome://extensions/`
+1. 打开 Chrome，访问 `chrome://extensions/`（桌面端「帮助」页的「打开扩展管理页」按钮会调用浏览器打开该页面；找不到浏览器时会复制地址，粘贴到地址栏即可）
 2. 开启“开发者模式”
 3. 点击“加载已解压的扩展程序”，选择桌面端安装目录下的 `chrome-mv3` 文件夹（通常位于 `C:\Program Files\poolman\resources\chrome-mv3` 或类似路径）
 
@@ -102,7 +102,7 @@ AI Gateway 无需配置 API Key。您可以通过环境变量或桌面端界面�
 | `WS_PORT` | WebSocket 端口 | `3001` |
 | `REQUEST_TIMEOUT_MS` | 单次请求超时（毫秒） | `120000` |
 | `CORS_ORIGIN` | 允许的跨域来源 | `*` |
-| `LOG_LEVEL` | 日志级别（`debug`/`info`/`warn`/`error`） | `info` |
+| `LOG_LEVEL` | 日志级别（`trace`/`debug`/`info`/`warn`/`error`）；插件调用详情等高频日志只在 `debug` 及以下输出 | `info` |
 
 ### 3.2 落盘工具（开发期链路分段排查）
 
@@ -112,17 +112,29 @@ AI Gateway 无需配置 API Key。您可以通过环境变量或桌面端界面�
 | 阶段 | 产物 | 行为 | 插入位置 |
 |------|------|------|----------|
 | ① 请求入口 | `chat-request-<时间戳>-<随机>.json`（方法 / 路径 / 查询 / 请求头 / 原始正文） | 落盘后按请求的接口格式与 `stream` 返回一份**形状正常的模型输出**（正文固定为「开发中」），其后的环节都不执行 | `apis.rs::create_app` 的 `route_layer`（默认注释掉，注释掉即放行到下一阶段） |
-| ② 响应解析完 | `response-<时间戳>-<随机>.json`（`SseFrameParser` 解析出的思考 / 正文 / 工具调用 + 状态、原始文本长度、结束原因） | 只落盘，链路照常跑完：结果照常返回客户端 | 模型内 `models/deepseek_web.rs::chat`，解析完成后落盘 |
+| ② 响应解析完 | `response-<时间戳>-<随机>.json`（`SseFrameProcessor` + `ChatStreamProcessor` 解析出的思考 / 正文 / 工具调用 + 状态、原始文本长度、结束原因） | 只落盘，链路照常跑完：结果照常返回客户端 | 模型内 `models/deepseek_web.rs::chat`，解析完成后落盘 |
+| ③ 工具调用 | `tool-call-<时间戳>-<随机>.json`（模型吐出的 DSML 原文 `raw_markup` + 解析出的 `calls` + 可读形态 `parsed` + 状态、会话） | 同上；只在真的检测出工具调用时补落一份，便于直接把「原文」与「解析结果」对着看。`calls[].function.arguments` 按 OpenAI 契约是 JSON 字符串，在文件里会被再转义一层（Windows 路径看着像多了一层反斜杠），要读可读值看 `parsed` | 模型内 `models/deepseek_web.rs::chat`，与响应快照同处 |
 
 | 变量名 | 说明 | 默认值 |
 |--------|------|--------|
-| `AI_GATEWAY_DUMP_REQUESTS` | 请求入口阶段的落盘开关（`0`/`false`/`off`/`no` 关闭，其余值启用） | 启用 |
-| `AI_GATEWAY_RESPONSE_DUMP` | 响应阶段的落盘开关 | 未设置时跟随 `AI_GATEWAY_DUMP_REQUESTS` |
+| `AI_GATEWAY_DUMP_REQUESTS` | 请求入口阶段的落盘开关（`1`/`true`/`yes`/`on` 启用，其余值关闭） | 关闭 |
+| `AI_GATEWAY_RESPONSE_DUMP` | 响应阶段（响应快照 + 工具调用快照）的落盘开关 | 未设置时跟随 `AI_GATEWAY_DUMP_REQUESTS` |
 | `AI_GATEWAY_DUMP_DIR` | 落盘目录（各阶段共用） | 应用数据目录（`data/`） |
+
+> 默认全部关闭，运行时不产生任何落盘文件；排查链路时再按需用上述变量打开对应阶段。
 
 ### 3.3 桌面端配置
 
 启动桌面端后，可在“配置管理”界面调整端口、超时时间等，修改后需重启服务生效。
+
+### 3.4 网页渠道并发（会话池）
+
+网页渠道的会话本身是有状态的（同一个网页会话不能并发），但不同会话之间可以并行。网关按**渠道并发数**为每个渠道预建同等数量的网页会话，每个在途请求独占一个会话，因此可并发的请求数就是并发数。
+
+- **会话标题**：池内会话在网页端统一命名为 `poolman_<编号>`（如 `poolman_1`），便于辨认与回收。网页端在会话还没有内容时拒绝改名（应答 `EMPTY_CHAT_SESSION`），因此命名发生在这个会话**首轮对话成功之后**，每个会话只改一次。
+- **持久化与复用**：会话信息记录在数据库 `web_sessions` 表；再次启动时先与网页端会话列表核对，仍然存在的直接复用，只有缺失的才补建，不会重复创建。
+- **并发数配置**：写在模型行的配置里，键为 `concurrency`（同一渠道多行取最大值，未配置时默认 5，上限 16）。例如把 `models` 表中 `deepseek-web` 渠道任一模型行的 `config` 改为 `{"concurrency": 8}`，重启后该渠道会预建 8 个会话。
+- **请求无状态**：每轮请求都把整段对话拼进提示词，网关不再按对话维护网页会话，调用方传入的 `session_id` 不参与网页会话选择。
 
 ---
 
