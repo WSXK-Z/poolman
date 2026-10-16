@@ -258,9 +258,14 @@ impl StreamProcessor {
                     }
                     break;
                 }
-                Some(CloseMatch::NoMatch) | None => {
-                    // 落到识别链
+                Some(CloseMatch::NoMatch) => {
+                    // 「同字符至少 N 个」的闭合规则下，短于 N 的连续同字符属于本围栏内容：
+                    // 交给识别链会被当作新的开边，而 Markdown 围栏不允许用更短的同类围栏内嵌。
+                    if self.emit_short_repeat(&mut events) {
+                        continue;
+                    }
                 }
+                None => {}
             }
 
             // 2. 识别链判定缓存头部。
@@ -340,6 +345,36 @@ impl StreamProcessor {
             }
         }
         events
+    }
+
+    /// 「同字符至少 N 个」的闭合规则下，短于 N 的连续同字符不是闭边：按围栏内容放出。
+    ///
+    /// 这类短串（如 4 个反引号围栏里出现的 3 个反引号）交给识别链会被当成新的开边，
+    /// 而同类围栏不允许用更短的围栏内嵌。返回是否消费了缓存。
+    fn emit_short_repeat(&mut self, events: &mut Vec<StreamEvent>) -> bool {
+        let Some(CloseSpec::Repeat { ch, min_count }) =
+            self.stack.last().and_then(|open| open.close.as_ref())
+        else {
+            return false;
+        };
+        let (ch, min_count) = (*ch, *min_count);
+
+        let mut count = 0usize;
+        let mut byte_end = 0usize;
+        for (i, c) in self.pending.char_indices() {
+            if c != ch {
+                break;
+            }
+            count += 1;
+            byte_end = i + c.len_utf8();
+        }
+        if count == 0 || count >= min_count {
+            return false;
+        }
+
+        let text: String = self.pending.drain(..byte_end).collect();
+        self.emit_content(text, events);
+        true
     }
 
     /// 确认的内容归入当前最内层围栏，无开放围栏时并入顶层内容；
@@ -598,7 +633,7 @@ mod tests {
         let events = p.feed("{\"a\": {\"b\": 1}} tail");
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::FenceContent(ref s) if s == "\"a\": {\"b\": 1}")));
+            .any(|e| matches!(e, StreamEvent::FenceContent(s) if s == "\"a\": {\"b\": 1}")));
     }
 
     #[test]
@@ -615,16 +650,16 @@ mod tests {
         let events = p.feed("`rust\ncode\n```after");
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::FenceOpen { ref edge, .. } if edge == "```rust\n")));
+            .any(|e| matches!(e, StreamEvent::FenceOpen { edge, .. } if edge == "```rust\n")));
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::FenceContent(ref s) if s == "code\n")));
+            .any(|e| matches!(e, StreamEvent::FenceContent(s) if s == "code\n")));
         assert!(events
             .iter()
             .any(|e| matches!(e, StreamEvent::FenceClose { .. })));
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::Content(ref s) if s == "after")));
+            .any(|e| matches!(e, StreamEvent::Content(s) if s == "after")));
     }
 
     #[test]
@@ -640,7 +675,7 @@ mod tests {
         let events = p.feed("````md\n```\ninner\n```\n````rest");
         // 内部 ``` 不会被当作闭边。
         assert!(events.iter().any(
-            |e| matches!(e, StreamEvent::FenceContent(ref s) if s.contains("```\ninner\n```"))
+            |e| matches!(e, StreamEvent::FenceContent(s) if s.contains("```\ninner\n```"))
         ));
         // 只有连续的 4 个反引号才闭合。
         assert!(events
@@ -648,7 +683,7 @@ mod tests {
             .any(|e| matches!(e, StreamEvent::FenceClose { .. })));
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::Content(ref s) if s == "rest")));
+            .any(|e| matches!(e, StreamEvent::Content(s) if s == "rest")));
     }
 
     #[test]
@@ -700,6 +735,6 @@ mod tests {
         let events = p.feed("</x>");
         assert!(events
             .iter()
-            .any(|e| matches!(e, StreamEvent::Content(ref s) if s == "</x>")));
+            .any(|e| matches!(e, StreamEvent::Content(s) if s == "</x>")));
     }
 }
