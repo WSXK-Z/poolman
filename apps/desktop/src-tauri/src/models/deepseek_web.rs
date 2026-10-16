@@ -11,10 +11,10 @@ pub mod sse_frame_processor;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use futures_util::future::BoxFuture;
-use serde::Serialize;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
@@ -64,19 +64,48 @@ const PARAMETER_CLOSE: &str = "</｜｜DSML｜｜ parameter>";
 ///
 /// 标记形态必须与 [`ChatStreamProcessor`] 认的一致，
 /// 且与 [`DeepSeekWebModel::render_tool_calls`] 渲染历史调用的方式一致。
-const TOOL_RULE: &str = r#"1. 需要调用工具时，调用写成 DSML 标记：整体包在 <｜｜DSML｜｜ calls> 与 </｜｜DSML｜｜ calls> 之间，一次调用一层 <｜｜DSML｜｜ invoke name="工具名"> 与 </｜｜DSML｜｜ invoke>，一个参数一条 <｜｜DSML｜｜ parameter name="参数名" string="true">参数值</｜｜DSML｜｜ parameter>，例如：
+const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
+
+- **要调工具**：整条回复**只**输出 DSML，标记外零字符。
+- **不调工具**：只输出正文，禁止出现任何 DSML 标签。
+
+```dsml
 <｜｜DSML｜｜ calls>
-<｜｜DSML｜｜ invoke name="read_file">
-<｜｜DSML｜｜ parameter name="path" string="true">d:/project/src/main.rs</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ invoke name="工具名">
+<｜｜DSML｜｜ parameter name="参数名" string="true">值</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>
-2. 竖线必须逐字写成全角 ｜｜DSML｜｜，不能写成 ||DSML||、DSML，也不能漏写；尖括号、斜杠、等号、引号一律用半角；标签必须成对出现，不能改写、不能漏写、不能嵌套，不要套 Markdown 代码块；每个参数写完值都要紧跟它自己的 </｜｜DSML｜｜ parameter>，不能省略、不能写错名字。
-3. string="true" 表示参数值是纯文本，照原样写；参数值不是字符串（数字、布尔、数组、对象）时写 string="false"，值按 JSON 写，例如 <｜｜DSML｜｜ parameter name="timeout" string="false">30</｜｜DSML｜｜ parameter>、<｜｜DSML｜｜ parameter name="view_range" string="false">[320,400]</｜｜DSML｜｜ parameter>。
-4. 参数值里不要出现 </｜｜DSML｜｜ parameter> 这样的片段；值里的反斜杠写成 \\、双引号写成 \"（Windows 路径也要写，例如 d:\\project\\a.rs）。
-5. 需要调用多个工具时，一个工具一层 invoke，平铺在同一个 calls 块里。
-6. 工具调用与正文不要混在同一条回答里：需要调用工具时这条回答只输出 DSML 标记，标记之外不写解释、前言、总结；不调用工具时才输出普通正文，正文里也不要夹带标记。
-7. 工具名与参数名必须与工具定义完全一致，必填参数不能省略；只能调用下面列出的工具。
-8. 历史里 invoke 的 id 属性是调用编号（新的调用不必写它）；工具结果的标题写成 【tool】name=工具名 id=调用编号（缺哪个字段就只写有的那个），其中 id 与上面某次 invoke 的 id 相同，据此把结果和那次调用对上。"#;
+```
+
+| 规则 | 写法 |
+|---|---|
+| 分隔符 | 竖线**必须全角** `｜｜DSML｜｜`；`< > / = "` 全半角 |
+| 标签 | 成对、不嵌套、不改写、不套代码块 |
+| 字符串参数 | `string="true"`，原样写；`\`→`\\`，`"`→`\"` |
+| 非字符串 | `string="false"`，值写 JSON：`30`、`true`、`[1,2]` |
+| 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内 |
+| 命名 | `name` 与工具定义**逐字一致**；必填参数不可省 |
+| 新调用 | **不写** `id`；`id` 仅历史用于关联 |
+| 结果标题 | `【tool】name=工具名 id=调用编号` |
+| 禁区 | 参数值内**不得含** `</｜｜DSML｜｜ parameter>` 或任何 DSML 片段 |
+
+示例：
+```dsml
+<｜｜DSML｜｜ calls>
+<｜｜DSML｜｜ invoke name="read_file">
+<｜｜DSML｜｜ parameter name="path" string="true">d:\\project\\src\\main.rs</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+<｜｜DSML｜｜ invoke name="bash">
+<｜｜DSML｜｜ parameter name="command" string="true">ls -la</｜｜DSML｜｜ parameter>
+<｜｜DSML｜｜ parameter name="timeout" string="false">30000</｜｜DSML｜｜ parameter>
+</｜｜DSML｜｜ invoke>
+</｜｜DSML｜｜ calls>
+```
+"#;
+
+/// 工具调用修复提示词（`src/prompts/dsml_normalizer.md`，编译期嵌入）：DSML 解析失败时
+/// 把坏块交给模型按它重写；`{{REGISTERED_TOOLS}}` 占位符由 [`DeepSeekWebModel::repair_prompt`] 填充。
+const NORMALIZER_PROMPT: &str = include_str!("../prompts/dsml_normalizer.md");
 
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const SESSION_CREATE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
@@ -357,6 +386,18 @@ impl DeepSeekWebModel {
         sections.join("\n\n")
     }
 
+    /// 组装修复提示词：规范化器提示词（`dsml_normalizer.md`）填上可用工具清单，
+    /// 末尾附上解析失败的坏块原文——模型对它只回规范 DSML 调用块或「无」。
+    fn repair_prompt(tools: Option<&Value>, broken_markup: &str) -> String {
+        let registered = Self::render_tools(tools).unwrap_or_else(|| "（无）".to_string());
+        format!(
+            "{}\n\n{}\n\n{}",
+            PROMPT_PREFIX,
+            NORMALIZER_PROMPT.replace("{{REGISTERED_TOOLS}}", &registered),
+            broken_markup
+        )
+    }
+
     /// 是否为 system 消息。
     fn is_system(message: &Value) -> bool {
         message.get("role").and_then(Value::as_str) == Some("system")
@@ -588,7 +629,8 @@ impl DeepSeekWebModel {
         headers
     }
 
-    /// 聊天共用实现：`on_chunk` 为 Some 时流式回吐正文增量，工具调用在收尾时解析。
+    /// 聊天共用实现：`on_chunk` 为 Some 时流式回吐正文增量，工具调用在收尾时解析；
+    /// 解析失败（DSML 块没写完）时用规范化器提示词（`dsml_normalizer.md`）重写一轮，最多修复一次。
     ///
     /// 每次请求是无状态的（整段对话都拼在提示词里），因此不绑定调用方会话：
     /// 先取并发闸门，再从会话池轮转一个网页会话独占使用，池容量即可并发的请求数。
@@ -742,24 +784,10 @@ impl DeepSeekWebModel {
                 );
                 anyhow::bail!("{}", reason);
             }
-            if leftover_markup.is_empty() {
-                warn!(
-                    "网页回答为空：session={} status={} 未解析出正文与工具调用，原始响应：{}",
-                    session_id, status, raw
-                );
-            } else {
-                // 块开了却没写完：残料既不能当正文也不能当调用，只能说明「这轮没有可用回答」
-                warn!(
-                    "网页工具调用未闭合：session={} status={} 残料：{}",
-                    session_id,
-                    status,
-                    head_chars(&leftover_markup, 300)
-                );
-                anyhow::bail!(
-                    "网页返回的工具调用未闭合（DSML 块被截断）：{}",
-                    head_chars(&leftover_markup, 200)
-                );
-            }
+            warn!(
+                "网页回答为空：session={} status={} 未解析出正文与工具调用，原始响应：{}",
+                session_id, status, raw
+            );
         } else {
             // 会话这时才有内容，网页端接受改名：把池内会话命名成 poolman_<槽位序号>。
             self.ensure_pool_title(&session_id).await;
@@ -802,8 +830,10 @@ impl DeepSeekWebModel {
             body: Some(self.completion_body(session_id, parent_message_id, prompt)),
             session_key: Some(session_id.to_string()),
         };
+        // 排队等放行：网页端每秒最多接受一次提问。
+        self.ask_queue.enqueue().await;
 
-        let (text, reasoning, tool_calls, tool_call_raw, leftover_markup, upstream_error, message_id, status, raw_body) =
+        let (text, reasoning, tool_calls, parse_failure, upstream_error, message_id, status, raw_body) =
             match on_chunk {
                 Some(user_sink) => {
                     // 帧处理器与增量处理器各自独立：闭包是 FnMut，跨 chunk 的状态用 Arc<Mutex> 共享。
@@ -847,8 +877,7 @@ impl DeepSeekWebModel {
                         processor.text().to_string(),
                         processor.reasoning().to_string(),
                         processor.tool_calls().to_vec(),
-                        processor.tool_call_raw().to_string(),
-                        processor.leftover_markup().to_string(),
+                        processor.parse_failure().map(str::to_string),
                         upstream_error,
                         message_id,
                         response.status,
@@ -866,8 +895,7 @@ impl DeepSeekWebModel {
                         processor.text().to_string(),
                         processor.reasoning().to_string(),
                         processor.tool_calls().to_vec(),
-                        processor.tool_call_raw().to_string(),
-                        processor.leftover_markup().to_string(),
+                        processor.parse_failure().map(str::to_string),
                         upstream_error,
                         message_id,
                         response.status,
@@ -879,8 +907,7 @@ impl DeepSeekWebModel {
             text,
             reasoning,
             tool_calls,
-            tool_call_raw,
-            leftover_markup,
+            parse_failure,
             upstream_error,
             message_id,
             status,
@@ -889,13 +916,61 @@ impl DeepSeekWebModel {
     }
 }
 
+/// 提问队列：提问按到达顺序排队，每秒放行一个。
+///
+/// 网页端对提问频率有限制，提交太快会直接报错；这里给每个提问定一个放行时刻，
+/// 排在队尾之后 [`AskQueue::INTERVAL`]，因此相邻两次提问的间隔不小于一秒。
+struct AskQueue {
+    /// 队尾的放行时刻；None 表示队列为空。
+    tail: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+}
+
+impl AskQueue {
+    /// 相邻两次放行之间的间隔。
+    const INTERVAL: Duration = Duration::from_secs(1);
+
+    fn new() -> Self {
+        Self {
+            tail: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    /// 排到队尾，等到轮到自己再返回。
+    ///
+    /// 队伍空时立即放行；否则接在上一个提问之后一秒。取号在锁内完成，
+    /// 因此放行顺序与排队顺序一致。
+    async fn enqueue(&self) {
+        let scheduled = {
+            let mut tail = self.tail.lock().await;
+            let (scheduled, next) = Self::reserve(*tail, tokio::time::Instant::now());
+            *tail = Some(next);
+            scheduled
+        };
+        tokio::time::sleep_until(scheduled).await;
+    }
+
+    /// 取号：定出这次提问的放行时刻，并给出队尾的新时刻。
+    ///
+    /// 队尾已经过去（队列空了一会儿）就地放行，否则接在队尾之后一个间隔。
+    fn reserve(
+        tail: Option<tokio::time::Instant>,
+        now: tokio::time::Instant,
+    ) -> (tokio::time::Instant, tokio::time::Instant) {
+        let scheduled = match tail {
+            Some(previous) if previous > now => previous,
+            _ => now,
+        };
+        (scheduled, scheduled + Self::INTERVAL)
+    }
+}
+
 /// 一轮推理的产物：解析出的内容 + 上游报错 + 排查用的原文证据。
 struct CompletionRound {
     text: String,
     reasoning: String,
     tool_calls: Vec<Value>,
-    tool_call_raw: String,
-    leftover_markup: String,
+    /// DSML 块开了却没写出可解析的调用时的坏块原文：触发一次规范化修复重写。
+    parse_failure: Option<String>,
     upstream_error: Option<UpstreamError>,
     message_id: Option<i64>,
     status: u16,
@@ -1130,7 +1205,7 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::session_pool::POOL_TITLE_PREFIX;
-    use super::{DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL, PROMPT_PREFIX};
+    use super::{AskQueue, DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL, PROMPT_PREFIX};
     use crate::models::defs::{
         ChannelExecutor, ChannelRequest, ChannelResponse, ChunkSink, InferRequest, PooledSession,
         SessionPoolStore,
@@ -1139,9 +1214,10 @@ mod tests {
     use crate::models::plugin::PluginModel;
     use futures_util::future::BoxFuture;
     use serde_json::{json, Value};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
 
     /// 记录请求并按 URL 返回预设响应。
     ///
@@ -1163,6 +1239,8 @@ mod tests {
         /// 首个完成请求返回「上下文到长度上限」，之后恢复正常回答
         /// （模拟网页端在那个会话上顶到上限，换成新会话后就能答）。
         limit_first_completion: AtomicBool,
+        /// 完成请求的预设响应队列：非空时逐个顶替默认响应体（模拟「先回坏块、修复轮回好块」）。
+        completion_queue: Mutex<VecDeque<String>>,
     }
 
     /// 「上下文到长度上限」的响应体：网页端在 hint 负载里给出原因与结束原因。
@@ -1203,6 +1281,14 @@ mod tests {
                         .expect("completion 请求体应是 JSON")
                 })
                 .collect()
+        }
+
+        /// 预设接下来几个完成请求的响应体（按序消费，用完回落到默认响应体）。
+        fn queue_completions(&self, bodies: &[String]) {
+            self.completion_queue
+                .lock()
+                .unwrap()
+                .extend(bodies.iter().cloned());
         }
 
         /// 创建会话的请求次数。
@@ -1336,11 +1422,16 @@ mod tests {
                         json!({ "code": 0, "data": { "biz_code": 0 } }).to_string()
                     }
                 } else if request.url.contains("chat/completion") {
-                    // 完成请求：首个按「上下文到长度上限」回（与流式路径同一个开关）
+                    // 完成请求：首个按「上下文到长度上限」回（与流式路径同一个开关）；
+                    // 预设队列非空时逐个取用（修复链路：先回坏块、修复轮回修好的调用）
                     if self.limit_first_completion.swap(false, Ordering::SeqCst) {
                         LIMIT_BODY.to_string()
                     } else {
-                        self.completion_body.clone()
+                        self.completion_queue
+                            .lock()
+                            .unwrap()
+                            .pop_front()
+                            .unwrap_or_else(|| self.completion_body.clone())
                     }
                 } else {
                     self.completion_body.clone()
@@ -1365,12 +1456,16 @@ mod tests {
             on_chunk: ChunkSink,
         ) -> BoxFuture<'_, anyhow::Result<ChannelResponse>> {
             Box::pin(async move {
-                // 首个完成请求按「上下文到长度上限」回，之后恢复正常回答。
+                // 首个完成请求按「上下文到长度上限」回，之后恢复正常回答；预设队列优先。
                 let limited = self.limit_first_completion.swap(false, Ordering::SeqCst);
                 let body = if limited {
                     LIMIT_BODY.to_string()
                 } else {
-                    self.completion_body.clone()
+                    self.completion_queue
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or_else(|| self.completion_body.clone())
                 };
                 let mut on_chunk = on_chunk;
                 if self.stream_chunk == 0 {
@@ -1415,6 +1510,7 @@ mod tests {
             created: AtomicUsize::new(0),
             list_unavailable: AtomicBool::new(false),
             limit_first_completion: AtomicBool::new(false),
+            completion_queue: Mutex::new(VecDeque::new()),
         })
     }
 
@@ -1621,20 +1717,17 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     }
 
-    /// 块没闭合（模型写一半断了）时这轮没有可用回答：报明原因，不把写坏的标记当回答发出去。
+    /// 块没闭合（模型写一半断了）时这轮没有可用回答：写坏的标记不当回答发出去，只落一条空回答。
     #[tokio::test]
-    async fn infer_reports_when_dsml_is_unclosed() {
+    async fn infer_drops_unclosed_dsml_markup() {
         let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
-        let error = model(&content_frame(half))
+        let response = model(&content_frame(half))
             .infer(tool_request())
             .await
-            .expect_err("截断的工具调用要报错，不能当成普通正文");
+            .expect("写坏的标记不是正文，也不该让整轮请求失败");
 
-        assert!(
-            error.to_string().contains("未闭合"),
-            "错误信息要说明工具调用被截断: {}",
-            error
-        );
+        assert_eq!(response.text, "", "写坏的标记不能当回答发出去");
+        assert!(response.tool_calls.is_none());
     }
 
     /// 上游用 `event: hint` 说明这轮为什么没有回答（例如达到对话长度上限）：
@@ -2110,6 +2203,63 @@ mod tests {
         assert_eq!(used[0], used[2], "槽位按容量轮转回到起点");
     }
 
+    /// 提问排队取号：队尾在将来就接在队尾之后，否则立即放行；相邻放行固定隔一个间隔。
+    #[tokio::test]
+    async fn ask_queue_reserves_one_slot_per_interval() {
+        let now = tokio::time::Instant::now();
+
+        let (scheduled, tail) = AskQueue::reserve(None, now);
+        assert_eq!(scheduled, now, "空队列立即放行");
+        assert_eq!(tail, now + AskQueue::INTERVAL, "队尾顺延一个间隔");
+
+        let (scheduled, tail) = AskQueue::reserve(Some(tail), now);
+        assert_eq!(scheduled, now + AskQueue::INTERVAL, "接在上一个提问之后");
+        assert_eq!(tail, now + AskQueue::INTERVAL * 2);
+
+        let (scheduled, tail) = AskQueue::reserve(Some(now - AskQueue::INTERVAL), now);
+        assert_eq!(scheduled, now, "队尾已过去时按当前时刻排");
+        assert_eq!(tail, now + AskQueue::INTERVAL);
+    }
+
+    /// 提问排队：按到达顺序放行，三个提问要跨两个间隔才走完。
+    #[tokio::test]
+    async fn ask_queue_releases_asks_in_queue_order() {
+        let queue = Arc::new(AskQueue::new());
+        let entered = Arc::new(Mutex::new(None::<tokio::time::Instant>));
+        let released = Arc::new(Mutex::new(Vec::<(usize, tokio::time::Instant)>::new()));
+        let mut handles = Vec::new();
+        for index in 0..3 {
+            let queue = queue.clone();
+            let entered = entered.clone();
+            let released = released.clone();
+            handles.push(tokio::spawn(async move {
+                entered
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(tokio::time::Instant::now);
+                queue.enqueue().await;
+                released
+                    .lock()
+                    .unwrap()
+                    .push((index, tokio::time::Instant::now()));
+            }));
+        }
+        for handle in handles {
+            handle.await.expect("排队任务不应结束于失败");
+        }
+
+        let released = released.lock().unwrap();
+        let order: Vec<usize> = released.iter().map(|(index, _)| *index).collect();
+        assert_eq!(order, vec![0, 1, 2], "放行顺序应与排队顺序一致");
+        // 计时从入队之前算起、记在放行之后结束，两头只会往长里算；容差留给定时器提前几毫秒到点。
+        let entered = entered.lock().unwrap().expect("应记录过入队时刻");
+        let elapsed = released.last().unwrap().1 - entered;
+        assert!(
+            elapsed + Duration::from_millis(20) >= AskQueue::INTERVAL * 2,
+            "三个提问应跨两个间隔，实际 {elapsed:?}"
+        );
+    }
+
     /// 空回答必须把原始响应打进日志：否则「请求走完了但客户端什么都没有」无从排查。
     #[tokio::test]
     async fn empty_answer_logs_raw_response() {
@@ -2249,8 +2399,8 @@ mod tests {
         assert!(!prompt.contains("【system】"), "{}", prompt);
         // 规则正文由模型自己给出：DSML 标记格式 + 限定规则
         assert!(prompt.contains(super::CALLS_OPEN), "{}", prompt);
-        assert!(prompt.contains("必须逐字写成全角"), "{}", prompt);
-        assert!(prompt.contains("只能调用下面列出的工具"), "{}", prompt);
+        assert!(prompt.contains("必须全角"), "{}", prompt);
+        assert!(prompt.contains("逐字一致"), "{}", prompt);
         // 参数为紧凑 JSON
         assert!(prompt.contains(r#"参数：{"properties""#), "{}", prompt);
         // 最新一条记录拼在最末尾
@@ -2783,5 +2933,117 @@ mod tests {
         assert_eq!(calls[0]["function"]["name"], "read_file");
         assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    /// 规范化器提示词（`dsml_normalizer.md`）与解析器共用同一套标记字面量，且保留运行时占位符。
+    #[test]
+    fn normalizer_prompt_agrees_with_markup_constants() {
+        assert!(
+            super::NORMALIZER_PROMPT.contains("{{REGISTERED_TOOLS}}"),
+            "占位符不能丢"
+        );
+        for literal in [
+            super::CALLS_OPEN,
+            super::CALLS_CLOSE,
+            super::INVOKE_OPEN,
+            super::INVOKE_CLOSE,
+            super::PARAMETER_OPEN,
+            super::PARAMETER_CLOSE,
+        ] {
+            assert!(
+                super::NORMALIZER_PROMPT.contains(literal),
+                "修复提示词应含 {literal}"
+            );
+        }
+    }
+
+    /// 修复提示词：占位符换成工具清单，坏块原文附在末尾，前面带固定前缀。
+    #[test]
+    fn repair_prompt_fills_tools_and_appends_broken_markup() {
+        let tools = json!([{ "function": { "name": "read_file", "description": "读取文件" } }]);
+        let prompt = DeepSeekWebModel::repair_prompt(Some(&tools), "<坏块>");
+        assert!(prompt.starts_with(super::PROMPT_PREFIX), "{}", prompt);
+        assert!(
+            !prompt.contains("{{REGISTERED_TOOLS}}"),
+            "占位符应被替换：{}",
+            prompt
+        );
+        assert!(prompt.contains("- read_file：读取文件"), "{}", prompt);
+        assert!(prompt.ends_with("<坏块>"), "{}", prompt);
+
+        // 没有工具时占位符填「（无）」：修复模型对任何输入都只能回「无」
+        let empty = DeepSeekWebModel::repair_prompt(None, "x");
+        assert!(!empty.contains("{{REGISTERED_TOOLS}}"), "{}", empty);
+    }
+
+    /// 工具调用没写完时发起一次修复：坏块连同规范化器提示词（含工具清单）再问一轮，
+    /// 修出的调用按原格式返回。
+    #[tokio::test]
+    async fn repair_round_recovers_broken_tool_call() {
+        let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
+        let fixed = content_frame(&dsml_calls(&[dsml_invoke("read_file", &[("path", "a.rs")])]));
+        // 默认响应体给「无」：首轮与修复轮都从预设队列取
+        let executor = executor(&content_frame("无"), 0);
+        executor.queue_completions(&[content_frame(half), fixed]);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>);
+
+        let response = model
+            .infer(tool_request())
+            .await
+            .expect("修复后应正常返回调用");
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+        let calls = response.tool_calls.expect("坏块应被修复成调用");
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+
+        // 第二次 completion 是修复请求：提示词里带规范化器、工具清单与坏块原文
+        let bodies = executor.completion_bodies();
+        assert_eq!(bodies.len(), 2, "首轮 + 修复轮：{:?}", bodies.len());
+        let repair_prompt = bodies[1]["prompt"].as_str().unwrap();
+        assert!(
+            repair_prompt.contains("工具调用规范化器"),
+            "{}",
+            repair_prompt
+        );
+        assert!(
+            repair_prompt.contains("- read_file：读取文件"),
+            "应填充工具清单：{}",
+            repair_prompt
+        );
+        assert!(repair_prompt.contains(half), "应带上坏块原文：{}", repair_prompt);
+    }
+
+    /// 修复也失败（模型没给出调用）：流式客户端收到一条解析失败提示，整轮仍不报错。
+    #[tokio::test]
+    async fn repair_failure_reports_to_stream() {
+        let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
+        // 队列只预设首轮的坏块：修复轮回落到默认响应体「无」
+        let executor = executor(&content_frame("无"), 0);
+        executor.queue_completions(&[content_frame(half)]);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>);
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+
+        let response = model
+            .infer_stream(
+                tool_request(),
+                Box::new(move |delta| sink.lock().unwrap().push(delta)),
+            )
+            .await
+            .expect("修复失败也不该让整轮请求报错");
+
+        let contents: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|delta| crate::apis::base::parse_delta(delta).content)
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["工具调用格式不正确".to_string()],
+            "修复不成才提示解析失败"
+        );
+        assert!(response.tool_calls.is_none(), "{:?}", response.tool_calls);
+        assert!(response.text.is_empty(), "「无」不应当成回答发给客户端");
     }
 }

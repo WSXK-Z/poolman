@@ -13,7 +13,7 @@
 //!   纯空白不发（标记前后的空行/缩进只是排版，发出去会变成一条只有空白的回答）；
 //! - 检测到「可能有工具调用」（缓冲区尾巴正是被 chunk 切开的半个标记）：只扣住这一小段，
 //!   等下一段增量来凑齐，前面已经确定不是标记的部分照常当正文发出；
-//! - 检测到「有工具调用」：块内内容不再外泄，一直扣住到**整块闭合**（收到 `</calls>`），
+//! - 检测到「有工具调用」：块内内容不再外泄，一直扣住到**整块闭合**（收到 `</｜｜DSML｜｜ calls>`），
 //!   这时才把这一块的调用一次性当增量发出——客户端要等工具全部解析完才能拿到，
 //!   边解析边发会让它拿到半块。
 //!   每条调用只发一次，`index` 是它在整轮里的全局序号（重发会让客户端把参数拼两遍）。
@@ -25,7 +25,7 @@
 
 use anyhow::Result;
 use serde_json::{Map, Value, json};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::apis::base::DeltaChunk;
 use crate::models::deepseek_web::{
@@ -68,17 +68,18 @@ pub struct ChatStreamProcessor {
     reasoning: String,
     /// 已发出去的工具调用（对应哪些已经发过：见 [`Self::emit_new_calls`]）。
     tool_calls: Vec<Value>,
-    /// 收尾时块内没消费完的标记残料：模型想调工具但没写完。它不是正文，不进回答，
-    /// 只用来告诉上层「这轮没有可用回答，原因是工具调用被截断」。
-    leftover_markup: String,
     /// 请求里的工具参数类型表：模型把类型标错时按它矫正。
     schemas: ToolSchemas,
+    /// 原始正文流（全部 RESPONSE 增量的拼接，从不裁剪）：坏块原文从它截取。
+    row_response_buf: String,
     cache_response_buf: String,
+    /// 当前 DSML 块在 [`Self::row_response_buf`] 里的起点：开块时记下、整块闭合即清。
+    block_start: Option<usize>,
+    /// 解析失败的坏块原文（`finish` 时落定）：上层据此发起一次规范化修复。
+    parse_failure: Option<String>,
     /// 已组装好、还没出站的调用（OpenAI 形状的 `tool_calls[]` 元素）。
     cache_function_buf: Vec<Value>,
     cache_tag_stack: Vec<FunctionTag>,
-    /// 本轮 RESPONSE 原文（正文 + 标记）：`tool_call_raw` 与「块没闭合」的残料都从它截出标记部分。
-    raw_text: String,
 }
 
 impl ChatStreamProcessor {
@@ -92,12 +93,13 @@ impl ChatStreamProcessor {
             calls_emitted: false,
             reasoning: String::new(),
             tool_calls: Vec::new(),
-            leftover_markup: String::new(),
             schemas: ToolSchemas::default(),
+            row_response_buf: String::new(),    
             cache_response_buf: String::new(),
             cache_function_buf: Vec::new(),
             cache_tag_stack: Vec::new(),
-            raw_text: String::new(),
+            block_start: None,
+            parse_failure: None,
         }
     }
 
@@ -115,35 +117,36 @@ impl ChatStreamProcessor {
     }
 
     /// 流结束：放出残留正文与工具调用。
-    /// 结果经 [`Self::text`] / [`Self::reasoning`] / [`Self::tool_calls`] 读取。
+    /// 结果经 [`Self::text`] / [`Self::reasoning`] / [`Self::tool_calls`] / [`Self::parse_failure`] 读取。
     pub fn finish(&mut self) {
         if self.recognize_tools {
-            // 块没闭合：这一块吃掉的原文就是写坏的残料（栈会被 `collect_calls` 取走，先记下来）
+            // 块没闭合（栈会被 `collect_calls` 取走，先记下来）：块内没写完的标记不是正文，整块丢掉
             let block_open = !self.cache_tag_stack.is_empty();
-            // 收尾：已闭合的调用落进缓冲，整块没等到 `</calls>` 的也在这里补发
+            let open_stack = block_open.then(|| format!("{:?}", self.cache_tag_stack));
+            let calls_before = self.tool_calls.len();
+            // 收尾：已闭合的调用落进缓冲，整块没等到 `</｜｜DSML｜｜ calls>` 的也在这里补发
             self.collect_calls();
             self.emit_new_calls();
-            // 原文只留标记部分：从第一个 `<｜｜DSML｜｜ calls>` 到最后一个闭合标志（没闭合就截到流尾）
-            if let Some(start) = self.raw_text.find(CALLS_OPEN) {
-                let end = [CALLS_CLOSE, INVOKE_CLOSE, PARAMETER_CLOSE]
-                    .iter()
-                    .filter_map(|marker| {
-                        self.raw_text[start..]
-                            .rfind(marker)
-                            .map(|at| start + at + marker.len())
-                    })
-                    .max()
-                    .unwrap_or(self.raw_text.len());
-                self.raw_text = self.raw_text[start..end].to_string();
-            } else {
-                self.raw_text.clear();
-            }
-            if block_open {
-                self.leftover_markup = self.raw_text.clone();
-            } else {
-                // 块外残留（流末的普通文字）仍算正文
-                let tail = std::mem::take(&mut self.cache_response_buf);
-                self.push_text(&tail);
+            match open_stack {
+                // 块内的标记不当正文；一个调用都没补出来才算工具调用失败
+                Some(stack) => {
+                    self.cache_response_buf.clear();
+                    if self.tool_calls.len() == calls_before {
+                        // 失败时打出解析停在哪一步，便于对照模型原文排查
+                        warn!("工具调用未写完，解析停在：{}", stack);
+                        // 坏块原文记下来交给上层：用规范化器提示词再问一轮修复
+                        let start = self
+                            .block_start
+                            .take()
+                            .unwrap_or(self.row_response_buf.len());
+                        self.parse_failure = Some(self.row_response_buf[start..].to_string());
+                    }
+                }
+                None => {
+                    // 块外残留（流末的普通文字）仍算正文
+                    let tail = std::mem::take(&mut self.cache_response_buf);
+                    self.push_text(&tail);
+                }
             }
         }
     }
@@ -163,14 +166,9 @@ impl ChatStreamProcessor {
         &self.tool_calls
     }
 
-    /// 检测器吃掉的工具调用原文（DSML 标记逐字保留），供落盘对照。
-    pub fn tool_call_raw(&self) -> &str {
-        &self.raw_text
-    }
-
-    /// 收尾时块内没消费完的标记残料（模型想调工具但没写完）；没有则为空串。
-    pub fn leftover_markup(&self) -> &str {
-        &self.leftover_markup
+    /// 解析失败的坏块原文（DSML 块开了却没写出任何可解析的调用）；None 表示这轮没有失败。
+    pub fn parse_failure(&self) -> Option<&str> {
+        self.parse_failure.as_deref()
     }
 
     /// 按片段类型分流：正文进 DSML 探测器，思考直接回吐，未知类型丢弃。
@@ -190,18 +188,18 @@ impl ChatStreamProcessor {
 
     /// 正文增量：先过工具检测，再按检测结果决定这段内容怎么走。
     fn push_response(&mut self, delta: &str) {
+        self.row_response_buf.push_str(delta);
         if !self.recognize_tools {
             // 不认工具：整段就是正文，不做任何切分
             self.push_text(delta);
             return;
         }
         self.cache_response_buf.push_str(delta);
-        self.raw_text.push_str(delta);
         self.scan();
     }
 
-    /// 标签栈里记下的调用落进 `cache_function_buf`（OpenAI 形状）：只有 `</invoke>` 已到的调用
-    /// 才算完整，写了一半的调用丢掉——它属残料，不产出半个工具调用。
+    /// 标签栈里记下的调用落进 `cache_function_buf`（OpenAI 形状）：只有 `</｜｜DSML｜｜ invoke>` 已到的调用
+    /// 才算完整，写了一半的调用丢掉——不产出半个工具调用。
     fn collect_calls(&mut self) {
         let mut name: Option<String> = None;
         let mut arguments = Map::new();
@@ -279,6 +277,7 @@ impl ChatStreamProcessor {
                 self.collect_calls();
                 self.emit_new_calls();
                 self.cache_tag_stack.clear();
+                self.block_start = None;
             }
             Some(&FunctionTag::ParamValue(_)) => {}
         }
@@ -289,6 +288,9 @@ impl ChatStreamProcessor {
     fn scan_calls_open(&mut self) {
         match text_recognizer(CALLS_OPEN, &self.cache_response_buf) {
             Result::Ok(TextRecognizerResult::Finded(start, end)) => {
+                // 块从这里开始：记下它在原始正文流里的起点，收尾失败时据此截出坏块原文
+                self.block_start =
+                    Some(self.row_response_buf.len() - self.cache_response_buf.len() + start);
                 self.cache_tag_stack.push(FunctionTag::CallsOpen);
                 let prefix = self.cache_response_buf[..start].to_string();
                 self.push_text(&prefix);
@@ -355,7 +357,7 @@ impl ChatStreamProcessor {
     /// 标记之前的块内语法一并丢掉；标记还没到就先不动缓冲区，等下一段增量补齐。
     fn scan_param_open(&mut self) {
         match text_recognizer(PARAMETER_OPEN, &self.cache_response_buf) {
-            // 前面只允许块内排版：还有别的标记（`</invoke>`、下一次调用之类）时交给那个标记先走
+            // 前面只允许块内排版：还有别的标记（`</｜｜DSML｜｜ invoke>`、下一次调用之类）时交给那个标记先走
             Result::Ok(TextRecognizerResult::Finded(start, end))
                 if self.cache_response_buf[..start].trim().is_empty() =>
             {
@@ -1028,7 +1030,7 @@ mod tests {
         assert_eq!(processor.tool_calls().len(), 2);
     }
 
-    /// 流被截断（`invoke` 闭合了、`</calls>` 没来）：调用在收尾时补发，块内原文不混进正文。
+    /// 流被截断（`</｜｜DSML｜｜ invoke>` 到了、`</｜｜DSML｜｜ calls>` 没来）：调用在收尾时补发，块内剩下的不当正文。
     #[test]
     fn call_survives_missing_block_close() {
         let (seen, sink) = collector();
@@ -1131,22 +1133,6 @@ mod tests {
         );
     }
 
-    /// 原文留给落盘：与喂进去的标记逐字一致，块外正文不混进来。
-    #[test]
-    fn tool_call_raw_is_kept_for_dump() {
-        let (_, sink) = collector();
-        let mut processor = ChatStreamProcessor::new(sink, true);
-        let markup = dsml_call("read_file", "path", "a.rs");
-        processor.feed(vec![
-            (DeltaChunk::RESPONSE.to_string(), "先说明".to_string()),
-            (DeltaChunk::RESPONSE.to_string(), markup.clone()),
-            (DeltaChunk::RESPONSE.to_string(), "再补充".to_string()),
-        ]);
-        processor.finish();
-
-        assert_eq!(processor.tool_call_raw(), markup);
-    }
-
     /// 检测到工具调用要落日志：这是链路里最容易「静默消失」的一环，排查时得看得见名字与参数。
     #[test]
     fn detected_call_is_logged() {
@@ -1166,6 +1152,30 @@ mod tests {
         assert!(logged.contains("检测到工具调用"), "{}", logged);
         assert!(logged.contains("read_file"), "应打出工具名：{}", logged);
         assert!(logged.contains("a.rs"), "应打出参数：{}", logged);
+    }
+
+    /// 工具调用写了一半断流也要落日志：打出解析停在哪一步，便于对照模型原文排查。
+    #[test]
+    fn unclosed_call_logs_parse_position() {
+        let logs = log_capture();
+        let start = logs.lock().unwrap().len();
+
+        let (_, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        processor.feed(vec![(
+            DeltaChunk::RESPONSE.to_string(),
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">".to_string(),
+        )]);
+        processor.finish();
+
+        // 只认这一轮之后新写进来的日志，别的用例（并行）的日志不算数
+        let logged = String::from_utf8(logs.lock().unwrap()[start..].to_vec()).unwrap();
+        assert!(logged.contains("工具调用未写完"), "{}", logged);
+        assert!(
+            logged.contains("CallName(\"read_file\")"),
+            "应打出停在哪一步：{}",
+            logged
+        );
     }
 
     /// 断言日志用的全局订阅者。
@@ -1319,9 +1329,10 @@ mod tests {
         assert!(processor.tool_calls().is_empty());
     }
 
-    /// 未闭合的块（模型写了一半就断了）：残料不当正文外泄，另行交给上层说明失败原因。
+    /// 未闭合的块（模型写了一半就断了）：块内没写完的标记不当正文外泄，也不产出半个调用；
+    /// 坏块原文记录在案，交给上层的规范化修复处理。
     #[test]
-    fn unclosed_call_is_reported_as_leftover_markup() {
+    fn unclosed_call_is_dropped() {
         let (seen, sink) = collector();
         let mut processor = ChatStreamProcessor::new(sink, true);
         let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"a\">";
@@ -1334,9 +1345,39 @@ mod tests {
             .iter()
             .map(|delta| parse_delta(delta).content)
             .collect();
-        assert_eq!(content, "", "写坏的标记不能当回答发出去");
+        assert_eq!(content, "", "写坏的标记不当回答：{:?}", content);
         assert!(processor.tool_calls().is_empty());
-        assert_eq!(processor.leftover_markup(), half);
+        assert!(processor.text().is_empty(), "被截断的块不进正文");
+        assert_eq!(
+            processor.parse_failure(),
+            Some(half),
+            "坏块原文要留给修复链路"
+        );
+    }
+
+    /// 坏块原文从块的开边截起：块前的正文不算失败输入；标记被切成多段也能拼全。
+    #[test]
+    fn parse_failure_starts_at_block_open_and_survives_split() {
+        let (_seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let broken = "先看看<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"a\">";
+        let mid = broken
+            .char_indices()
+            .nth(broken.chars().count() / 2)
+            .map(|(i, _)| i)
+            .unwrap_or(broken.len());
+        processor.feed(vec![
+            (DeltaChunk::RESPONSE.to_string(), broken[..mid].to_string()),
+            (DeltaChunk::RESPONSE.to_string(), broken[mid..].to_string()),
+        ]);
+        processor.finish();
+
+        assert_eq!(processor.text(), "先看看", "块前正文照常发");
+        assert_eq!(
+            processor.parse_failure(),
+            Some(&broken["先看看".len()..]),
+            "失败输入从块的开边截起"
+        );
     }
 
     /// 参数类型按请求里的 schema 矫正：模型标成字符串的数字 / 数组 / 布尔要落成 JSON 类型，
