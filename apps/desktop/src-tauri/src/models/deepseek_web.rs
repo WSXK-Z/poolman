@@ -68,6 +68,7 @@ const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 
 - **要调工具**：整条回复**只**输出 DSML，标记外零字符。
 - **不调工具**：只输出正文，禁止出现任何 DSML 标签。
+- **数量上限**：一次回复里 `invoke` 最多 3 个，单个 `invoke` 里 `parameter` 最多 10 个；超出的调用拆到后续轮次，不要挤在同一条回复里。
 
 ```dsml
 <｜｜DSML｜｜ calls>
@@ -83,7 +84,7 @@ const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 | 标签 | 成对、不嵌套、不改写、不套代码块 |
 | 字符串参数 | `string="true"`，原样写；`\`→`\\`，`"`→`\"` |
 | 非字符串 | `string="false"`，值写 JSON：`30`、`true`、`[1,2]` |
-| 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内 |
+| 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内，最多 3 个；单个 `invoke` 的 `parameter` 最多 10 个 |
 | 命名 | `name` 与工具定义**逐字一致**；必填参数不可省 |
 | 新调用 | **不写** `id`；`id` 仅历史用于关联 |
 | 结果标题 | `【tool】name=工具名 id=调用编号` |
@@ -2954,6 +2955,16 @@ mod tests {
                 super::NORMALIZER_PROMPT.contains(literal),
                 "修复提示词应含 {literal}"
             );
+        }
+    }
+
+    /// 工具规则与修复提示词给出的「调用数量 / 参数个数」上限必须一致。
+    #[test]
+    fn tool_rule_and_normalizer_agree_on_limits() {
+        for text in [super::TOOL_RULE, super::NORMALIZER_PROMPT] {
+            for needle in ["`invoke` 最多 3 个", "`parameter` 最多 10 个"] {
+                assert!(text.contains(needle), "应写上数量上限 {needle}：{text}");
+            }
         }
     }
 
