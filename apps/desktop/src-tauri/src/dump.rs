@@ -618,28 +618,28 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = temp_dir().to_string_lossy().to_string();
-        std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP");
+        unsafe { std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP") };
 
-        std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "0");
+        unsafe { std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "0") };
         assert!(
             !DumpConfig::from_env(&dir).response_enabled(),
             "跟随请求阶段关闭"
         );
 
-        std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "1");
+        unsafe { std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "1") };
         assert!(
             DumpConfig::from_env(&dir).response_enabled(),
             "跟随请求阶段启用"
         );
 
-        std::env::set_var("AI_GATEWAY_RESPONSE_DUMP", "0");
+        unsafe { std::env::set_var("AI_GATEWAY_RESPONSE_DUMP", "0") };
         assert!(
             !DumpConfig::from_env(&dir).response_enabled(),
             "请求阶段开着也能单独关掉响应阶段"
         );
 
-        std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS");
-        std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP");
+        unsafe { std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS") };
+        unsafe { std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP") };
     }
 
     /// 关闭时不写任何文件：请求 / 响应 / 工具调用三条落盘路径都被拦下，连目录都不创建。
@@ -824,19 +824,19 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let data_dir = temp_dir();
         let data_dir = data_dir.to_string_lossy().to_string();
-        std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS");
-        std::env::remove_var("AI_GATEWAY_DUMP_DIR");
+        unsafe { std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS") };
+        unsafe { std::env::remove_var("AI_GATEWAY_DUMP_DIR") };
 
         for off in ["0", "false", "off", "no", "FALSE"] {
-            std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", off);
+            unsafe { std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", off) };
             assert!(!DumpConfig::from_env(&data_dir).enabled(), "{} 应关闭", off);
         }
         for on in ["1", "true", "yes", "on"] {
-            std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", on);
+            unsafe { std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", on) };
             assert!(DumpConfig::from_env(&data_dir).enabled(), "{} 应启用", on);
         }
 
-        std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS");
+        unsafe { std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS") };
         let config = DumpConfig::from_env(&data_dir);
         assert!(!config.enabled(), "未设置时默认关闭");
         assert!(!config.response_enabled(), "响应阶段跟随关闭");
@@ -846,11 +846,11 @@ mod tests {
             "未设置目录时落到数据目录"
         );
 
-        std::env::set_var("AI_GATEWAY_DUMP_DIR", "/tmp/poolman-dump");
+        unsafe { std::env::set_var("AI_GATEWAY_DUMP_DIR", "/tmp/poolman-dump") };
         assert_eq!(
             DumpConfig::from_env(&data_dir).dir().to_string_lossy(),
             "/tmp/poolman-dump"
         );
-        std::env::remove_var("AI_GATEWAY_DUMP_DIR");
+        unsafe { std::env::remove_var("AI_GATEWAY_DUMP_DIR") };
     }
 }

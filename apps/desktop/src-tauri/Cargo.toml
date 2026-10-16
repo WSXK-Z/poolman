@@ -1,9 +1,9 @@
 [package]
 name = "desktop"
-version = "0.2.0"
+version = "0.2.2"
 description = "poolman"
 authors = ["wushi"]
-edition = "2021"
+edition = "2024"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
