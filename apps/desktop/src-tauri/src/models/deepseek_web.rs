@@ -391,7 +391,7 @@ impl DeepSeekWebModel {
     fn repair_prompt(tools: Option<&Value>, broken_markup: &str) -> String {
         let registered = Self::render_tools(tools).unwrap_or_else(|| "（无）".to_string());
         format!(
-            "{}\n\n{}\n\n{}",
+            "{}\n\n{}\n\n以下是用户输入内容：\n{}",
             PROMPT_PREFIX,
             NORMALIZER_PROMPT.replace("{{REGISTERED_TOOLS}}", &registered),
             broken_markup

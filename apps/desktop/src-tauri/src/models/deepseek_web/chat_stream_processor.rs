@@ -132,8 +132,9 @@ impl ChatStreamProcessor {
                 Some(stack) => {
                     self.cache_response_buf.clear();
                     if self.tool_calls.len() == calls_before {
-                        // 失败时打出解析停在哪一步，便于对照模型原文排查
-                        warn!("工具调用未写完，解析停在：{}", stack);
+                        // 失败时打出接收原文与解析停在哪一步，便于对照模型原文排查
+                        warn!("工具调用解析失败，接收到的原始内容：{}", self.row_response_buf);
+                        warn!("工具调用解析失败，解析停在：{}", stack);
                         // 坏块原文记下来交给上层：用规范化器提示词再问一轮修复
                         let start = self
                             .block_start
