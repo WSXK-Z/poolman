@@ -39,6 +39,9 @@ use models::{DeepSeekWebModel, PluginModel, SessionPoolStore};
 use providers::provider_control::{read_enablement_file, ProviderControl};
 use providers::{seed, ProviderManager};
 use session::manager::SessionManager;
+use tauri::menu::{Menu, MenuItem};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::{Manager, WindowEvent};
 
 /// 数据目录（数据库/日志）：环境变量 AI_GATEWAY_DATA 覆盖；
 /// 开发模式(debug)用项目 data 目录(../data，保持现有数据不丢)，
@@ -245,6 +248,61 @@ fn spawn_session_warmup(models: Vec<Arc<dyn PluginModel>>) {
     });
 }
 
+/// 主窗口标签，与 tauri.conf.json 中的窗口及 capabilities 保持一致。
+const MAIN_WINDOW_LABEL: &str = "main";
+
+/// 托盘图标 id。
+const TRAY_ID: &str = "poolman-tray";
+
+/// 托盘菜单「显示主窗口」项 id。
+const TRAY_MENU_SHOW: &str = "tray_show";
+
+/// 托盘菜单「退出」项 id。
+const TRAY_MENU_QUIT: &str = "tray_quit";
+
+/// 唤出主窗口：还原 → 显示 → 聚焦。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.unminimize();
+        let _ = window.show();
+        let _ = window.set_focus();
+    }
+}
+
+/// 装配系统托盘：左键单击唤出主窗口，右键菜单提供「显示主窗口 / 退出」。
+fn setup_tray(app: &mut tauri::App) -> tauri::Result<()> {
+    let show = MenuItem::with_id(app, TRAY_MENU_SHOW, "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    let mut builder = TrayIconBuilder::with_id(TRAY_ID)
+        .menu(&menu)
+        .tooltip("poolman")
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            TRAY_MENU_SHOW => show_main_window(app),
+            TRAY_MENU_QUIT => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    if let Some(icon) = app.default_window_icon().cloned() {
+        builder = builder.icon(icon);
+    }
+
+    builder.build(app)?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 初始化数据库（sea-orm + SQLite 持久化；路径可用 AI_GATEWAY_DB 覆盖；
@@ -348,6 +406,29 @@ pub fn run() {
         .manage(bridge)
         .manage(chat_router)
         .invoke_handler(commands::handler())
+        .setup(|app| {
+            setup_tray(app)?;
+            Ok(())
+        })
+        .on_window_event(|window, event| {
+            if window.label() != MAIN_WINDOW_LABEL {
+                return;
+            }
+            match event {
+                // 关闭按钮不退出进程，仅把窗口收进托盘；退出走托盘菜单。
+                WindowEvent::CloseRequested { api, .. } => {
+                    let _ = window.hide();
+                    api.prevent_close();
+                }
+                // 最小化同样收进托盘：任务栏不再保留窗口，只能从托盘唤出。
+                WindowEvent::Resized(_) => {
+                    if window.is_minimized().unwrap_or(false) {
+                        let _ = window.hide();
+                    }
+                }
+                _ => {}
+            }
+        })
         .run(tauri::generate_context!())
         .expect("运行 tauri 应用出错");
 }
