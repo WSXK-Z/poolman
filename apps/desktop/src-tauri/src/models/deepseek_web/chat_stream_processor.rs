@@ -448,7 +448,7 @@ impl ChatStreamProcessor {
     }
     /// 命中调用闭合标志 `</｜｜DSML｜｜ invoke>`，且它确实是下一个标记时：标志与它之前的块内排版
     /// 一并消费，压入 `CallClose`（下一个该找 `<｜｜DSML｜｜ invoke` 或 `</｜｜DSML｜｜ calls>`）；
-    /// 标志还没到就先扣住，等下一段增量补齐。
+    /// 标志还没到就先扣住，等下一段增量补齐。闭合标志写成缺 `/` 的形态时见 [`Self::scan_close_without_slash`]。
     fn scan_call_close(&mut self) {
         match text_recognizer(INVOKE_CLOSE, &self.cache_response_buf) {
             Result::Ok(TextRecognizerResult::Finded(start, end))
@@ -463,9 +463,36 @@ impl ChatStreamProcessor {
             Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
                 // 尾巴是半个标记：扣住，等下一段增量补齐
             }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
+            // 完整闭合标志没找到、也没有半个标志：可能是模型少写了一个 `/`
+            Result::Ok(TextRecognizerResult::NotFinded) => self.scan_close_without_slash(),
             Err(_) => {}
         }
+    }
+
+    /// 闭合标志漏写 `/` 的形态：`<｜｜DSML｜｜ invoke>`。
+    ///
+    /// 这种标签没有 `name` 属性，当开标签用不了（拿不到工具名，客户端会判整次调用非法）；
+    /// 按闭合处理，前面收好的参数就都还归这次调用，不会因为少一个字符把整块作废。
+    /// 带 `name` 的同形标签是真正的开标签，交给正常路径。
+    fn scan_close_without_slash(&mut self) {
+        let Ok(TextRecognizerResult::Finded(start, end)) =
+            text_recognizer(INVOKE_OPEN, &self.cache_response_buf)
+        else {
+            return;
+        };
+        // 前面只允许块内排版：还有别的标记时交给那个标记先走
+        if !self.cache_response_buf[..start].trim().is_empty() {
+            return;
+        }
+        let rest = &self.cache_response_buf[end..];
+        let Some(gt) = rest.find('>') else {
+            return; // 标签还没写完：等下一段增量
+        };
+        if rest[..gt].contains("name") {
+            return;
+        }
+        self.cache_tag_stack.push(FunctionTag::CallClose);
+        self.cache_response_buf = rest[gt + 1..].to_string();
     }
     /// 命中整块闭合标志 `</｜｜DSML｜｜ calls>`，且它确实是下一个标记时：标志与它之前的块内排版
     /// 一并消费，压入 `CallsClose`（本块结束）；标志还没到就先扣住，等下一段增量补齐。
@@ -1155,7 +1182,7 @@ mod tests {
         assert!(logged.contains("a.rs"), "应打出参数：{}", logged);
     }
 
-    /// 工具调用写了一半断流也要落日志：打出解析停在哪一步，便于对照模型原文排查。
+    /// 工具调用写了一半断流也要落日志：打出接收原文与解析停在哪一步，便于对照模型原文排查。
     #[test]
     fn unclosed_call_logs_parse_position() {
         let logs = log_capture();
@@ -1163,15 +1190,14 @@ mod tests {
 
         let (_, sink) = collector();
         let mut processor = ChatStreamProcessor::new(sink, true);
-        processor.feed(vec![(
-            DeltaChunk::RESPONSE.to_string(),
-            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">".to_string(),
-        )]);
+        let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), half.to_string())]);
         processor.finish();
 
         // 只认这一轮之后新写进来的日志，别的用例（并行）的日志不算数
         let logged = String::from_utf8(logs.lock().unwrap()[start..].to_vec()).unwrap();
-        assert!(logged.contains("工具调用未写完"), "{}", logged);
+        assert!(logged.contains("工具调用解析失败"), "{}", logged);
+        assert!(logged.contains(half), "应打出接收到的原文：{}", logged);
         assert!(
             logged.contains("CallName(\"read_file\")"),
             "应打出停在哪一步：{}",
@@ -1354,6 +1380,57 @@ mod tests {
             Some(half),
             "坏块原文要留给修复链路"
         );
+    }
+
+    /// 闭标签漏写 `/`（写成 `<｜｜DSML｜｜ invoke>`）：按闭合处理，已收好的参数照常落进这次调用，
+    /// 不因为少一个字符把整块作废。
+    #[test]
+    fn slash_less_call_close_still_completes_the_call() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        // 与真实输出同形：块内多行、两个参数，最后的闭标签漏了斜杠
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls>\n",
+            "<｜｜DSML｜｜ invoke name=\"powershell\">\n",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">Get-Item 'd:\\\\a.exe' | Format-List</｜｜DSML｜｜ parameter>\n",
+            "<｜｜DSML｜｜ parameter name=\"description\" string=\"true\">Verify build artifacts exist</｜｜DSML｜｜ parameter>\n",
+            "<｜｜DSML｜｜ invoke>\n",
+            "</｜｜DSML｜｜ calls>\n",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap());
+        assert_eq!(calls.len(), 1, "漏写斜杠不该让整块作废：{:?}", calls);
+        assert_eq!(calls[0]["function"]["name"], "powershell");
+        let arguments: Value =
+            parse_json(calls[0]["function"]["arguments"].as_str().unwrap_or("{}"))
+                .expect("参数应是 JSON 对象");
+        assert_eq!(arguments["command"], "Get-Item 'd:\\a.exe' | Format-List");
+        assert_eq!(arguments["description"], "Verify build artifacts exist");
+        assert!(processor.parse_failure().is_none(), "不该判成解析失败");
+    }
+
+    /// 带 `name` 的同形标签是真正的开标签：不当闭合处理。
+    /// （这里前一次调用确实还差一个闭合标签，整块交给修复链路，不猜成一次调用。）
+    #[test]
+    fn named_invoke_open_is_not_taken_as_close() {
+        let (_seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls>",
+            "<｜｜DSML｜｜ invoke name=\"a\">",
+            "<｜｜DSML｜｜ parameter name=\"x\" string=\"true\">1</｜｜DSML｜｜ parameter>",
+            "<｜｜DSML｜｜ invoke name=\"b\">",
+            "<｜｜DSML｜｜ parameter name=\"y\" string=\"true\">2</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke>",
+            "</｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        assert!(processor.tool_calls().is_empty(), "不产出拼在一起的调用");
+        assert!(processor.parse_failure().is_some(), "整块交给修复链路");
     }
 
     /// 坏块原文从块的开边截起：块前的正文不算失败输入；标记被切成多段也能拼全。
