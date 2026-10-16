@@ -143,6 +143,17 @@ pub struct SseFrameProcessor {
     pending: String,
     /// 最近一次响应的消息 id：下轮请求的 parent_message_id 来源。
     message_id: Option<i64>,
+    /// 上游主动报错（`type: "error"` 的负载）：说明这轮为什么没有回答。
+    upstream_error: Option<UpstreamError>,
+}
+
+/// 上游在流里报告的失败（例如「达到对话长度上限」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpstreamError {
+    /// 上游给的原因，原样透出给调用方。
+    pub message: String,
+    /// 上游给的结束原因（如 `context_length_exceeded`），没给则为 None。
+    pub finish_reason: Option<String>,
 }
 
 impl SseFrameProcessor {
@@ -151,12 +162,18 @@ impl SseFrameProcessor {
             fragments: Vec::new(),
             pending: String::new(),
             message_id: None,
+            upstream_error: None,
         }
     }
 
     /// 最近一次响应的消息 id（流里没出现 id 帧时为 None）。
     pub fn message_id(&self) -> Option<i64> {
         self.message_id
+    }
+
+    /// 上游在流里报告的失败（没有则为 None）：这轮为什么没有回答。
+    pub fn upstream_error(&self) -> Option<&UpstreamError> {
+        self.upstream_error.as_ref()
     }
 
     /// 送入一段原始流增量，返回其中完整行产生的新增（片段类型, 内容）。
@@ -196,8 +213,29 @@ impl SseFrameProcessor {
         let Ok(value) = serde_json::from_str::<Value>(payload) else {
             return Vec::new();
         };
+        self.note_upstream_error(&value);
         self.apply(&value);
         self.take_deltas()
+    }
+
+    /// 记下上游主动报错的负载：`type` 为 `error`（例如达到对话长度上限）。
+    ///
+    /// 这类负载不带片段内容，靠它才知道「为什么这轮没有回答」。
+    fn note_upstream_error(&mut self, value: &Value) {
+        if value.get("type").and_then(Value::as_str) != Some("error") {
+            return;
+        }
+        self.upstream_error = Some(UpstreamError {
+            message: value
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or("上游报告错误")
+                .to_string(),
+            finish_reason: value
+                .get("finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
     }
 
     /// 把一帧并入片段表。
@@ -447,5 +485,49 @@ mod tests {
         let mut processor = SseFrameProcessor::new();
         processor.feed("data: {\"v\":\"x\"}\n  ");
         assert!(processor.finish().is_empty());
+    }
+
+    /// `type: "error"` 的负载：不带内容，但要作为「上游为什么没回答」记下来。
+    #[test]
+    fn error_payload_is_recorded() {
+        let mut processor = SseFrameProcessor::new();
+        let stream = concat!(
+            "event: ready\n",
+            "data: {\"request_message_id\":59,\"response_message_id\":60,\"model_type\":\"default\"}\n\n",
+            "event: hint\n",
+            "data: {\"type\":\"error\",\"content\":\"达到对话长度上限，请开启新对话\",\"clear_response\":true,\"finish_reason\":\"context_length_exceeded\"}\n\n",
+            "event: close\n",
+            "data: {\"click_behavior\":\"none\",\"auto_resume\":false}\n",
+        );
+        assert!(processor.feed(stream).is_empty(), "错误负载不产内容增量");
+
+        let error = processor.upstream_error().expect("应记下上游错误");
+        assert_eq!(error.message, "达到对话长度上限，请开启新对话");
+        assert_eq!(error.finish_reason.as_deref(), Some("context_length_exceeded"));
+        assert_eq!(processor.message_id(), Some(60));
+    }
+
+    /// 报错负载之后照样能解析正文：错误只是被记下来，不影响普通帧。
+    #[test]
+    fn content_frames_still_parse_after_error_payload() {
+        let mut processor = SseFrameProcessor::new();
+        let mut deltas = processor.feed(concat!(
+            "data: {\"type\":\"error\",\"content\":\"上游错误\"}\n\n",
+            "data: {\"p\":\"response/content\",\"v\":\"正文\"}\n",
+        ));
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas.remove(0).1, "正文");
+        assert_eq!(
+            processor.upstream_error().map(|error| error.message.as_str()),
+            Some("上游错误")
+        );
+    }
+
+    /// 不是报错的负载（例如搜索提示）不记成错误。
+    #[test]
+    fn non_error_payload_is_ignored() {
+        let mut processor = SseFrameProcessor::new();
+        processor.feed("data: {\"type\":\"info\",\"content\":\"正在搜索\"}\n\n");
+        assert!(processor.upstream_error().is_none());
     }
 }

@@ -285,6 +285,43 @@ impl DeepSeekWebModel {
         Ok(created)
     }
 
+    /// 网页端说这个会话到长度上限了：删掉它，按同一个标题补建一个新会话顶上。
+    ///
+    /// 池内会话是长期复用的，累积的历史会把网页上下文顶到上限；换个新会话等于清空那段历史，
+    /// 后续请求才有地方落。新会话沿用原槽位标题（`poolman_<序号>`），方便在网页端辨认和回收。
+    /// 不在池内的会话（外部会话）不动，返回 None。
+    pub(super) async fn recycle_pool_session(&self, session_id: &str) -> Result<Option<String>> {
+        let Some(slot) = self.pool_slot_of(session_id).await else {
+            return Ok(None);
+        };
+        let title = pool_title(slot as u32);
+        match self.delete_channel_session(session_id).await {
+            Ok(true) => info!("会话达到长度上限，已删除网页会话 {}", session_id),
+            Ok(false) => warn!("会话达到长度上限，删除网页会话 {} 未生效", session_id),
+            Err(error) => warn!("会话达到长度上限，删除网页会话 {} 失败: {}", session_id, error),
+        }
+        let created = self.create_pool_session(slot as u32).await?;
+        // 网页端在会话还没有内容时拒绝改名（EMPTY_CHAT_SESSION）：改不动就留给首轮对话成功后命名
+        match self.rename_channel_session(&created, &title).await {
+            Ok(true) => {
+                self.pool_titled.lock().unwrap().insert(created.clone());
+            }
+            Ok(false) => warn!("新会话 {} 标题设置未生效（期望 {}）", created, title),
+            Err(error) => warn!("新会话 {} 标题设置失败: {}", created, error),
+        }
+        {
+            let mut pool = self.pool.lock().await;
+            if let Some(entry) = pool.get_mut(slot) {
+                *entry = created.clone();
+            }
+        }
+        self.pool_titled.lock().unwrap().remove(session_id);
+        self.session_map.lock().unwrap().remove(session_id);
+        self.save_current_pool().await?;
+        info!("会话池槽位已换新会话 {}（原 {}）", created, session_id);
+        Ok(Some(created))
+    }
+
     /// 当前池的槽位表落库（未注入存储时跳过）：下标即槽位序号。
     async fn save_current_pool(&self) -> Result<()> {
         let Some(store) = &self.pool_store else {

@@ -26,9 +26,8 @@ use super::model::Model;
 use super::plugin::PluginModel;
 use super::pow::{build_pow_header, solve_pow};
 use crate::dump::DumpConfig;
-use crate::models::deepseek_web::chat_stream_processor::ChatStreamProcessor;
-use crate::models::deepseek_web::dsml_stream_parser::escape;
-use crate::models::deepseek_web::sse_frame_processor::SseFrameProcessor;
+use crate::models::deepseek_web::chat_stream_processor::{ChatStreamProcessor, ToolSchemas};
+use crate::models::deepseek_web::sse_frame_processor::{SseFrameProcessor, UpstreamError};
 
 /// 渠道标识。
 pub const CHANNEL: &str = "deepseek-web";
@@ -54,17 +53,17 @@ const CALLS_OPEN: &str = "<｜｜DSML｜｜ calls>";
 const CALLS_CLOSE: &str = "</｜｜DSML｜｜ calls>";
 
 /// 单次调用的开边前缀（后面接 `工具名">`）/ 闭边。
-const INVOKE_OPEN: &str = "<｜｜DSML｜｜ invoke name=\"";
+const INVOKE_OPEN: &str = "<｜｜DSML｜｜ invoke";
 const INVOKE_CLOSE: &str = "</｜｜DSML｜｜ invoke>";
 
 /// 参数的开边前缀（后面接 `参数名" string="…">`）/ 闭边。
-const PARAMETER_OPEN: &str = "<｜｜DSML｜｜ parameter name=\"";
+const PARAMETER_OPEN: &str = "<｜｜DSML｜｜ parameter";
 const PARAMETER_CLOSE: &str = "</｜｜DSML｜｜ parameter>";
 
 /// 工具调用格式与限定规则：网页版没有原生工具调用，靠这段文字约束模型按 DSML 标记输出调用。
 ///
-/// 标记形态必须与 [`DsmlStreamParser`](crate::models::deepseek_web::dsml_stream_parser::DsmlStreamParser)
-/// 认的一致，且与 [`DeepSeekWebModel::render_tool_calls`] 渲染历史调用的方式一致。
+/// 标记形态必须与 [`ChatStreamProcessor`] 认的一致，
+/// 且与 [`DeepSeekWebModel::render_tool_calls`] 渲染历史调用的方式一致。
 const TOOL_RULE: &str = r#"1. 需要调用工具时，调用写成 DSML 标记：整体包在 <｜｜DSML｜｜ calls> 与 </｜｜DSML｜｜ calls> 之间，一次调用一层 <｜｜DSML｜｜ invoke name="工具名"> 与 </｜｜DSML｜｜ invoke>，一个参数一条 <｜｜DSML｜｜ parameter name="参数名" string="true">参数值</｜｜DSML｜｜ parameter>，例如：
 <｜｜DSML｜｜ calls>
 <｜｜DSML｜｜ invoke name="read_file">
@@ -90,6 +89,9 @@ const POW_CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_po
 /// 网页版默认模型类型与思考开关。
 const MODEL_TYPE: &str = "default";
 const THINKING_ENABLED: bool = true;
+
+/// 网页端报告的「对话达到长度上限」结束原因：这个池内会话要换新。
+const CONTEXT_LIMIT_REASON: &str = "context_length_exceeded";
 
 /// DeepSeek 网页版模型。
 pub struct DeepSeekWebModel {
@@ -119,6 +121,14 @@ pub struct DeepSeekWebModel {
     concurrency: Concurrency,
     /// 分阶段落盘工具（响应）；None 表示不落盘。
     dump: Option<Arc<DumpConfig>>,
+}
+
+/// 反转义 [`ChatStreamProcessor`] 解析参数值用的转义：值里的 `\` 与 `"` 写成转义形态。
+///
+/// 渲染历史调用（[`DeepSeekWebModel::render_tool_calls`]）必须用它，否则同一个值渲染后再解析回来
+/// 会被反转义吃掉一层反斜杠（如 UNC 路径 `\\server\share` 变成 `\server\share`）。
+fn escape(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 impl DeepSeekWebModel {
@@ -490,10 +500,12 @@ impl DeepSeekWebModel {
                     "历史工具调用的 arguments 不是 JSON 对象，按无参还原：{}",
                     name
                 );
-                lines.push(format!("{INVOKE_OPEN}{name}\"{id}>{INVOKE_CLOSE}"));
+                lines.push(format!(
+                    "{INVOKE_OPEN} name=\"{name}\"{id}>{INVOKE_CLOSE}"
+                ));
                 continue;
             };
-            lines.push(format!("{INVOKE_OPEN}{name}\"{id}>"));
+            lines.push(format!("{INVOKE_OPEN} name=\"{name}\"{id}>"));
             for (key, value) in params {
                 // 字符串参数按解析端的反转义规则转义，保证渲染后再解析回来还是同一个值
                 let (flag, literal) = match value {
@@ -501,7 +513,7 @@ impl DeepSeekWebModel {
                     other => ("false", other.to_string()),
                 };
                 lines.push(format!(
-                    "{PARAMETER_OPEN}{key}\" string=\"{flag}\">{literal}{PARAMETER_CLOSE}"
+                    "{PARAMETER_OPEN} name=\"{key}\" string=\"{flag}\">{literal}{PARAMETER_CLOSE}"
                 ));
             }
             lines.push(INVOKE_CLOSE.to_string());
@@ -599,96 +611,70 @@ impl DeepSeekWebModel {
             .as_ref()
             .and_then(Value::as_array)
             .is_some_and(|items| !items.is_empty());
+        // 工具参数类型以请求里的 schema 为准：模型爱把数字、数组也标成字符串
+        let schemas = ToolSchemas::from_tools(request.tools.as_ref());
         let _slot_permit = self
             .gate
             .acquire()
             .await
             .map_err(|_| anyhow!("渠道并发闸门已关闭"))?;
-        let session_id = self.acquire_pool_slot().await?;
+        let mut session_id = self.acquire_pool_slot().await?;
         // 用之前核对：槽位上的会话若已被网页端删掉，这里会补建一个，别让整轮请求白跑
-        let session_id = self.ensure_pool_session(session_id).await?;
-        let parent_message_id = self.parent_message_id(&session_id);
-        info!(
-            "DeepSeek 网页推理 session={} parent_message_id={} prompt_len={}",
-            session_id,
-            parent_message_id,
-            prompt.len()
-        );
-        let channel_request = ChannelRequest {
-            url: COMPLETION_URL.to_string(),
-            method: "POST".to_string(),
-            headers: self.completion_headers(Some(&session_id)).await,
-            body: Some(self.completion_body(&session_id, &parent_message_id, &prompt)),
-            session_key: Some(session_id.clone()),
+        session_id = self.ensure_pool_session(session_id).await?;
+        // 增量出口只能移动一次，而「上下文到上限」时这一轮要换会话重跑：包一层共享单元转发，
+        // 每次尝试各取一个代理。
+        let sink_cell = Arc::new(Mutex::new(on_chunk));
+        let mut switched_session = false;
+        let mut round = loop {
+            let parent_message_id = self.parent_message_id(&session_id);
+            info!(
+                "DeepSeek 网页推理 session={} parent_message_id={} prompt_len={}",
+                session_id,
+                parent_message_id,
+                prompt.len()
+            );
+            let attempt = self
+                .run_completion_round(
+                    &session_id,
+                    &parent_message_id,
+                    &prompt,
+                    recognize_tools,
+                    &schemas,
+                    forwarding_sink(&sink_cell),
+                )
+                .await?;
+            // 网页端说上下文到顶了：这个池内会话的累积历史已经顶满。后台删掉它、按同标题换一个
+            // 新会话再跑一次，客户端看不到这次切换。
+            if !switched_session && hits_context_limit(&attempt) {
+                switched_session = true;
+                match self.recycle_pool_session(&session_id).await {
+                    Ok(Some(created)) => {
+                        info!(
+                            "网页上下文到上限，已换新会话 {}（原 {}）后重跑本轮",
+                            created, session_id
+                        );
+                        session_id = created;
+                        continue;
+                    }
+                    Ok(None) => {
+                        warn!("网页上下文到上限，但会话 {} 不在会话池内，未换新", session_id)
+                    }
+                    Err(error) => warn!("网页上下文到上限，换新会话失败: {}", error),
+                }
+            }
+            break attempt;
         };
-
-        let (text, reasoning, tool_calls, tool_call_raw, message_id, status, raw_body) =
-            match on_chunk {
-                Some(user_sink) => {
-                    // 帧处理器与增量处理器各自独立：闭包是 FnMut，跨 chunk 的状态用 Arc<Mutex> 共享。
-                    let frames = Arc::new(Mutex::new(SseFrameProcessor::new()));
-                    let processor = Arc::new(Mutex::new(ChatStreamProcessor::new(
-                        user_sink,
-                        recognize_tools,
-                    )));
-                    let feeder_frames = frames.clone();
-                    let feeder_processor = processor.clone();
-                    let response = self
-                        .executor
-                        .execute_stream(
-                            channel_request,
-                            Box::new(move |raw| {
-                                let (Ok(mut frames), Ok(mut processor)) =
-                                    (feeder_frames.lock(), feeder_processor.lock())
-                                else {
-                                    return;
-                                };
-                                processor.feed(frames.feed(&raw));
-                            }),
-                        )
-                        .await?;
-                    if !response.ok {
-                        anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
-                    }
-                    // 缓冲区里可能还留着没换行的尾巴：收尾时一并放出，再让处理器补完检测。
-                    let mut processor = processor.lock().unwrap();
-                    let (tail, message_id) = {
-                        let mut frames = frames.lock().unwrap();
-                        (frames.finish(), frames.message_id())
-                    };
-                    processor.feed(tail);
-                    processor.finish();
-                    let text = processor.text().to_string();
-                    let reasoning = processor.reasoning().to_string();
-                    let tool_calls = processor.tool_calls().to_vec();
-                    let tool_call_raw = processor.tool_call_raw().to_string();
-                    (
-                        text,
-                        reasoning,
-                        tool_calls,
-                        tool_call_raw,
-                        message_id,
-                        response.status,
-                        response.body,
-                    )
-                }
-                None => {
-                    let response = self.executor.execute(channel_request).await?;
-                    if !response.ok {
-                        anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
-                    }
-                    let (processor, message_id) = parse_sse_text(&response.body, recognize_tools);
-                    (
-                        processor.text().to_string(),
-                        processor.reasoning().to_string(),
-                        processor.tool_calls().to_vec(),
-                        processor.tool_call_raw().to_string(),
-                        message_id,
-                        response.status,
-                        response.body,
-                    )
-                }
-            };
+        let CompletionRound {
+            text,
+            reasoning,
+            tool_calls,
+            tool_call_raw,
+            leftover_markup,
+            upstream_error,
+            message_id,
+            status,
+            raw_body,
+        } = round;
         // 记下本轮响应的消息 id：下一轮请求的 parent_message_id 靠它接上服务端的消息链。
         self.remember_message_id(&session_id, message_id);
 
@@ -753,12 +739,39 @@ impl DeepSeekWebModel {
             }
         }
         if text.trim().is_empty() && !has_calls {
-            warn!(
-                "网页回答为空：session={} status={} 未解析出正文与工具调用，原始响应：{}",
-                session_id,
-                status,
-                raw_body.chars().take(300).collect::<String>()
-            );
+            // 整块（非流式）时响应体在手上；流式没有响应体，只能靠日志说明这轮没内容
+            let raw = head_chars(&raw_body, 300);
+            if let Some(upstream) = upstream_error {
+                // 换会话重跑过还是这个错：把上游原因原样报给调用方（例如提示词本身就超长，
+                // 只能由调用方缩短），别只说「空回答」让它无从判断。
+                let reason = match upstream.finish_reason.as_deref() {
+                    Some(reason) => format!("{}（{}）", upstream.message, reason),
+                    None => upstream.message.clone(),
+                };
+                warn!(
+                    "网页上游报错：session={} status={} message={}",
+                    session_id, status, reason
+                );
+                anyhow::bail!("{}", reason);
+            }
+            if leftover_markup.is_empty() {
+                warn!(
+                    "网页回答为空：session={} status={} 未解析出正文与工具调用，原始响应：{}",
+                    session_id, status, raw
+                );
+            } else {
+                // 块开了却没写完：残料既不能当正文也不能当调用，只能说明「这轮没有可用回答」
+                warn!(
+                    "网页工具调用未闭合：session={} status={} 残料：{}",
+                    session_id,
+                    status,
+                    head_chars(&leftover_markup, 300)
+                );
+                anyhow::bail!(
+                    "网页返回的工具调用未闭合（DSML 块被截断）：{}",
+                    head_chars(&leftover_markup, 200)
+                );
+            }
         } else {
             // 会话这时才有内容，网页端接受改名：把池内会话命名成 poolman_<槽位序号>。
             self.ensure_pool_title(&session_id).await;
@@ -780,6 +793,154 @@ impl DeepSeekWebModel {
             is_complete: true,
         })
     }
+
+    /// 跑一轮网页推理：发完成请求，按流式（`on_chunk` 为 Some）或整块收结果，
+    /// 返回解析产物与排查用的原文证据。
+    ///
+    /// 会话与父消息 id 由调用方给定：同一个会话在「上下文到上限」后会被换成新的再跑一轮。
+    async fn run_completion_round(
+        &self,
+        session_id: &str,
+        parent_message_id: &Value,
+        prompt: &str,
+        recognize_tools: bool,
+        schemas: &ToolSchemas,
+        on_chunk: Option<ChunkSink>,
+    ) -> Result<CompletionRound> {
+        let channel_request = ChannelRequest {
+            url: COMPLETION_URL.to_string(),
+            method: "POST".to_string(),
+            headers: self.completion_headers(Some(session_id)).await,
+            body: Some(self.completion_body(session_id, parent_message_id, prompt)),
+            session_key: Some(session_id.to_string()),
+        };
+
+        let (text, reasoning, tool_calls, tool_call_raw, leftover_markup, upstream_error, message_id, status, raw_body) =
+            match on_chunk {
+                Some(user_sink) => {
+                    // 帧处理器与增量处理器各自独立：闭包是 FnMut，跨 chunk 的状态用 Arc<Mutex> 共享。
+                    let frames = Arc::new(Mutex::new(SseFrameProcessor::new()));
+                    let processor = Arc::new(Mutex::new(
+                        ChatStreamProcessor::new(user_sink, recognize_tools)
+                            .with_tool_schemas(schemas.clone()),
+                    ));
+                    let feeder_frames = frames.clone();
+                    let feeder_processor = processor.clone();
+                    let response = self
+                        .executor
+                        .execute_stream(
+                            channel_request,
+                            Box::new(move |raw| {
+                                let (Ok(mut frames), Ok(mut processor)) =
+                                    (feeder_frames.lock(), feeder_processor.lock())
+                                else {
+                                    return;
+                                };
+                                processor.feed(frames.feed(&raw));
+                            }),
+                        )
+                        .await?;
+                    if !response.ok {
+                        anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
+                    }
+                    // 缓冲区里可能还留着没换行的尾巴：收尾时一并放出，再让处理器补完检测。
+                    let mut processor = processor.lock().unwrap();
+                    let (tail, message_id, upstream_error) = {
+                        let mut frames = frames.lock().unwrap();
+                        (
+                            frames.finish(),
+                            frames.message_id(),
+                            frames.upstream_error().cloned(),
+                        )
+                    };
+                    processor.feed(tail);
+                    processor.finish();
+                    (
+                        processor.text().to_string(),
+                        processor.reasoning().to_string(),
+                        processor.tool_calls().to_vec(),
+                        processor.tool_call_raw().to_string(),
+                        processor.leftover_markup().to_string(),
+                        upstream_error,
+                        message_id,
+                        response.status,
+                        response.body,
+                    )
+                }
+                None => {
+                    let response = self.executor.execute(channel_request).await?;
+                    if !response.ok {
+                        anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
+                    }
+                    let (processor, message_id, upstream_error) =
+                        parse_sse_text(&response.body, recognize_tools, schemas);
+                    (
+                        processor.text().to_string(),
+                        processor.reasoning().to_string(),
+                        processor.tool_calls().to_vec(),
+                        processor.tool_call_raw().to_string(),
+                        processor.leftover_markup().to_string(),
+                        upstream_error,
+                        message_id,
+                        response.status,
+                        response.body,
+                    )
+                }
+            };
+        Ok(CompletionRound {
+            text,
+            reasoning,
+            tool_calls,
+            tool_call_raw,
+            leftover_markup,
+            upstream_error,
+            message_id,
+            status,
+            raw_body,
+        })
+    }
+}
+
+/// 一轮推理的产物：解析出的内容 + 上游报错 + 排查用的原文证据。
+struct CompletionRound {
+    text: String,
+    reasoning: String,
+    tool_calls: Vec<Value>,
+    tool_call_raw: String,
+    leftover_markup: String,
+    upstream_error: Option<UpstreamError>,
+    message_id: Option<i64>,
+    status: u16,
+    raw_body: String,
+}
+
+/// 这一轮是不是「网页端说上下文到上限」：换会话重跑的信号。
+fn hits_context_limit(round: &CompletionRound) -> bool {
+    round.text.trim().is_empty()
+        && round.tool_calls.is_empty()
+        && round
+            .upstream_error
+            .as_ref()
+            .and_then(|error| error.finish_reason.as_deref())
+            == Some(CONTEXT_LIMIT_REASON)
+}
+
+/// 取一个把增量转发到同一个出口的代理；请求不带出口时返回 None。
+///
+/// 出口（[`ChunkSink`]）只能移动一次，而「上下文到上限」时同一轮要换会话重跑，
+/// 因此每次尝试各取一个代理，统一转发到最初那个出口。
+fn forwarding_sink(cell: &Arc<Mutex<Option<ChunkSink>>>) -> Option<ChunkSink> {
+    if !cell.lock().map(|guard| guard.is_some()).unwrap_or(false) {
+        return None;
+    }
+    let cell = cell.clone();
+    Some(Box::new(move |delta: String| {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(sink) = guard.as_mut() {
+                sink(delta);
+            }
+        }
+    }))
 }
 
 /// 响应阶段落盘快照（开发期排查用）：网页返回经 `SseFrameProcessor` 解析后的内容。
@@ -988,16 +1149,30 @@ fn is_biz_ok(json: &Value) -> bool {
     code_ok && biz_ok
 }
 
+/// 取正文开头（按字符截断，不切断多字节字符）。
+fn head_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
 /// 解析整段响应文本（非流式情形）：返回收尾后的增量处理器（供读取正文 / 思考 / 工具调用）
 /// 与响应消息 id（供下轮 `parent_message_id`）。
-fn parse_sse_text(body: &str, recognize_tools: bool) -> (ChatStreamProcessor, Option<i64>) {
+fn parse_sse_text(
+    body: &str,
+    recognize_tools: bool,
+    schemas: &ToolSchemas,
+) -> (ChatStreamProcessor, Option<i64>, Option<UpstreamError>) {
     let mut frames = SseFrameProcessor::new();
-    let mut processor = ChatStreamProcessor::new(Box::new(|_| {}), recognize_tools);
+    let mut processor =
+        ChatStreamProcessor::new(Box::new(|_| {}), recognize_tools).with_tool_schemas(schemas.clone());
     processor.feed(frames.feed(body));
     // 整段文本的最后一行可能没有换行符，收尾时补处理。
     processor.feed(frames.finish());
     processor.finish();
-    (processor, frames.message_id())
+    (
+        processor,
+        frames.message_id(),
+        frames.upstream_error().cloned(),
+    )
 }
 
 /// 按 RFC 3986 对查询参数值做百分号编码。
@@ -1016,7 +1191,7 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::session_pool::POOL_TITLE_PREFIX;
-    use super::{DeepSeekWebModel, CHANNEL, PROMPT_PREFIX};
+    use super::{DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL, PROMPT_PREFIX};
     use crate::models::defs::{
         ChannelExecutor, ChannelRequest, ChannelResponse, ChunkSink, InferRequest, PooledSession,
         SessionPoolStore,
@@ -1046,7 +1221,17 @@ mod tests {
         created: AtomicUsize,
         /// 会话列表取不到（模拟「启动时插件还没连上」）。
         list_unavailable: AtomicBool,
+        /// 首个完成请求返回「上下文到长度上限」，之后恢复正常回答
+        /// （模拟网页端在那个会话上顶到上限，换成新会话后就能答）。
+        limit_first_completion: AtomicBool,
     }
+
+    /// 「上下文到长度上限」的响应体：网页端在 hint 负载里给出原因与结束原因。
+    const LIMIT_BODY: &str = concat!(
+        "event: ready\n",
+        "data: {\"request_message_id\":59,\"response_message_id\":60,\"model_type\":\"default\"}\n\n",
+        "data: {\"type\":\"error\",\"content\":\"达到对话长度上限，请开启新对话\",\"clear_response\":true,\"finish_reason\":\"context_length_exceeded\"}\n",
+    );
 
     impl MockExecutor {
         /// 会话 id 形如 `sess-00000000`，长度足以通过渠道侧的会话 id 校验。
@@ -1211,6 +1396,13 @@ mod tests {
                         }
                         json!({ "code": 0, "data": { "biz_code": 0 } }).to_string()
                     }
+                } else if request.url.contains("chat/completion") {
+                    // 完成请求：首个按「上下文到长度上限」回（与流式路径同一个开关）
+                    if self.limit_first_completion.swap(false, Ordering::SeqCst) {
+                        LIMIT_BODY.to_string()
+                    } else {
+                        self.completion_body.clone()
+                    }
                 } else {
                     self.completion_body.clone()
                 };
@@ -1234,7 +1426,13 @@ mod tests {
             on_chunk: ChunkSink,
         ) -> BoxFuture<'_, anyhow::Result<ChannelResponse>> {
             Box::pin(async move {
-                let body = self.completion_body.clone();
+                // 首个完成请求按「上下文到长度上限」回，之后恢复正常回答。
+                let limited = self.limit_first_completion.swap(false, Ordering::SeqCst);
+                let body = if limited {
+                    LIMIT_BODY.to_string()
+                } else {
+                    self.completion_body.clone()
+                };
                 let mut on_chunk = on_chunk;
                 if self.stream_chunk == 0 {
                     on_chunk(body.clone());
@@ -1277,6 +1475,7 @@ mod tests {
             sessions: Mutex::new(BTreeMap::new()),
             created: AtomicUsize::new(0),
             list_unavailable: AtomicBool::new(false),
+            limit_first_completion: AtomicBool::new(false),
         })
     }
 
@@ -1418,7 +1617,7 @@ mod tests {
     /// 流式：正文增量按序回吐，最终结果累计完整。
     #[tokio::test]
     async fn infer_stream_emits_deltas() {
-        // 正文要扣到上限（`ChatStreamProcessor::BODY_HOLD_BACK`）才往下流，这里给足长度
+        // 正文边到边发：第一段够长，足以在流中就看到内容
         let first = "第一".repeat(70);
         let body = format!(
             "data: {{\"p\":\"response/content\",\"v\":\"{first}\"}}\n\
@@ -1444,7 +1643,7 @@ mod tests {
         assert_eq!(contents, vec![first, "第二".to_string()]);
     }
 
-    /// 非流式：正文里的 DSML 工具调用解析成 tool_calls；有调用时这条回答不带正文。
+    /// 非流式：正文里的 DSML 工具调用解析成 tool_calls；调用之前的正文照常返回，之后的不返回。
     #[tokio::test]
     async fn infer_extracts_tool_calls_from_dsml() {
         let body = content_frame("先读文件")
@@ -1458,7 +1657,7 @@ mod tests {
             .await
             .expect("推理应成功");
 
-        assert_eq!(response.text, "", "有工具调用时只输出工具调用");
+        assert_eq!(response.text, "先读文件", "调用之前的正文照常返回");
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
         let calls = response.tool_calls.expect("应解析出工具调用");
         assert_eq!(calls.as_array().unwrap().len(), 1);
@@ -1483,17 +1682,127 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     }
 
-    /// 块没闭合（模型写一半断了）时按正文回吐，不吞掉模型输出。
+    /// 块没闭合（模型写一半断了）时这轮没有可用回答：报明原因，不把写坏的标记当回答发出去。
     #[tokio::test]
-    async fn infer_falls_back_when_dsml_is_unclosed() {
+    async fn infer_reports_when_dsml_is_unclosed() {
         let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
-        let response = model(&content_frame(half))
+        let error = model(&content_frame(half))
             .infer(tool_request())
             .await
-            .expect("推理应成功");
+            .expect_err("截断的工具调用要报错，不能当成普通正文");
 
-        assert_eq!(response.text, half);
-        assert!(response.tool_calls.is_none());
+        assert!(
+            error.to_string().contains("未闭合"),
+            "错误信息要说明工具调用被截断: {}",
+            error
+        );
+    }
+
+    /// 上游用 `event: hint` 说明这轮为什么没有回答（例如达到对话长度上限）：
+    /// 原样报给调用方，而不是只回一条空回答。
+    #[tokio::test]
+    async fn infer_reports_upstream_hint_error() {
+        let body = concat!(
+            "event: ready\n",
+            "data: {\"request_message_id\":59,\"response_message_id\":60,\"model_type\":\"default\"}\n\n",
+            "event: hint\n",
+            "data: {\"type\":\"error\",\"content\":\"达到对话长度上限，请开启新对话\",\"clear_response\":true,\"finish_reason\":\"context_length_exceeded\"}\n\n",
+            "event: close\n",
+            "data: {\"click_behavior\":\"none\",\"auto_resume\":false}\n",
+        );
+        let error = model(body)
+            .infer(user_request())
+            .await
+            .expect_err("上游报错时要报错，不能返回空回答");
+
+        let message = error.to_string();
+        assert!(message.contains("达到对话长度上限"), "{}", message);
+        assert!(message.contains("context_length_exceeded"), "{}", message);
+    }
+
+    /// 网页端说达到对话长度上限：后台删掉这个池内会话、换一个同标题的新会话重跑一轮，
+    /// 客户端只看到正常回答（无感切换）。
+    #[tokio::test]
+    async fn context_limit_error_switches_session_transparently() {
+        let executor = executor(&content_frame("答"), 0);
+        executor.seed_session("sess-full", &format!("{POOL_TITLE_PREFIX}1"));
+        let store = Arc::new(MemoryStore::default());
+        store.slots.lock().unwrap().insert(
+            CHANNEL.to_string(),
+            vec![PooledSession {
+                slot: 0,
+                session_id: "sess-full".to_string(),
+            }],
+        );
+        // 第一个完成请求撞长度上限，换会话后恢复正常回答
+        executor
+            .limit_first_completion
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let model = pooled_model(&executor, &store, 1);
+        let response = model
+            .infer(user_request())
+            .await
+            .expect("换会话后应正常回答，不向客户端报错");
+        assert_eq!(response.text, "答");
+
+        let slots = stored_sessions(&store);
+        assert_eq!(slots.len(), 1);
+        assert_ne!(slots[0], "sess-full", "顶到上限的会话要被换掉");
+        assert!(
+            !executor.sessions().contains_key("sess-full"),
+            "旧会话应从网页端删除：{:?}",
+            executor.sessions()
+        );
+        // 两次完成请求落在不同会话上：第一次是旧会话，第二次是换新的那个
+        let completions: Vec<String> = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/chat/completion"))
+            .map(|request| request.body.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(completions.len(), 2, "撞上限后应重跑一轮");
+        assert!(
+            completions[0].contains("sess-full") && !completions[1].contains("sess-full"),
+            "第二轮必须换到新会话上"
+        );
+        assert!(
+            executor.rename_count() >= 1,
+            "新会话要按原槽位标题命名（网页端拒绝空会话改名时留给首轮成功后补）"
+        );
+    }
+
+    /// 换会话重跑后仍然撞上限（提示词本身就超长）：这轮报错，把上游原因交给调用方。
+    #[tokio::test]
+    async fn context_limit_error_after_switch_reports_upstream_reason() {
+        let executor = executor(LIMIT_BODY, 0);
+        executor.seed_session("sess-full", &format!("{POOL_TITLE_PREFIX}1"));
+        let store = Arc::new(MemoryStore::default());
+        store.slots.lock().unwrap().insert(
+            CHANNEL.to_string(),
+            vec![PooledSession {
+                slot: 0,
+                session_id: "sess-full".to_string(),
+            }],
+        );
+
+        let error = pooled_model(&executor, &store, 1)
+            .infer(user_request())
+            .await
+            .expect_err("换会话后还是超长只能报错");
+        assert!(error.to_string().contains("达到对话长度上限"), "{}", error);
+        // 只重跑一次，不无限换会话
+        let completions = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.ends_with("/chat/completion"))
+            .count();
+        assert_eq!(completions, 2, "只重跑一次");
+        assert_ne!(stored_sessions(&store)[0], "sess-full");
     }
 
     /// 多个 DSML 块 → 多个工具调用。
@@ -1524,7 +1833,7 @@ mod tests {
     }
 
     /// 流式：DSML 标记被任意边界切开也不外泄给客户端，收尾增量里给出工具调用；
-    /// 这条回答只有工具调用，调用前后的正文都不发。
+    /// 调用之前的正文照常发，之后的正文不发。
     #[tokio::test]
     async fn infer_stream_hides_markup_and_reports_tool_calls() {
         let markup = dsml_calls(&[dsml_invoke("read_file", &[("path", "a.rs")])]);
@@ -1544,13 +1853,13 @@ mod tests {
             .iter()
             .map(|delta| crate::apis::base::parse_delta(delta).content)
             .collect();
-        assert_eq!(contents, "", "有工具调用时正文不发、标记也不外泄");
+        assert_eq!(contents, "先读文件", "调用之前的正文照常发、标记不外泄");
         assert!(
             deltas.iter().any(|delta| delta.contains("read_file")),
             "应有承载工具调用的增量：{:?}",
             deltas
         );
-        assert_eq!(response.text, "");
+        assert_eq!(response.text, "先读文件");
         assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(
             response.tool_calls.unwrap()[0]["function"]["name"],
@@ -1590,40 +1899,6 @@ mod tests {
             .map(|delta| crate::apis::base::parse_delta(delta).content)
             .collect();
         assert_eq!(contents, "尾");
-    }
-
-    /// 流式：DSML 标记跨多个真实协议帧拼接，标记被吃掉不外泄；有调用时正文整条不发。
-    #[tokio::test]
-    async fn infer_stream_joins_markup_across_frames() {
-        let body = concat!(
-            "data: {\"v\":{\"response\":{\"message_id\":8,\"fragments\":[{\"type\":\"RESPONSE\",\"content\":\"\"}]}}}\n",
-            "data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\"前\"}\n",
-            "data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\"<｜｜DSML｜｜ invoke name=\\\"read\"}\n",
-            "data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\"_file\\\"><｜｜DSML｜｜ parameter name=\\\"path\\\" string=\\\"true\\\">a.rs</｜｜DSML｜｜ parameter>\"}\n",
-            "data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\"</｜｜DSML｜｜ invoke>\"}\n",
-            "data: {\"p\":\"response/fragments/0/content\",\"o\":\"APPEND\",\"v\":\"后\"}\n",
-        );
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        let response = model_split(body, 5)
-            .infer_stream(
-                tool_request(),
-                Box::new(move |delta| sink.lock().unwrap().push(delta)),
-            )
-            .await
-            .expect("流式推理应成功");
-
-        let contents: String = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|delta| crate::apis::base::parse_delta(delta).content)
-            .collect();
-        assert_eq!(contents, "", "有工具调用时正文不发、标记也不外泄");
-        assert_eq!(response.text, "");
-        let calls = response.tool_calls.expect("应解析出工具调用");
-        assert_eq!(calls[0]["function"]["name"], "read_file");
-        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
     }
 
     /// `parent_message_id` 接上服务端的消息链：首轮为 null，之后用上一轮响应的消息 id。
@@ -2298,20 +2573,19 @@ mod tests {
             ]
         });
         let markup = DeepSeekWebModel::render_tool_calls(&message).join("\n");
+        let processor = parse_sse_text(&content_frame(&markup), true, &ToolSchemas::default()).0;
 
-        let mut parser = crate::models::deepseek_web::dsml_stream_parser::DsmlStreamParser::new();
-        let mut events = Vec::new();
-        parser.feed(&markup, &mut events);
-        parser.finish(&mut events);
-
-        let calls = parser.calls();
+        let calls = processor.tool_calls();
         assert_eq!(calls.len(), 2, "渲染的标记应还原成两个调用：{markup}");
-        assert_eq!(calls[0].name, "read_file");
-        assert_eq!(calls[0].arguments["path"], json!("a.rs"));
-        assert_eq!(calls[1].name, "view");
-        assert_eq!(calls[1].arguments["path"], json!("b.rs"));
-        assert_eq!(calls[1].arguments["view_range"], json!([320, 400]));
-        assert_eq!(calls[1].arguments["raw"], json!(true));
+        let arguments = |index: usize| -> Value {
+            serde_json::from_str(calls[index]["function"]["arguments"].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(calls[0]["function"]["name"], "read_file");
+        assert_eq!(arguments(0)["path"], json!("a.rs"));
+        assert_eq!(calls[1]["function"]["name"], "view");
+        assert_eq!(arguments(1)["path"], json!("b.rs"));
+        assert_eq!(arguments(1)["view_range"], json!([320, 400]));
+        assert_eq!(arguments(1)["raw"], json!(true));
     }
 
     /// 落盘关闭时模型侧不产出任何文件：响应与工具调用两条落盘路径都跳过，链路照常返回结果。
@@ -2329,7 +2603,7 @@ mod tests {
             DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>).with_dump(dump);
 
         let response = model.infer(tool_request()).await.expect("推理应成功");
-        assert_eq!(response.text, "", "有工具调用时只输出工具调用");
+        assert_eq!(response.text, "答", "调用之前的正文照常返回");
         assert_eq!(
             response.tool_calls.unwrap()[0]["function"]["name"],
             "read_file"
@@ -2758,7 +3032,7 @@ mod tests {
         );
         let response = model(body).infer(tool_request()).await.expect("推理应成功");
 
-        assert_eq!(response.text, "", "有工具调用时正文不发，标记也不进正文");
+        assert_eq!(response.text, "先读文件", "调用之前的正文照常返回，标记不进正文");
         assert_eq!(response.reasoning.as_deref(), Some("想"), "思考单独返回");
         let calls = response.tool_calls.expect("应解析出工具调用");
         assert_eq!(calls[0]["function"]["name"], "read_file");
