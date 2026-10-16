@@ -37,7 +37,7 @@ const menuOptions = [
       <n-layout has-sider style="height: 100vh">
         <n-layout-sider bordered width="200" :native-scrollbar="false">
           <div class="brand">
-            <span class="brand-dot" /> 穷门
+            <span class="brand-dot" /> poolman
           </div>
           <n-menu v-model:value="activeMenu" :options="menuOptions" />
         </n-layout-sider>
