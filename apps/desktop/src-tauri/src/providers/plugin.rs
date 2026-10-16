@@ -13,14 +13,23 @@ use anyhow::Result;
 use futures_util::future::BoxFuture;
 
 use super::defs::{ChatProvider, ModelDescriptor};
-use crate::extension::provider_control::ProviderControl;
 use crate::models::{Concurrency, InferRequest, ModelResponse, PluginModel};
+use crate::providers::provider_control::ProviderControl;
 
 /// 插件供应商的稳定标识。
 pub const PLUGIN_PROVIDER_ID: &str = "plugin";
 
 /// 插件供应商对外展示名。
 pub const PLUGIN_PROVIDER_NAME: &str = "浏览器模型代理";
+
+/// 渠道并发设置在模型行配置里的键（`models.config.concurrency`）。
+pub const CHANNEL_CONCURRENCY_KEY: &str = "concurrency";
+
+/// 渠道默认并发：网页渠道本身支持并发的不同会话，默认预建这个数量的会话。
+pub const DEFAULT_CHANNEL_CONCURRENCY: u32 = 5;
+
+/// 渠道并发上限：配置写错时避免一次性建出过多网页会话。
+pub const MAX_CHANNEL_CONCURRENCY: u32 = 10;
 
 /// 一条对外模型目录项：对外模型名（别名）→ 承载它的网页渠道。
 #[derive(Debug, Clone, Copy)]
@@ -83,6 +92,20 @@ pub fn channel_label(channel: &str) -> &str {
         "qwen-web" => "通义千问",
         other => other,
     }
+}
+
+/// 渠道并发设置：取该渠道各模型行配置里的最大值，缺失用默认值，并夹到上限内。
+pub fn channel_concurrency(rows: &[super::manager::Model], channel: &str) -> u32 {
+    rows.iter()
+        .filter(|row| row.channel == channel)
+        .filter_map(|row| {
+            row.config
+                .get(CHANNEL_CONCURRENCY_KEY)
+                .and_then(serde_json::Value::as_u64)
+        })
+        .max()
+        .map(|value| value.clamp(1, MAX_CHANNEL_CONCURRENCY as u64) as u32)
+        .unwrap_or(DEFAULT_CHANNEL_CONCURRENCY)
 }
 
 /// 插件供应商。
@@ -169,11 +192,16 @@ impl ChatProvider for PluginProvider {
 #[cfg(test)]
 mod tests {
     use super::{platform_for, PluginProvider, WEB_MODELS};
-    use crate::extension::provider_control::ProviderControl;
     use crate::models::model::Model;
     use crate::models::defs::ModelCapability;
     use crate::models::{Concurrency, InferRequest, ModelResponse, PluginModel};
     use crate::providers::defs::ChatProvider;
+    use crate::providers::plugin::{
+        channel_concurrency, CHANNEL_CONCURRENCY_KEY, DEFAULT_CHANNEL_CONCURRENCY,
+        MAX_CHANNEL_CONCURRENCY,
+    };
+    use crate::providers::provider_control::ProviderControl;
+    use serde_json::json;
     use anyhow::Result;
     use futures_util::future::BoxFuture;
     use serde_json::Value;
@@ -295,6 +323,69 @@ mod tests {
     #[test]
     fn unlisted_model_falls_back_to_itself() {
         assert_eq!(platform_for("custom-model"), "custom-model");
+    }
+
+    /// 渠道并发设置：取该渠道各模型行配置的最大值，缺失用默认值，并夹到上限内。
+    #[test]
+    fn channel_concurrency_reads_model_config() {
+        fn row(channel: &str, config: serde_json::Value) -> crate::providers::manager::Model {
+            crate::providers::manager::Model {
+                id: format!("{}-{}", channel, config),
+                provider_id: "plugin".to_string(),
+                channel: channel.to_string(),
+                display_name: channel.to_string(),
+                enabled: true,
+                status: "inactive".to_string(),
+                config,
+                created_at: 0,
+                updated_at: 0,
+            }
+        }
+
+        let rows = vec![
+            row("deepseek-web", json!({})),
+            row("deepseek-web", json!({ (CHANNEL_CONCURRENCY_KEY): 7 })),
+            row("deepseek-web", json!({ (CHANNEL_CONCURRENCY_KEY): 2 })),
+            row("chatgpt-web", json!({ (CHANNEL_CONCURRENCY_KEY): 9 })),
+        ];
+        // 同一渠道多行取最大
+        assert_eq!(channel_concurrency(&rows, "deepseek-web"), 7);
+        // 有配置的渠道按配置走
+        assert_eq!(channel_concurrency(&rows, "chatgpt-web"), 9);
+        // 没记录的渠道用默认值
+        assert_eq!(
+            channel_concurrency(&rows, "kimi-web"),
+            DEFAULT_CHANNEL_CONCURRENCY
+        );
+        assert_eq!(DEFAULT_CHANNEL_CONCURRENCY, 5, "默认并发为 5");
+        // 配置越界与非法值都被夹住
+        assert_eq!(
+            channel_concurrency(
+                &[row("kimi-web", json!({ (CHANNEL_CONCURRENCY_KEY): 0 }))],
+                "kimi-web"
+            ),
+            1
+        );
+        assert_eq!(
+            channel_concurrency(
+                &[row(
+                    "kimi-web",
+                    json!({ (CHANNEL_CONCURRENCY_KEY): MAX_CHANNEL_CONCURRENCY + 5 })
+                )],
+                "kimi-web"
+            ),
+            MAX_CHANNEL_CONCURRENCY
+        );
+        assert_eq!(
+            channel_concurrency(
+                &[row(
+                    "kimi-web",
+                    json!({ (CHANNEL_CONCURRENCY_KEY): "many" })
+                )],
+                "kimi-web"
+            ),
+            DEFAULT_CHANNEL_CONCURRENCY
+        );
     }
 
     /// 插件供应商：别名路由到渠道模型执行、覆盖全部对外模型、遵守启停、缺渠道报错。

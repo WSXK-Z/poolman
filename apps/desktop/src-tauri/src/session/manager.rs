@@ -9,7 +9,7 @@ use sea_orm::{
 };
 use serde::Serialize;
 
-use super::entity::{converted_message, raw_message, session};
+use crate::entitys::{converted_message, raw_message, session};
 
 /// 会话（列表用）
 #[derive(Debug, Clone, Serialize)]

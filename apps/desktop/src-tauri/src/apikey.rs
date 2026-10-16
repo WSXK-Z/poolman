@@ -4,11 +4,10 @@
 //! 外部用户连接时携带该 Key，网关据此调用对应平台的转换器。
 
 use anyhow::Result;
-use sea_orm::entity::prelude::*;
-use sea_orm::{
-    ActiveModelTrait, Database, DatabaseConnection, DeleteResult, EntityTrait, Set,
-};
+use sea_orm::{ActiveModelTrait, Database, DatabaseConnection, DeleteResult, EntityTrait, Set};
 use serde::{Deserialize, Serialize};
+
+use crate::entitys::api_key::{ActiveModel, Entity, Model};
 
 /// 已创建的 API Key
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -21,22 +20,6 @@ pub struct ApiKey {
     #[serde(default)]
     pub note: String,
 }
-
-/// sea-orm 实体：api_keys 表
-#[derive(Clone, Debug, PartialEq, DeriveEntityModel)]
-#[sea_orm(table_name = "api_keys")]
-pub struct Model {
-    #[sea_orm(primary_key, auto_increment = false)]
-    pub key: String,
-    pub platform: String,
-    pub created_at: i64,
-    pub note: String,
-}
-
-#[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
-
-impl ActiveModelBehavior for ActiveModel {}
 
 impl From<Model> for ApiKey {
     fn from(m: Model) -> Self {
@@ -60,10 +43,7 @@ impl ApiKeyStore {
         let url = format!("sqlite://{}?mode=rwc", db_path);
         let db = Database::connect(&url).await?;
         // 将数据库架构与实体定义同步：缺失的表/列/索引自动创建（幂等）
-        db.get_schema_builder()
-            .register(Entity)
-            .sync(&db)
-            .await?;
+        db.get_schema_builder().register(Entity).sync(&db).await?;
         Ok(Self { db })
     }
 

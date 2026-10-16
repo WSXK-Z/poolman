@@ -2,10 +2,11 @@
 //!
 //! 负责「有哪些供应商、各自提供哪些模型」的定义与持久化，并保存供应商启停、
 //! 模型启停与模型状态。运行期模型实例（渠道适配器 + 执行器）由工厂按这里的行构建。
-//! 请求路由期的启停快照由 `extension::provider_control::ProviderControl` 维护。
+//! 请求路由期的启停快照由 `providers::provider_control::ProviderControl` 维护。
 
 use anyhow::Result;
 use std::collections::HashMap;
+use futures_util::future::BoxFuture;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DeleteResult, EntityTrait, QueryFilter,
     QueryOrder, Set,
@@ -14,7 +15,8 @@ use sea_orm::sea_query::Expr;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::entity::{model as model_entity, provider};
+use crate::entitys::{model as model_entity, provider, web_session};
+use crate::models::defs::{PooledSession, SessionPoolStore};
 
 /// 供应商实例（对外视图）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +100,7 @@ impl ProviderManager {
         db.get_schema_builder()
             .register(provider::Entity)
             .register(model_entity::Entity)
+            .register(web_session::Entity)
             .sync(&db)
             .await?;
         Ok(Self { db })
@@ -326,11 +329,68 @@ impl ProviderManager {
             .await?;
         Ok(result.rows_affected)
     }
+
+    // ---------- 网页渠道会话池 ----------
+
+    /// 读取某渠道已登记的会话池槽位（按槽位序号）。
+    pub async fn list_web_sessions(&self, channel: &str) -> Result<Vec<PooledSession>> {
+        let rows = web_session::Entity::find()
+            .filter(web_session::Column::Channel.eq(channel))
+            .order_by_asc(web_session::Column::Slot)
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PooledSession {
+                slot: row.slot.max(0) as u32,
+                session_id: row.session_id,
+            })
+            .collect())
+    }
+
+    /// 覆盖写入某渠道的会话池槽位：先清空该渠道的登记再整表写入。
+    pub async fn replace_web_sessions(
+        &self,
+        channel: &str,
+        sessions: &[PooledSession],
+    ) -> Result<()> {
+        web_session::Entity::delete_many()
+            .filter(web_session::Column::Channel.eq(channel))
+            .exec(&self.db)
+            .await?;
+        let now = now_ms();
+        for session in sessions {
+            web_session::ActiveModel {
+                channel: Set(channel.to_string()),
+                slot: Set(session.slot as i32),
+                session_id: Set(session.session_id.clone()),
+                updated_at: Set(now),
+            }
+            .insert(&self.db)
+            .await?;
+        }
+        Ok(())
+    }
+}
+
+impl SessionPoolStore for ProviderManager {
+    fn load<'a>(&'a self, channel: &'a str) -> BoxFuture<'a, Result<Vec<PooledSession>>> {
+        Box::pin(async move { self.list_web_sessions(channel).await })
+    }
+
+    fn save<'a>(
+        &'a self,
+        channel: &'a str,
+        sessions: &'a [PooledSession],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.replace_web_sessions(channel, sessions).await })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::ProviderManager;
+    use crate::models::defs::{PooledSession, SessionPoolStore};
     use sea_orm::Database;
     use serde_json::json;
 
@@ -411,6 +471,80 @@ mod tests {
         assert!(!manager.set_model_enabled("nope", false).await.unwrap());
         assert!(!manager.delete_model("nope").await.unwrap());
         assert!(!manager.set_provider_enabled("nope", false).await.unwrap());
+    }
+
+    /// 网页渠道会话池槽位：按渠道整表读写（重启后据此核对复用）。
+    #[tokio::test]
+    async fn web_session_pool_round_trips_per_channel() {
+        let manager = manager().await;
+        let deepseek = vec![
+            PooledSession {
+                slot: 0,
+                session_id: "sess-a".to_string(),
+            },
+            PooledSession {
+                slot: 2,
+                session_id: "sess-c".to_string(),
+            },
+        ];
+        manager
+            .replace_web_sessions("deepseek-web", &deepseek)
+            .await
+            .unwrap();
+        manager
+            .replace_web_sessions(
+                "chatgpt-web",
+                &[PooledSession {
+                    slot: 0,
+                    session_id: "sess-other".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+
+        // 按渠道隔离，且按槽位序号排序
+        assert_eq!(
+            manager.list_web_sessions("deepseek-web").await.unwrap(),
+            deepseek
+        );
+        assert_eq!(
+            manager
+                .list_web_sessions("chatgpt-web")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(manager
+            .list_web_sessions("kimi-web")
+            .await
+            .unwrap()
+            .is_empty());
+
+        // 整表覆盖：旧槽位被清掉
+        manager
+            .replace_web_sessions(
+                "deepseek-web",
+                &[PooledSession {
+                    slot: 1,
+                    session_id: "sess-b".to_string(),
+                }],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.list_web_sessions("deepseek-web").await.unwrap(),
+            vec![PooledSession {
+                slot: 1,
+                session_id: "sess-b".to_string()
+            }]
+        );
+
+        // 会话池存储契约：模型只按渠道读写自己的槽位
+        let store: &dyn SessionPoolStore = &manager;
+        assert_eq!(store.load("chatgpt-web").await.unwrap().len(), 1);
+        store.save("chatgpt-web", &[]).await.unwrap();
+        assert!(store.load("chatgpt-web").await.unwrap().is_empty());
     }
 
     /// 渠道级启停：按渠道汇总（任一行启用即启用），批量设置作用于该渠道全部模型行。

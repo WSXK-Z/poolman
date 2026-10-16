@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.1.19"
+version = "0.1.21"
 description = "poolman"
 authors = ["wushi"]
 edition = "2021"

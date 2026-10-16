@@ -11,6 +11,7 @@ mod commands;
 mod config;
 mod converters;
 mod dump;
+mod entitys;
 mod extension;
 mod handlers;
 mod models;
@@ -34,9 +35,9 @@ use config::ServerConfig;
 use extension::credentials::CredentialStore;
 use extension::executor::PluginChannelExecutor;
 use extension::manager::ExtensionManager;
-use extension::provider_control::{read_enablement_file, ProviderControl};
 use extension::websocket::WebSocketBridge;
-use models::{DeepSeekWebModel, PluginModel};
+use models::{DeepSeekWebModel, PluginModel, SessionPoolStore};
+use providers::provider_control::{read_enablement_file, ProviderControl};
 use providers::{seed, ProviderManager};
 use session::manager::SessionManager;
 
@@ -66,12 +67,21 @@ fn data_dir() -> String {
     }
 }
 
-/// 日志过滤器：默认 INFO；数据库驱动会把每条 SQL 以 INFO 打到 `sqlx::query`，
-/// 与排查无关，因此按 target 降到 WARN（真实的连接/语句告警仍然保留）。
-fn log_filter() -> tracing_subscriber::filter::Targets {
+/// 日志过滤器：默认 INFO（`LOG_LEVEL` 可改成 `debug` / `trace` / `warn` / `error`）；
+/// 数据库驱动会把每条 SQL 以 INFO 打到 `sqlx::query`，与排查无关，
+/// 因此按 target 降到 WARN（真实的连接/语句告警仍然保留）。
+fn log_filter(level: &str) -> tracing_subscriber::filter::Targets {
     use tracing_subscriber::filter::{LevelFilter, Targets};
+    let default = match level.trim().to_ascii_lowercase().as_str() {
+        "trace" => LevelFilter::TRACE,
+        "debug" => LevelFilter::DEBUG,
+        "warn" => LevelFilter::WARN,
+        "error" => LevelFilter::ERROR,
+        "off" => LevelFilter::OFF,
+        _ => LevelFilter::INFO,
+    };
     Targets::new()
-        .with_default(LevelFilter::INFO)
+        .with_default(default)
         .with_target("sqlx", LevelFilter::WARN)
         .with_target("sea_orm", LevelFilter::WARN)
 }
@@ -91,7 +101,7 @@ fn init_logging() {
                 .with_ansi(false),
         )
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
-        .with(log_filter())
+        .with(log_filter(&ServerConfig::from_env().log_level))
         .init();
 }
 
@@ -111,9 +121,9 @@ async fn start_server(
         "配置已加载: host={}, port={}, ws_port={}",
         config.host, config.port, config.ws_port
     );
-    if dump.enabled() {
+    if dump.enabled() || dump.response_enabled() {
         info!(
-            "请求落盘工具已启用：对话请求只落盘到 {} 并返回「开发中」，链路后续环节不执行（AI_GATEWAY_DUMP_REQUESTS=0 可关闭）",
+            "落盘工具已启用：请求 / 响应 / 工具调用快照写入 {}（AI_GATEWAY_DUMP_REQUESTS=0 关闭请求阶段，AI_GATEWAY_RESPONSE_DUMP=0 关闭响应阶段）",
             dump.dir().display()
         );
     }
@@ -160,6 +170,7 @@ fn build_plugin_models(
     credentials: Arc<CredentialStore>,
     timeout_ms: u64,
     dump: Arc<dump::DumpConfig>,
+    pool_store: Arc<dyn SessionPoolStore>,
 ) -> Vec<Arc<dyn PluginModel>> {
     let mut models: Vec<Arc<dyn PluginModel>> = Vec::new();
     let mut channels: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -182,9 +193,12 @@ fn build_plugin_models(
                     row.channel.clone(),
                     timeout_ms,
                 ));
+                let concurrency = providers::plugin::channel_concurrency(rows, &row.channel);
                 models.push(
                     Arc::new(
                         DeepSeekWebModel::new(row.display_name.clone(), executor)
+                            .with_concurrency(concurrency)
+                            .with_session_store(pool_store.clone())
                             .with_dump(dump.clone()),
                     ) as Arc<dyn PluginModel>,
                 );
@@ -193,6 +207,49 @@ fn build_plugin_models(
         }
     }
     models
+}
+
+/// 会话池预热的重试间隔：启动时插件可能还没连上，隔一会儿再试。
+const SESSION_WARMUP_INTERVAL_MS: u64 = 3_000;
+
+/// 会话池预热的重试次数：重试用尽后放弃，请求进来时还会兜底补齐。
+const SESSION_WARMUP_ATTEMPTS: usize = 10;
+
+/// 后台预热各渠道会话池：按渠道并发设置预建网页会话，避免首个请求才现建。
+fn spawn_session_warmup(models: Vec<Arc<dyn PluginModel>>) {
+    if models.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                info!("会话池预热未启动: {}", error);
+                return;
+            }
+        };
+        runtime.block_on(async move {
+            for model in models {
+                for attempt in 1..=SESSION_WARMUP_ATTEMPTS {
+                    match model.prepare_channel_sessions().await {
+                        Ok(()) => {
+                            info!("渠道 {} 会话池预热完成", model.channel());
+                            break;
+                        }
+                        Err(error) if attempt == SESSION_WARMUP_ATTEMPTS => {
+                            info!("渠道 {} 会话池预热未完成（请求进来时会重试）: {}", model.channel(), error)
+                        }
+                        Err(_) => {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(
+                                SESSION_WARMUP_INTERVAL_MS,
+                            ))
+                            .await
+                        }
+                    }
+                }
+            }
+        });
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -266,8 +323,11 @@ pub fn run() {
         credentials.clone(),
         startup_config.request_timeout_ms,
         dump.clone(),
+        provider_manager.clone() as Arc<dyn SessionPoolStore>,
     );
     info!("已实例化渠道模型 {} 个", plugin_models.len());
+    // 后台预热会话池（按渠道并发设置预建网页会话）：插件尚未连上时重试，请求进来也会兜底
+    spawn_session_warmup(plugin_models.clone());
     let chat_router = Arc::new(ChatRouter::new(plugin_models, provider_control.clone()));
 
     let api_keys_server = api_keys.clone();
@@ -332,7 +392,7 @@ mod log_filter_tests {
     fn sqlx_query_info_is_filtered_but_warnings_and_app_logs_pass() {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let subscriber = tracing_subscriber::registry()
-            .with(log_filter())
+            .with(log_filter("info"))
             .with(Recorder(seen.clone()));
 
         tracing::subscriber::with_default(subscriber, || {
@@ -364,5 +424,33 @@ mod log_filter_tests {
             "应用自身日志应照常输出：{:?}",
             seen
         );
+    }
+
+    /// `LOG_LEVEL` 决定默认级别：debug 时 debug 日志可见，默认（INFO）与非法值都不可见。
+    #[test]
+    fn log_level_selects_default_verbosity() {
+        for (level, expect_debug) in [
+            ("info", false),
+            ("DEBUG", true),
+            ("debug", true),
+            (" warn ", false),
+            ("bogus", false),
+        ] {
+            let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+            let subscriber = tracing_subscriber::registry()
+                .with(log_filter(level))
+                .with(Recorder(seen.clone()));
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::debug!(target: "desktop::extension::executor", "插件调用完成");
+            });
+            let logged = seen.lock().unwrap().clone();
+            assert_eq!(
+                logged.iter().any(|entry| entry.ends_with(":DEBUG")),
+                expect_debug,
+                "LOG_LEVEL={} 时 debug 可见性不符：{:?}",
+                level,
+                logged
+            );
+        }
     }
 }

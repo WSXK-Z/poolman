@@ -15,11 +15,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
 
-use crate::apis::base::{
-    error_response, normalize_messages, parse_delta, ApiKeyAuth, AppState,
-};
+use crate::apis::base::{error_response, normalize_messages, parse_delta, ApiKeyAuth, AppState};
 use crate::providers::InferRequest;
 
 #[derive(Debug, Deserialize)]
@@ -94,11 +92,50 @@ pub struct Usage {
 pub async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<ApiKeyAuth>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatCompletionRequest>,
 ) -> impl IntoResponse {
     if req.messages.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "消息数组不能为空", "invalid_request_error");
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "消息数组不能为空",
+            "invalid_request_error",
+        );
     }
+
+    // 入站摘要：区分「新会话的下一轮」与「同一轮被重复发出」靠这一行
+    let user_agent = headers
+        .get(axum::http::header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("-");
+    let tool_results = req
+        .messages
+        .iter()
+        .filter(|item| item["role"] == "tool")
+        .count();
+    let last_user_chars = req
+        .messages
+        .iter()
+        .rev()
+        .find(|item| item["role"] == "user")
+        .and_then(|item| item["content"].as_str())
+        .map_or(0, |text| text.chars().count());
+    let tool_count = req
+        .tools
+        .as_ref()
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    info!(
+        "入站请求 model={} stream={} messages={} tool_results={} last_user_chars={} tools={} client_session={:?} ua={}",
+        req.model,
+        req.stream,
+        req.messages.len(),
+        tool_results,
+        last_user_chars,
+        tool_count,
+        req.session_id,
+        user_agent
+    );
 
     let model = req.model.clone();
     let request = InferRequest {
@@ -151,19 +188,28 @@ pub async fn chat_completions_handler(
         }
         Err(e) => {
             warn!("聊天请求出错: {}", e);
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string(), "server_error")
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &e.to_string(),
+                "server_error",
+            )
         }
     }
 }
 
 /// 流式对话补全：SSE 逐条输出增量。
-fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> axum::response::Response {
+fn sse_response(
+    state: Arc<AppState>,
+    request: InferRequest,
+    model: String,
+) -> axum::response::Response {
     let base = serde_json::json!({
         "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "chat.completion.chunk",
         "created": chrono::Utc::now().timestamp(),
         "model": model,
     });
+    let response_id = base["id"].clone();
 
     let stream = async_stream::stream! {
         // 闭包是同步 FnMut，不能 await/block，故用 unbounded 通道回传增量。
@@ -186,10 +232,16 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
         });
 
         let mut seen_tool_calls = false;
+        // 出站统计：这一轮客户端到底拿到了什么
+        let mut frames = 0usize;
+        let mut content_chars = 0usize;
+        let mut reasoning_chars = 0usize;
+        let mut tool_calls = 0usize;
         while let Some(item) = rx.recv().await {
             let delta = match item {
                 Ok(delta) => delta,
                 Err(error) => {
+                    warn!("出站中止 request_id={} frames={} err={}", response_id, frames, error);
                     let event = serde_json::json!({ "error": { "message": error, "type": "server_error" } });
                     yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&event).unwrap()));
                     return;
@@ -199,16 +251,20 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
 
             let mut delta_obj = serde_json::json!({});
             if !chunk.content.is_empty() {
+                content_chars += chunk.content.chars().count();
                 delta_obj["content"] = serde_json::json!(chunk.content);
             }
             if !chunk.reasoning.is_empty() {
+                reasoning_chars += chunk.reasoning.chars().count();
                 delta_obj["reasoning_content"] = serde_json::json!(chunk.reasoning);
             }
-            if let Some(tool_calls) = chunk.tool_calls {
-                delta_obj["tool_calls"] = index_tool_calls(tool_calls);
+            if let Some(calls) = chunk.functions {
+                tool_calls += calls.as_array().map_or(0, Vec::len);
+                delta_obj["tool_calls"] = index_tool_calls(calls);
                 seen_tool_calls = true;
             }
 
+            frames += 1;
             let frame = serde_json::json!({
                 "id": base["id"],
                 "object": base["object"],
@@ -220,6 +276,12 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
         }
 
         let finish_reason = if seen_tool_calls { "tool_calls" } else { "stop" };
+        // 出站摘要：正文 / 思考 / 工具调用各有多少、结束原因是什么。
+        // 排查「客户端拿到回答却不接着走」时，看这一行就知道它收到了什么，不必复现。
+        info!(
+            "出站摘要 request_id={} frames={} content_chars={} reasoning_chars={} tool_calls={} finish_reason={}",
+            response_id, frames, content_chars, reasoning_chars, tool_calls, finish_reason
+        );
         let end = serde_json::json!({
             "id": base["id"],
             "object": base["object"],
@@ -239,7 +301,8 @@ pub fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions_handler))
 }
 
-/// 给工具调用补上流式增量必需的 `index`（客户端按它合并分片），已有的不覆盖。
+/// 给工具调用补上流式增量必需的 `index`（客户端按它合并分片）：渠道侧已按整轮全局序号给出的不覆盖，
+/// 缺的按位置补。
 fn index_tool_calls(tool_calls: Value) -> Value {
     let Value::Array(calls) = tool_calls else {
         return tool_calls;

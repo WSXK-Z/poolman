@@ -53,12 +53,10 @@ pub(crate) fn tool_format_reminder() -> &'static str {
 
 /// 工具调用围栏的标签名——围栏的"唯一真相"。
 ///
-/// 三方都离不开它，但都无法互相引用：
-/// - 提示词正文在 `prompts/system.md`（编译期 `include_str!` 嵌入，不能插值常量）；
-/// - 解析器在 `extension/adapters/deepseek/tool_parsing.rs`（`const` 之间不能拼接字符串）。
-///
-/// 所以三处各自写的是字面量，靠单元测试锁死一致：
-/// 本常量、`system.md` 里出现的围栏标签、解析器接受的名字集合（见 `fence_spec_is_single_source`）。
+/// 提示词正文在 `prompts/system.md`（编译期 `include_str!` 嵌入，不能插值常量），
+/// 与常量只能各写一份字面量，靠单元测试锁死一致：
+/// 本常量、`system.md` 里出现的围栏标签（见 `fence_spec_is_single_source`）。
+/// 解析侧按这个名字识别围栏。
 pub(crate) const TOOL_CALL_TAG: &str = "tool_call";
 
 // ============================== 共享辅助 ==============================
@@ -321,8 +319,8 @@ mod tests {
         );
     }
 
-    /// 围栏同源（提示词侧）：常量与 `system.md` 正文必须一致。
-    /// 解析器侧由 `extension::adapters::deepseek::tool_parsing` 的测试守住，两侧合起来锁死三方。
+    /// 围栏同源（提示词侧）：常量与 `system.md` 正文必须一致；
+    /// 该标签名同时是提示词要求模型输出的围栏名，解析侧必须按它识别。
     #[test]
     fn fence_spec_is_single_source() {
         assert_eq!(TOOL_CALL_TAG, "tool_call", "围栏标签名被改动，需同步提示词与解析器");

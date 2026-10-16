@@ -2,7 +2,7 @@
  * DeepSeek 网页版适配器（连接器化后仅保留元信息）。
  *
  * 重构后，请求组装 / PoW 求解 / SSE 解析 / 422 自愈 / 会话管理等业务逻辑
- * 已全部迁移到桌面端（apps/desktop/src-tauri/src/extension/adapters/deepseek）。
+ * 已全部迁移到桌面端（apps/desktop/src-tauri/src/models/deepseek_web.rs）。
  * 插件只承担两类机械职责：
  *   1) 内容脚本捕获凭证/接口模板 → 同步服务端（CREDENTIAL_SYNC）
  *   2) 收到 EXECUTE_REQUEST 后在网页 context 执行 fetch 并回传原始流

@@ -15,5 +15,5 @@ pub mod plugin;
 pub mod pow;
 
 pub use deepseek_web::DeepSeekWebModel;
-pub use defs::{Concurrency, InferRequest, ModelResponse};
+pub use defs::{Concurrency, InferRequest, ModelResponse, SessionPoolStore};
 pub use plugin::PluginModel;

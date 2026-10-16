@@ -1,4 +1,4 @@
-//! 插件命令：插件实例的启停、渠道启停与渠道操作，以及插件构建目录定位。
+//! 插件命令：插件实例的启停、渠道启停与渠道操作，以及插件构建目录定位与扩展页引导。
 
 use std::sync::Arc;
 
@@ -11,11 +11,67 @@ use crate::handlers::{command_set, CommandSet};
 pub(super) fn handler() -> CommandSet<tauri::Wry> {
     command_set![
         plugin_extension_dir,
+        open_extensions_page,
         list_plugins,
         set_plugin_enabled,
         set_plugin_channel_enabled,
         control_plugin_provider,
     ]
+}
+
+/// 浏览器的扩展管理页：实际启动的浏览器与在其中打开的地址。
+#[derive(serde::Serialize)]
+pub struct ExtensionsPage {
+    /// 实际启动的浏览器名。
+    pub browser: String,
+    /// 在浏览器里打开的地址。
+    pub url: String,
+}
+
+/// 打开浏览器的扩展管理页。
+///
+/// `chrome://extensions` 这类内部页面不能当普通 URL 交给系统打开（Windows 没有对应协议处理器，
+/// WebView 侧也会被 Tauri 拒绝），只能把内部地址当参数启动浏览器本体。
+/// 找不到可用浏览器时返回错误，由前端退化成「复制地址自行打开」。
+#[tauri::command]
+pub fn open_extensions_page() -> Result<ExtensionsPage, String> {
+    for (browser, relative, url) in [
+        (
+            "Chrome",
+            r"Google\Chrome\Application\chrome.exe",
+            "chrome://extensions",
+        ),
+        (
+            "Edge",
+            r"Microsoft\Edge\Application\msedge.exe",
+            "edge://extensions",
+        ),
+    ] {
+        let Some(executable) = browser_executable(relative) else {
+            continue;
+        };
+        // 启动失败（路径失效、权限不足）就继续试下一个浏览器
+        if std::process::Command::new(&executable)
+            .arg(url)
+            .spawn()
+            .is_ok()
+        {
+            return Ok(ExtensionsPage {
+                browser: browser.to_string(),
+                url: url.to_string(),
+            });
+        }
+    }
+    Err("未找到可用的 Chrome / Edge，请在浏览器地址栏手动输入 chrome://extensions 打开".to_string())
+}
+
+/// 在常见安装位置里找浏览器可执行文件：Chrome 与 Edge 都不保证在 PATH 上。
+fn browser_executable(relative: &str) -> Option<std::path::PathBuf> {
+    ["ProgramFiles", "ProgramFiles(x86)", "LocalAppData"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .map(|dir| std::path::Path::new(&dir).join(relative))
+        .find(|path| path.is_file())
 }
 
 /// 定位浏览器插件构建产物目录，供「加载已解压扩展程序」一键引导使用。

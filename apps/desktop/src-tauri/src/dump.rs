@@ -5,9 +5,10 @@
 //! `stream` 参数返回一份形状正常的模型输出（正文固定为「开发中」），其后的环节
 //! （鉴权、路由、模型、插件）都不执行。
 //!
-//! 开关：环境变量 `AI_GATEWAY_DUMP_REQUESTS`，`0` / `false` / `off` / `no` 关闭，其余值启用（默认启用）。
-//! 响应阶段的落盘（[`DumpConfig::write_response`]，由模型在解析完网页返回后调用）开关为
-//! `AI_GATEWAY_RESPONSE_DUMP`，未设置时跟随请求阶段。
+//! 开关：环境变量 `AI_GATEWAY_DUMP_REQUESTS`，`1` / `true` / `yes` / `on` 启用，其余值关闭（默认关闭）。
+//! 响应阶段的落盘（[`DumpConfig::write_response`] / [`DumpConfig::write_tool_calls`]，由模型在解析完
+//! 网页返回后调用）开关为 `AI_GATEWAY_RESPONSE_DUMP`，未设置时跟随请求阶段。
+//! 两个阶段关闭时都不写任何文件。
 //! 目录：环境变量 `AI_GATEWAY_DUMP_DIR`，默认应用数据目录。
 //!
 //! 落盘内容含请求头（其中可能有 API Key）、提示词与模型返回，因此产物不入库（见 `.gitignore`）。
@@ -53,7 +54,7 @@ impl DumpConfig {
 
     /// 从环境变量读取开关与目录；目录默认取应用数据目录。
     pub fn from_env(data_dir: &str) -> Self {
-        let enabled = env_flag("AI_GATEWAY_DUMP_REQUESTS", true);
+        let enabled = env_flag("AI_GATEWAY_DUMP_REQUESTS", false);
         // 响应阶段的开关独立；未设置时跟随请求阶段（保持「插入即生效」的手感）
         let response_enabled = env_flag("AI_GATEWAY_RESPONSE_DUMP", enabled);
         let dir = env::var("AI_GATEWAY_DUMP_DIR")
@@ -82,13 +83,35 @@ impl DumpConfig {
     }
 
     /// 把一个请求快照写成 `chat-request-<时间戳>-<随机>.json`，返回落盘路径。
+    ///
+    /// 请求阶段关闭时不写任何文件。
     pub fn write(&self, dump: &RequestDump) -> anyhow::Result<PathBuf> {
+        if !self.enabled {
+            anyhow::bail!("请求落盘已关闭（AI_GATEWAY_DUMP_REQUESTS）");
+        }
         self.write_json("chat-request", dump)
     }
 
     /// 把一份响应阶段快照写成 `response-<时间戳>-<随机>.json`，返回落盘路径。
+    ///
+    /// 响应阶段关闭时不写任何文件。
     pub fn write_response<T: Serialize>(&self, payload: &T) -> anyhow::Result<PathBuf> {
+        if !self.response_enabled {
+            anyhow::bail!("响应落盘已关闭（AI_GATEWAY_RESPONSE_DUMP）");
+        }
         self.write_json("response", payload)
+    }
+
+    /// 把一份工具调用快照写成 `tool-call-<时间戳>-<随机>.json`，返回落盘路径。
+    ///
+    /// 与响应快照同属响应阶段（同一开关、同一目录），只是单独成文件：
+    /// 工具调用一有就落，便于直接对照「模型吐的原文」与「解析出的调用」。
+    /// 响应阶段关闭时不写任何文件。
+    pub fn write_tool_calls<T: Serialize>(&self, payload: &T) -> anyhow::Result<PathBuf> {
+        if !self.response_enabled {
+            anyhow::bail!("工具调用落盘已关闭（AI_GATEWAY_RESPONSE_DUMP）");
+        }
+        self.write_json("tool-call", payload)
     }
 
     /// 一快照一文件：`<前缀>-<时间戳>-<随机>.json`。
@@ -207,7 +230,9 @@ pub async fn require_dump(
             info!("对话请求已落盘：{}", path.display());
             if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
                 if let Ok(value) = HeaderValue::from_str(name) {
-                    response.headers_mut().insert("x-poolman-request-dump", value);
+                    response
+                        .headers_mut()
+                        .insert("x-poolman-request-dump", value);
                 }
             }
         }
@@ -455,8 +480,8 @@ mod tests {
 
     /// 取响应正文文本。
     fn body_text(response: axum::response::Response) -> String {
-        let bytes = block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
-            .expect("读取响应正文");
+        let bytes =
+            block_on(axum::body::to_bytes(response.into_body(), usize::MAX)).expect("读取响应正文");
         String::from_utf8(bytes.to_vec()).expect("响应正文应为 UTF-8")
     }
 
@@ -509,7 +534,10 @@ mod tests {
 
         let body = dump.body.as_ref().expect("应能解析为 JSON");
         assert_eq!(body["messages"][0]["content"][0]["type"], "image_url");
-        assert_eq!(body["messages"][0]["content"][1]["text"], "图片背景是什么颜色");
+        assert_eq!(
+            body["messages"][0]["content"][1]["text"],
+            "图片背景是什么颜色"
+        );
         assert_eq!(dump.body_raw, raw, "原文应按到达时的字节原样保留");
     }
 
@@ -555,7 +583,11 @@ mod tests {
 
         let path = config.write_response(&payload).unwrap();
         let name = path.file_name().unwrap().to_string_lossy().to_string();
-        assert!(name.starts_with("response-") && name.ends_with(".json"), "{}", name);
+        assert!(
+            name.starts_with("response-") && name.ends_with(".json"),
+            "{}",
+            name
+        );
         let restored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         assert_eq!(restored["stage"], "response");
         assert_eq!(restored["text"], "你好");
@@ -582,15 +614,23 @@ mod tests {
     /// 响应阶段开关独立：未设置时跟随请求阶段，设置时可单独开关。
     #[test]
     fn response_flag_follows_request_flag_by_default() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = temp_dir().to_string_lossy().to_string();
         std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP");
 
         std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "0");
-        assert!(!DumpConfig::from_env(&dir).response_enabled(), "跟随请求阶段关闭");
+        assert!(
+            !DumpConfig::from_env(&dir).response_enabled(),
+            "跟随请求阶段关闭"
+        );
 
         std::env::set_var("AI_GATEWAY_DUMP_REQUESTS", "1");
-        assert!(DumpConfig::from_env(&dir).response_enabled(), "跟随请求阶段启用");
+        assert!(
+            DumpConfig::from_env(&dir).response_enabled(),
+            "跟随请求阶段启用"
+        );
 
         std::env::set_var("AI_GATEWAY_RESPONSE_DUMP", "0");
         assert!(
@@ -602,9 +642,42 @@ mod tests {
         std::env::remove_var("AI_GATEWAY_RESPONSE_DUMP");
     }
 
+    /// 关闭时不写任何文件：请求 / 响应 / 工具调用三条落盘路径都被拦下，连目录都不创建。
+    #[test]
+    fn disabled_dump_writes_nothing() {
+        let dir = temp_dir();
+        let config = DumpConfig::new(false, dir.to_string_lossy().to_string());
+        assert!(!config.enabled());
+        assert!(!config.response_enabled());
+
+        let request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .body(Body::from("{}"))
+            .unwrap();
+        let (parts, _) = request.into_parts();
+        let dump = RequestDump::capture(&parts, b"{}");
+
+        assert!(config.write(&dump).is_err(), "请求阶段关闭时不应落盘");
+        assert!(
+            config
+                .write_response(&serde_json::json!({ "text": "答" }))
+                .is_err(),
+            "响应阶段关闭时不应落盘"
+        );
+        assert!(
+            config
+                .write_tool_calls(&serde_json::json!({ "calls": [] }))
+                .is_err(),
+            "工具调用属响应阶段，关闭时不应落盘"
+        );
+        assert!(!dir.exists(), "关闭时连落盘目录都不该创建");
+    }
+
     /// 落盘：一请求一文件，目录自动创建，内容为可解析的 JSON。
     #[test]
-    fn write_creates_one_json_file_per_request() {        let dir = temp_dir();
+    fn write_creates_one_json_file_per_request() {
+        let dir = temp_dir();
         let config = DumpConfig::new(true, dir.to_string_lossy().to_string());
         assert!(config.enabled());
         assert!(!dir.exists(), "目录应由落盘时创建");
@@ -637,7 +710,13 @@ mod tests {
         let dump = dump_for("/v1/chat/completions", r#"{"model":"deepseek-web"}"#);
         let response = stub_response(&dump);
         assert_eq!(response.status(), StatusCode::OK);
-        assert!(response.headers().get("content-type").unwrap().to_str().unwrap().contains("json"));
+        assert!(response
+            .headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains("json"));
 
         let json = body_json(response);
         assert_eq!(json["object"], "chat.completion");
@@ -674,7 +753,8 @@ mod tests {
         assert_eq!(first["choices"][0]["delta"]["content"], "开发中");
         assert!(first["choices"][0]["finish_reason"].is_null());
 
-        let second: Value = serde_json::from_str(frames[1].strip_prefix("data: ").unwrap()).unwrap();
+        let second: Value =
+            serde_json::from_str(frames[1].strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(second["choices"][0]["finish_reason"], "stop");
         assert_eq!(frames[2], "data: [DONE]");
     }
@@ -682,7 +762,10 @@ mod tests {
     /// 文本补全：对象名是 `text_completion`，正文放在 `choices[0].text`。
     #[test]
     fn completion_stub_uses_text_completion_shape() {
-        let plain = body_json(stub_response(&dump_for("/v1/completions", r#"{"model":"m"}"#)));
+        let plain = body_json(stub_response(&dump_for(
+            "/v1/completions",
+            r#"{"model":"m"}"#,
+        )));
         assert_eq!(plain["object"], "text_completion");
         assert_eq!(plain["choices"][0]["text"], "开发中");
         assert_eq!(plain["choices"][0]["finish_reason"], "stop");
@@ -702,7 +785,10 @@ mod tests {
     /// 响应接口：非流式是 `response` 对象，流式是命名事件（与真实编码器同形）。
     #[test]
     fn responses_stub_uses_response_events() {
-        let plain = body_json(stub_response(&dump_for("/v1/responses", r#"{"model":"m"}"#)));
+        let plain = body_json(stub_response(&dump_for(
+            "/v1/responses",
+            r#"{"model":"m"}"#,
+        )));
         assert_eq!(plain["object"], "response");
         assert_eq!(plain["status"], "completed");
         assert_eq!(plain["output"][0]["content"][0]["type"], "output_text");
@@ -730,10 +816,12 @@ mod tests {
         assert_eq!(json["model"], "poolman");
     }
 
-    /// 开关解析：显式关闭值不启用、其余值启用、未设置时默认启用；目录可用环境变量覆盖。
+    /// 开关解析：显式启用值启用、其余值关闭、未设置时默认关闭；目录可用环境变量覆盖。
     #[test]
     fn env_switch_and_dir_resolution() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let data_dir = temp_dir();
         let data_dir = data_dir.to_string_lossy().to_string();
         std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS");
@@ -750,8 +838,13 @@ mod tests {
 
         std::env::remove_var("AI_GATEWAY_DUMP_REQUESTS");
         let config = DumpConfig::from_env(&data_dir);
-        assert!(config.enabled(), "未设置时默认启用");
-        assert_eq!(config.dir().to_string_lossy(), data_dir, "未设置目录时落到数据目录");
+        assert!(!config.enabled(), "未设置时默认关闭");
+        assert!(!config.response_enabled(), "响应阶段跟随关闭");
+        assert_eq!(
+            config.dir().to_string_lossy(),
+            data_dir,
+            "未设置目录时落到数据目录"
+        );
 
         std::env::set_var("AI_GATEWAY_DUMP_DIR", "/tmp/poolman-dump");
         assert_eq!(

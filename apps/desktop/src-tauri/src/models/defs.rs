@@ -95,12 +95,17 @@ impl Concurrency {
         }
     }
 
-    /// 单并发且同会话串行（最保守，网页渠道默认）。
-    pub fn single() -> Self {
+    /// 会话池并发（有状态网页渠道）：最多 `max_inflight` 个请求同时在途，各自占用独立会话。
+    pub fn pooled(max_inflight: u32) -> Self {
         Self {
-            max_inflight: 1,
+            max_inflight: max_inflight.max(1),
             per_session_serial: true,
         }
+    }
+
+    /// 单并发且同会话串行（最保守，网页渠道默认）。
+    pub fn single() -> Self {
+        Self::pooled(1)
     }
 }
 
@@ -156,6 +161,33 @@ pub struct ChannelResponse {
     pub status: u16,
     /// 响应体文本。
     pub body: String,
+}
+
+/// 网页渠道会话池的一条槽位：槽位序号 + 渠道会话 id。
+///
+/// 网页会话是有状态的（同一会话不能并发），因此按并发数为渠道预建若干会话，
+/// 每个在途请求独享一个槽位；槽位表持久化后可在重启时核对复用。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PooledSession {
+    /// 槽位序号（0 起）。
+    pub slot: u32,
+    /// 渠道会话 id。
+    pub session_id: String,
+}
+
+/// 网页渠道会话池的持久化存储：按渠道读写槽位表。
+///
+/// 由持久化层实现；模型只按自己的渠道读写，不感知存储介质。
+pub trait SessionPoolStore: Send + Sync {
+    /// 读取某渠道已登记的槽位。
+    fn load<'a>(&'a self, channel: &'a str) -> BoxFuture<'a, Result<Vec<PooledSession>>>;
+
+    /// 覆盖写入某渠道的槽位表（空表表示清空该渠道）。
+    fn save<'a>(
+        &'a self,
+        channel: &'a str,
+        sessions: &'a [PooledSession],
+    ) -> BoxFuture<'a, Result<()>>;
 }
 
 /// 渠道执行器：模型用它把请求送到渠道（网页平台）。

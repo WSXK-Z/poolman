@@ -123,6 +123,9 @@ pub fn error_response(status: StatusCode, message: &str, kind: &str) -> axum::re
 }
 
 /// 一条流式增量解析结果。
+///
+/// 三个键（[`DeltaChunk::RESPONSE`] / [`DeltaChunk::THINK`] / [`DeltaChunk::FUNCTIONS`]）是**渠道无关**的
+/// 中间增量协议：渠道侧按这套键封装增量，本层用 [`parse_delta`] 解析，两边只认这里的一份定义。
 #[derive(Debug, Default)]
 pub struct DeltaChunk {
     /// 正文增量。
@@ -130,7 +133,18 @@ pub struct DeltaChunk {
     /// 思考增量。
     pub reasoning: String,
     /// 工具调用（OpenAI 标准 tool_calls 数组）。
-    pub tool_calls: Option<Value>,
+    pub functions: Option<Value>,
+}
+
+impl DeltaChunk {
+    /// 正文增量键。
+    pub const RESPONSE: &str = "RESPONSE";
+
+    /// 思考增量键。
+    pub const THINK: &str = "THINK";
+
+    /// 工具调用增量键（值须为数组）。
+    pub const FUNCTIONS: &str = "FUNCTIONS";
 }
 
 /// 解析底层流式增量：兼容 JSON 包裹（`{"RESPONSE"/"THINK"/"FUNCTIONS"}`）与纯文本。
@@ -138,13 +152,13 @@ pub fn parse_delta(raw: &str) -> DeltaChunk {
     let mut chunk = DeltaChunk::default();
     match serde_json::from_str::<Value>(raw) {
         Ok(value) => {
-            if let Some(text) = value.get("FUNCTIONS").filter(|v| v.is_array()) {
-                chunk.tool_calls = Some(text.clone());
+            if let Some(text) = value.get(DeltaChunk::FUNCTIONS).filter(|v| v.is_array()) {
+                chunk.functions = Some(text.clone());
             }
-            if let Some(text) = value.get("RESPONSE").and_then(Value::as_str) {
+            if let Some(text) = value.get(DeltaChunk::RESPONSE).and_then(Value::as_str) {
                 chunk.content.push_str(text);
             }
-            if let Some(text) = value.get("THINK").and_then(Value::as_str) {
+            if let Some(text) = value.get(DeltaChunk::THINK).and_then(Value::as_str) {
                 chunk.reasoning.push_str(text);
             }
         }

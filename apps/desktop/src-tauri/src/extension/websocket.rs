@@ -59,11 +59,12 @@ type WsStream =
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 type WsSplitStream = futures_util::stream::SplitStream<WsStream>;
 
-/// 单台插件的最大在途请求数：超过后不再把新请求分给它，
+/// 单台插件的最大在途请求数：超过后不再把新请求分给它，排队等一个空位，
 /// 避免把一台插件的浏览器标签页打满。
 ///
-/// 注意：等待队列尚未实现——超限时请求会以「没有可分配该供应商请求的已连接插件」失败。
-const MAX_INFLIGHT_PER_PLUGIN: u32 = 4;
+/// 与渠道默认并发（`providers::plugin::DEFAULT_CHANNEL_CONCURRENCY`）对齐：
+/// 单台插件要能承接默认并发数的在途请求，否则渠道侧的并发设置达不到。
+const MAX_INFLIGHT_PER_PLUGIN: u32 = 5;
 
 pub struct WebSocketBridge {
     pub sender: Arc<Mutex<Option<WsSink>>>,
@@ -465,8 +466,8 @@ impl WebSocketBridge {
         outcome
     }
 
-    /// 请求扩展捕获指定 provider 的凭证（CAPTURE_REQUEST 下行；扩展上报 CREDENTIAL_SYNC 后完成）
-    /// 请求在线插件重新读取网页凭证；CREDENTIAL_SYNC 到达时按 provider 唤醒等待方。
+    /// 请求在线插件重新读取网页凭证（CAPTURE_REQUEST 下行）：
+    /// CREDENTIAL_SYNC 到达时按 provider 唤醒等待方，超时则报错。
     pub async fn request_credentials(&self, provider: &str, timeout_ms: u64) -> anyhow::Result<()> {
         let id = provider.to_string();
         let message = serde_json::json!({
@@ -567,6 +568,17 @@ mod tests {
     /// mock 插件的连接类型
     type PluginWs =
         tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+    /// 单插件在途上限必须能承接渠道默认并发，否则渠道侧的并发设置达不到。
+    #[test]
+    fn inflight_cap_covers_default_channel_concurrency() {
+        assert!(
+            MAX_INFLIGHT_PER_PLUGIN >= crate::providers::plugin::DEFAULT_CHANNEL_CONCURRENCY,
+            "单插件在途上限 {} 低于渠道默认并发 {}",
+            MAX_INFLIGHT_PER_PLUGIN,
+            crate::providers::plugin::DEFAULT_CHANNEL_CONCURRENCY
+        );
+    }
 
     /// 构造使用临时数据目录的桥接实例（插件注册表写入临时目录）。
     fn test_bridge() -> Arc<WebSocketBridge> {

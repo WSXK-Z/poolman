@@ -17,9 +17,9 @@
 //! 「按模型分派」的编排入口见 crate 根 [`crate::chat_router::ChatRouter`]。
 
 pub mod defs;
-pub mod entity;
 pub mod manager;
 pub mod plugin;
+pub mod provider_control;
 pub mod seed;
 
 pub use defs::{ChatProvider, ModelDescriptor};

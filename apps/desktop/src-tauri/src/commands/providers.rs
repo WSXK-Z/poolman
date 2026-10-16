@@ -3,9 +3,9 @@
 use std::sync::Arc;
 
 use crate::chat_router::ChatRouter;
-use crate::extension::provider_control::{ManagedProvider, ProviderControl};
 use crate::extension::websocket::WebSocketBridge;
 use crate::handlers::{command_set, CommandSet};
+use crate::providers::provider_control::{ManagedProvider, ProviderControl};
 use crate::providers::ProviderManager;
 
 /// 本组命令的处理器。

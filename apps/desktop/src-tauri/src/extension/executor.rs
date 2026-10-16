@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::{anyhow, Result};
 use futures_util::future::BoxFuture;
 use serde_json::Value;
-use tracing::{info, warn};
+use tracing::{debug, warn};
 
 use crate::extension::credentials::CredentialStore;
 use crate::extension::websocket::{ExecuteRequestPayload, ExecuteResultPayload, WebSocketBridge};
@@ -42,12 +42,8 @@ impl PluginChannelExecutor {
         }
     }
 
-    /// 渠道标识。
-    pub fn channel(&self) -> &str {
-        &self.channel
-    }
-
-    /// 请求插件重新捕获本渠道凭证（凭证缺失时由调用方触发）。
+    /// 请求插件重新捕获本渠道凭证：CAPTURE_REQUEST 下行，插件上报 CREDENTIAL_SYNC 后返回。
+    #[allow(dead_code)]
     pub async fn request_credentials(&self) -> Result<()> {
         self.bridge
             .request_credentials(&self.channel, self.timeout_ms)
@@ -140,10 +136,10 @@ impl ChannelExecutor for PluginChannelExecutor {
     }
 }
 
-/// 记录插件调用结果：状态、正文长度与开头（截断，避免刷屏）。
+/// 记录插件调用结果（状态、正文长度、分块数）。
 ///
-/// `stream` 为流式调用的（分块数, 首个分块）——流式的最终响应体是空的，
-/// 只有靠它们才能看出插件到底回了什么。
+/// 正常的调用是高频常规事件，降到 `debug` 级别：默认日志里不出现，排查时才打开；
+/// 失败仍然在 `warn`，绝不会被静默。正文不进日志（可能含对话内容），只在需要时看分块数。
 fn log_result(
     channel: &str,
     url: &str,
@@ -155,8 +151,8 @@ fn log_result(
         None => ("-".to_string(), "-".to_string()),
     };
     match result {
-        Ok(payload) => info!(
-            "插件调用结果 channel={} url={} status={} ok={} body_len={} chunks={} first_chunk={} body={}",
+        Ok(payload) => debug!(
+            "插件调用完成 channel={} url={} status={} ok={} body_len={} chunks={} first_chunk={}",
             channel,
             url,
             payload.status,
@@ -164,7 +160,6 @@ fn log_result(
             payload.body.len(),
             chunks,
             first_chunk,
-            head(&payload.body, 500),
         ),
         Err(error) => warn!("插件调用失败 channel={} url={} err={}", channel, url, error),
     }
@@ -336,9 +331,7 @@ mod tests {
             "deepseek-web",
             5_000,
         );
-        assert_eq!(executor.channel(), "deepseek-web");
-        // 未捕获凭证时返回 None（由调用方决定是否触发捕获）
-        assert!(executor.token().is_none());
+        assert!(executor.token().is_none(), "未捕获凭证时为 None");
 
         // 插件侧：读请求并应答
         let responder = tokio::spawn(async move {
@@ -375,6 +368,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || SinkWriter(sink.clone()))
             .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
 
@@ -398,14 +392,19 @@ mod tests {
         assert!(response.body.contains("hi"));
 
         let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("插件调用结果"), "{}", logged);
+        // 调用结果是 debug 级：默认日志不打印，排查时打开才看得到
+        assert!(logged.contains("插件调用完成"), "{}", logged);
         assert!(logged.contains("status=200"), "{}", logged);
         assert!(
             logged.contains("https://chat.deepseek.com/api/v0/chat/completion"),
             "{}",
             logged
         );
-        assert!(logged.contains("data: hi"), "正文摘要应落日志：{}", logged);
+        assert!(
+            !logged.contains("data: hi"),
+            "响应正文不该进日志：{}",
+            logged
+        );
 
         std::fs::remove_file(dir.join("plugins.json")).ok();
         std::fs::remove_dir(dir).ok();
@@ -489,6 +488,7 @@ mod tests {
         let subscriber = tracing_subscriber::fmt()
             .with_writer(move || SinkWriter(sink.clone()))
             .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
             .finish();
         let guard = tracing::subscriber::set_default(subscriber);
 
@@ -515,7 +515,7 @@ mod tests {
         drop(guard);
 
         let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
-        assert!(logged.contains("插件调用结果"), "{}", logged);
+        assert!(logged.contains("插件调用完成"), "{}", logged);
         assert!(logged.contains("chunks=2"), "应记下分块数：{}", logged);
         assert!(
             logged.contains("first_chunk=data: {\"p\":\"response/content\""),

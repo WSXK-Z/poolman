@@ -19,9 +19,9 @@ use anyhow::Result;
 use serde_json::Value;
 use tracing::info;
 
-use crate::extension::provider_control::ProviderControl;
 use crate::models::PluginModel;
 use crate::providers::plugin::PLUGIN_PROVIDER_ID;
+use crate::providers::provider_control::ProviderControl;
 use crate::providers::{
     ChatProvider, InferRequest, ModelDescriptor, ModelResponse, PluginProvider, ProviderRegistry,
 };
@@ -198,12 +198,12 @@ impl ChatRouter {
 #[cfg(test)]
 mod tests {
     use super::{ChatRouter, RouteDecision, RouteRequest};
-    use crate::extension::provider_control::ProviderControl;
     use crate::models::defs::{
         ChunkSink, Concurrency, InferRequest, ModelCapability, ModelResponse,
     };
     use crate::models::model::Model;
     use crate::models::PluginModel;
+    use crate::providers::provider_control::ProviderControl;
     use anyhow::Result;
     use futures_util::future::BoxFuture;
     use serde_json::json;

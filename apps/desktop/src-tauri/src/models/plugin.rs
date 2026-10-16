@@ -35,4 +35,9 @@ pub trait PluginModel: Model {
 
     /// 拉取渠道会话历史。
     fn channel_history<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<Value>>;
+
+    /// 预热渠道会话：按渠道并发设置预建会话池（幂等）；默认无需预热。
+    fn prepare_channel_sessions(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async { Ok(()) })
+    }
 }
