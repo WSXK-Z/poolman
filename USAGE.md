@@ -100,7 +100,8 @@ AI Gateway 无需配置 API Key。您可以通过环境变量或桌面端界面�
 | `HOST` | 监听地址 | `127.0.0.1` |
 | `PORT` | HTTP 服务端口 | `13213` |
 | `WS_PORT` | WebSocket 端口 | `3001` |
-| `REQUEST_TIMEOUT_MS` | 单次请求超时（毫秒） | `120000` |
+| `REQUEST_TIMEOUT_MS` | 非流式请求的总超时（毫秒） | `120000` |
+| `STREAM_IDLE_TIMEOUT_MS` | 流式请求的静默容忍（毫秒）：连续这么久没有新数据才判定上游挂死；期间持续有数据则一直等待 | `180000` |
 | `CORS_ORIGIN` | 允许的跨域来源 | `*` |
 | `LOG_LEVEL` | 日志级别（`trace`/`debug`/`info`/`warn`/`error`）；插件调用详情等高频日志只在 `debug` 及以下输出 | `info` |
 
