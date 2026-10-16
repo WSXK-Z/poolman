@@ -69,6 +69,7 @@ const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 - **要调工具**：整条回复**只**输出 DSML，标记外零字符。
 - **不调工具**：只输出正文，禁止出现任何 DSML 标签。
 - **数量上限**：一次回复里 `invoke` 最多 3 个，单个 `invoke` 里 `parameter` 最多 10 个；超出的调用拆到后续轮次，不要挤在同一条回复里。
+- **闭标签带斜杠**：闭标签一律写成 `</｜｜DSML｜｜ invoke>`、`</｜｜DSML｜｜ parameter>`、`</｜｜DSML｜｜ calls>`（`<` 之后紧跟 `/`），闭标签上不写属性；漏掉那个 `/` 会被当成新的开标签，整块调用作废。
 
 ```dsml
 <｜｜DSML｜｜ calls>
@@ -81,7 +82,7 @@ const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 | 规则 | 写法 |
 |---|---|
 | 分隔符 | 竖线**必须全角** `｜｜DSML｜｜`；`< > / = "` 全半角 |
-| 标签 | 成对、不嵌套、不改写、不套代码块 |
+| 标签 | 成对、不嵌套、不改写、不套代码块；闭标签 `<` 后紧跟 `/`，且不带属性 |
 | 字符串参数 | `string="true"`，原样写；`\`→`\\`，`"`→`\"` |
 | 非字符串 | `string="false"`，值写 JSON：`30`、`true`、`[1,2]` |
 | 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内，最多 3 个；单个 `invoke` 的 `parameter` 最多 10 个 |
@@ -3165,12 +3166,17 @@ mod tests {
         }
     }
 
-    /// 工具规则与修复提示词给出的「调用数量 / 参数个数」上限必须一致。
+    /// 工具规则与修复提示词给出的硬性要求必须一致：调用数量 / 参数个数上限、闭标签带 `/`。
     #[test]
-    fn tool_rule_and_normalizer_agree_on_limits() {
+    fn tool_rule_and_normalizer_agree_on_hard_rules() {
         for text in [super::TOOL_RULE, super::NORMALIZER_PROMPT] {
-            for needle in ["`invoke` 最多 3 个", "`parameter` 最多 10 个"] {
-                assert!(text.contains(needle), "应写上数量上限 {needle}：{text}");
+            for needle in [
+                "`invoke` 最多 3 个",
+                "`parameter` 最多 10 个",
+                super::INVOKE_CLOSE,
+                super::INVOKE_OPEN,
+            ] {
+                assert!(text.contains(needle), "应写上 {needle}：{text}");
             }
         }
     }
