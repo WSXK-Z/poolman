@@ -10,7 +10,6 @@ mod chat_router;
 mod commands;
 mod config;
 mod converters;
-mod dump;
 mod entitys;
 mod extension;
 mod handlers;
@@ -111,7 +110,6 @@ async fn start_server(
     credentials: Arc<CredentialStore>,
     bridge: Arc<WebSocketBridge>,
     chat_router: Arc<ChatRouter>,
-    dump: Arc<dump::DumpConfig>,
 ) -> anyhow::Result<()> {
     init_logging();
     info!("正在启动 Rust AI 网关服务端（Tauri 集成）...");
@@ -121,12 +119,6 @@ async fn start_server(
         "配置已加载: host={}, port={}, ws_port={}",
         config.host, config.port, config.ws_port
     );
-    if dump.enabled() || dump.response_enabled() {
-        info!(
-            "落盘工具已启用：请求 / 响应 / 工具调用快照写入 {}（AI_GATEWAY_DUMP_REQUESTS=0 关闭请求阶段，AI_GATEWAY_RESPONSE_DUMP=0 关闭响应阶段）",
-            dump.dir().display()
-        );
-    }
 
     // 监听扩展 WebSocket（服务端模式，后台任务）：扩展作为客户端连接 ws://host:ws_port
     let ws_addr = format!("{}:{}", config.host, config.ws_port);
@@ -148,7 +140,6 @@ async fn start_server(
         credentials: credentials.clone(),
         config: config.clone(),
         api_keys,
-        dump,
     });
     let app = create_app(state);
 
@@ -170,7 +161,6 @@ fn build_plugin_models(
     credentials: Arc<CredentialStore>,
     timeout_ms: u64,
     stream_idle_timeout_ms: u64,
-    dump: Arc<dump::DumpConfig>,
     pool_store: Arc<dyn SessionPoolStore>,
 ) -> Vec<Arc<dyn PluginModel>> {
     let mut models: Vec<Arc<dyn PluginModel>> = Vec::new();
@@ -202,8 +192,7 @@ fn build_plugin_models(
                     Arc::new(
                         DeepSeekWebModel::new(row.display_name.clone(), executor)
                             .with_concurrency(concurrency)
-                            .with_session_store(pool_store.clone())
-                            .with_dump(dump.clone()),
+                            .with_session_store(pool_store.clone()),
                     ) as Arc<dyn PluginModel>,
                 );
             }
@@ -317,9 +306,6 @@ pub fn run() {
         Some(sessions.clone()),
     ));
     let startup_config = ServerConfig::from_env();
-    // 请求落盘工具：开发期链路排查用，可在任意环节插入（请求阶段插在推理入口、
-    // 提示词阶段插在模型内转换完成后）。模型装配需要它，故先构造。
-    let dump = Arc::new(dump::DumpConfig::from_env(&data_dir));
     // 按持久化的模型行构建运行期渠道模型，组装模型分派入口
     let plugin_models = build_plugin_models(
         &model_rows,
@@ -327,7 +313,6 @@ pub fn run() {
         credentials.clone(),
         startup_config.request_timeout_ms,
         startup_config.stream_idle_timeout_ms,
-        dump.clone(),
         provider_manager.clone() as Arc<dyn SessionPoolStore>,
     );
     info!("已实例化渠道模型 {} 个", plugin_models.len());
@@ -339,7 +324,6 @@ pub fn run() {
     let credentials_server = credentials.clone();
     let bridge_server = bridge.clone();
     let chat_router_server = chat_router.clone();
-    let dump_server = dump.clone();
 
     // 在独立线程中启动 HTTP 服务器（避免阻塞 Tauri UI）
     std::thread::spawn(move || {
@@ -349,7 +333,6 @@ pub fn run() {
             credentials_server,
             bridge_server,
             chat_router_server,
-            dump_server,
         )) {
             eprintln!("HTTP 服务端错误: {}", e);
         }

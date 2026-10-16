@@ -25,7 +25,7 @@ use super::defs::{
 use super::model::Model;
 use super::plugin::PluginModel;
 use super::pow::{build_pow_header, solve_pow};
-use crate::dump::DumpConfig;
+use crate::apis::base::DeltaChunk;
 use crate::models::deepseek_web::chat_stream_processor::{ChatStreamProcessor, ToolSchemas};
 use crate::models::deepseek_web::sse_frame_processor::{SseFrameProcessor, UpstreamError};
 
@@ -117,10 +117,10 @@ pub struct DeepSeekWebModel {
     slot_cursor: AtomicUsize,
     /// 会话 id → 最近一次响应消息 id（下轮请求的 parent_message_id）。
     session_map: Mutex<HashMap<String, i64>>,
+    /// 提问队列：网页端限制提问频率，提问按到达顺序排队，每秒放行一个。
+    ask_queue: AskQueue,
     /// 并发语义（网页渠道：会话池并发）。
     concurrency: Concurrency,
-    /// 分阶段落盘工具（响应）；None 表示不落盘。
-    dump: Option<Arc<DumpConfig>>,
 }
 
 /// 反转义 [`ChatStreamProcessor`] 解析参数值用的转义：值里的 `\` 与 `"` 写成转义形态。
@@ -145,15 +145,9 @@ impl DeepSeekWebModel {
             gate: tokio::sync::Semaphore::new(1),
             slot_cursor: AtomicUsize::new(0),
             session_map: Mutex::new(HashMap::new()),
+            ask_queue: AskQueue::new(),
             concurrency: Concurrency::single(),
-            dump: None,
         }
-    }
-
-    /// 注入分阶段落盘工具：响应按开关落盘。
-    pub fn with_dump(mut self, dump: Arc<DumpConfig>) -> Self {
-        self.dump = Some(dump);
-        self
     }
 
     /// 设置渠道并发：同时决定会话池容量与在途上限（网页渠道会话有状态，靠会话池并行）。
@@ -664,80 +658,74 @@ impl DeepSeekWebModel {
             }
             break attempt;
         };
+        // 工具调用没写完：用规范化器提示词（dsml_normalizer.md）把坏块重写一轮，修出调用就当正常结果
+        let mut repaired = false;
+        if let Some(broken) = round.parse_failure.take() {
+            let prompt = Self::repair_prompt(request.tools.as_ref(), &broken);
+            info!("工具调用解析失败，发起修复重写 prompt_len={}", prompt.len());
+            // 修复请求接在本轮回答之后：网页会话里它是紧接着的下一条消息
+            let parent = round
+                .message_id
+                .map(|id| Value::Number(id.into()))
+                .unwrap_or(Value::Null);
+            match self
+                .run_completion_round(&session_id, &parent, &prompt, true, &schemas, None)
+                .await
+            {
+                Ok(attempt) => {
+                    if !attempt.tool_calls.is_empty() {
+                        repaired = true;
+                        // 修复出的调用按原增量格式发出：index 接在已有调用之后（客户端按 index 拼参数）
+                        let base = round.tool_calls.len();
+                        if let Some(sink) = forwarding_sink(&sink_cell) {
+                            let indexed: Vec<Value> = attempt
+                                .tool_calls
+                                .iter()
+                                .enumerate()
+                                .map(|(offset, call)| {
+                                    let mut call = call.clone();
+                                    call["index"] = json!(base + offset);
+                                    info!(
+                                        tool = %call["function"]["name"].as_str().unwrap_or_default(),
+                                        arguments = %call["function"]["arguments"].as_str().unwrap_or_default(),
+                                        "修复出工具调用"
+                                    );
+                                    call
+                                })
+                                .collect();
+                            emit_delta(sink, DeltaChunk::FUNCTIONS, Value::Array(indexed));
+                        }
+                        round.tool_calls.extend(attempt.tool_calls);
+                    }
+                    // 修复轮的回答才是网页会话里最新的一条消息
+                    if attempt.message_id.is_some() {
+                        round.message_id = attempt.message_id;
+                    }
+                }
+                Err(error) => warn!("工具调用修复请求失败，按解析失败处理：{}", error),
+            }
+            if !repaired {
+                // 修复不成（模型回「无」或请求失败）：流式客户端补一条解析失败提示（非流式维持空回答）
+                if let Some(sink) = forwarding_sink(&sink_cell) {
+                    emit_delta(sink, DeltaChunk::RESPONSE, json!("工具调用格式不正确"));
+                }
+            }
+        }
         let CompletionRound {
             text,
             reasoning,
             tool_calls,
-            tool_call_raw,
-            leftover_markup,
             upstream_error,
             message_id,
             status,
             raw_body,
+            parse_failure: _,
         } = round;
         // 记下本轮响应的消息 id：下一轮请求的 parent_message_id 靠它接上服务端的消息链。
         self.remember_message_id(&session_id, message_id);
 
         let has_calls = !tool_calls.is_empty();
         let finish_reason = if has_calls { "tool_calls" } else { "stop" };
-        // 响应落盘（开发期排查）：落的是解析后的内容，不影响返回给客户端的结果。
-        if let Some(dump) = &self.dump {
-            if dump.response_enabled() {
-                let payload = ResponseDump {
-                    received_at: chrono::Utc::now().to_rfc3339(),
-                    stage: "response",
-                    model: request.model.clone(),
-                    channel: CHANNEL,
-                    web_session: Some(session_id.clone()),
-                    status,
-                    raw_len: raw_body.len(),
-                    reasoning: reasoning.clone(),
-                    reasoning_len: reasoning.chars().count(),
-                    text: text.clone(),
-                    text_len: text.chars().count(),
-                    tool_calls: Value::Array(tool_calls.clone()),
-                    finish_reason,
-                };
-                let path = dump.write_response(&payload)?;
-                info!("响应已落盘：{}", path.display());
-            }
-        }
-        // 工具调用单独落一份（模型吐的原文 + 解析出的调用）：排查「模型到底写了什么」时
-        // 不必再从响应快照里反推标记。
-        if has_calls {
-            if let Some(dump) = &self.dump {
-                if dump.response_enabled() {
-                    let payload = ToolCallDump {
-                        received_at: chrono::Utc::now().to_rfc3339(),
-                        stage: "tool-call",
-                        model: request.model.clone(),
-                        channel: CHANNEL,
-                        web_session: Some(session_id.clone()),
-                        status,
-                        raw_markup: tool_call_raw.clone(),
-                        raw_markup_len: tool_call_raw.chars().count(),
-                        calls: Value::Array(tool_calls.clone()),
-                        // `calls` 里 arguments 是 JSON 字符串，在 JSON 文件里会被再转义一层
-                        // （Windows 路径看着像多了一层反斜杠）；这里给一份客户端解析后的形态。
-                        parsed: Value::Array(
-                            tool_calls
-                                .iter()
-                                .map(|call| {
-                                    let function = &call["function"];
-                                    let arguments = function["arguments"]
-                                        .as_str()
-                                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-                                        .unwrap_or(Value::Null);
-                                    json!({ "name": function["name"], "arguments": arguments })
-                                })
-                                .collect(),
-                        ),
-                    };
-                    let path = dump.write_tool_calls(&payload)?;
-                    info!("工具调用已落盘：{}", path.display());
-                }
-            }
-        }
         if text.trim().is_empty() && !has_calls {
             // 整块（非流式）时响应体在手上；流式没有响应体，只能靠日志说明这轮没内容
             let raw = head_chars(&raw_body, 300);
@@ -943,60 +931,11 @@ fn forwarding_sink(cell: &Arc<Mutex<Option<ChunkSink>>>) -> Option<ChunkSink> {
     }))
 }
 
-/// 响应阶段落盘快照（开发期排查用）：网页返回经 `SseFrameProcessor` 解析后的内容。
-#[derive(Debug, Serialize)]
-struct ResponseDump {
-    received_at: String,
-    /// 阶段标识，便于与请求阶段的快照区分。
-    stage: &'static str,
-    /// 对外模型名。
-    model: String,
-    /// 承载它的渠道。
-    channel: &'static str,
-    /// 执行本次请求的渠道会话。
-    web_session: Option<String>,
-    /// 网页返回的 HTTP 状态。
-    status: u16,
-    /// 网页原始返回文本长度（流式下原始文本不落盘，只记长度）。
-    raw_len: usize,
-    /// 思考内容（THINK 片段）。
-    reasoning: String,
-    reasoning_len: usize,
-    /// 正文（不含思考与工具调用标记）。
-    text: String,
-    text_len: usize,
-    /// 解析出的工具调用（OpenAI 标准 tool_calls 数组，无调用时为空数组）。
-    tool_calls: Value,
-    finish_reason: &'static str,
-}
-
-/// 工具调用阶段的落盘快照（开发期排查用）：模型吐出的 DSML 原文 + 解析出的调用。
-///
-/// 与响应快照分开成文件：工具调用一有就落一份，排查时直接把原文和结果对着看。
-#[derive(Debug, Serialize)]
-struct ToolCallDump {
-    received_at: String,
-    /// 阶段标识，便于与请求 / 响应阶段的快照区分。
-    stage: &'static str,
-    /// 对外模型名。
-    model: String,
-    /// 承载它的渠道。
-    channel: &'static str,
-    /// 执行本次请求的渠道会话。
-    web_session: Option<String>,
-    /// 网页返回的 HTTP 状态。
-    status: u16,
-    /// 检测器吃掉的 DSML 原文：标记逐字保留（含块内换行与参数值），即「模型吐了什么」。
-    raw_markup: String,
-    /// 原始文本长度（字符数）。
-    raw_markup_len: usize,
-    /// 原文解析出的工具调用（OpenAI 标准 tool_calls 数组），即「解析出了什么」。
-    ///
-    /// 注意 `arguments` 按 OpenAI 契约是 **JSON 字符串**，在 JSON 文件里会被再转义一层：
-    /// 想看可读形态（路径不会被看成多一层反斜杠）用 `parsed`。
-    calls: Value,
-    /// 同一批调用的可读形态：`arguments` 是对象，等于客户端 `JSON.parse(arguments)` 之后的形态。
-    parsed: Value,
+/// 出站一条单键增量（与 [`ChatStreamProcessor`] 的增量同格式：`{"键":值}`）。
+fn emit_delta(mut sink: ChunkSink, key: &str, value: Value) {
+    let mut frame = serde_json::Map::with_capacity(1);
+    frame.insert(key.to_string(), value);
+    sink(Value::Object(frame).to_string());
 }
 
 impl Model for DeepSeekWebModel {
@@ -2586,200 +2525,6 @@ mod tests {
         assert_eq!(arguments(1)["path"], json!("b.rs"));
         assert_eq!(arguments(1)["view_range"], json!([320, 400]));
         assert_eq!(arguments(1)["raw"], json!(true));
-    }
-
-    /// 落盘关闭时模型侧不产出任何文件：响应与工具调用两条落盘路径都跳过，链路照常返回结果。
-    #[tokio::test]
-    async fn disabled_dump_keeps_dir_clean() {
-        let dir = std::env::temp_dir().join(format!("poolman-nodump-{}", uuid::Uuid::new_v4()));
-        let dump = Arc::new(crate::dump::DumpConfig::new(
-            false,
-            dir.to_string_lossy().to_string(),
-        ));
-        let markup = dsml_calls(&[dsml_invoke("read_file", &[("path", "a.rs")])]);
-        let body = content_frame("答") + &content_frame(&markup);
-        let executor = executor(&body, 0);
-        let model =
-            DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>).with_dump(dump);
-
-        let response = model.infer(tool_request()).await.expect("推理应成功");
-        assert_eq!(response.text, "答", "调用之前的正文照常返回");
-        assert_eq!(
-            response.tool_calls.unwrap()[0]["function"]["name"],
-            "read_file"
-        );
-        assert!(!dir.exists(), "落盘关闭时不应创建目录，更不应写文件");
-    }
-
-    /// 响应落盘：落一份解析结果快照，且不打断链路，客户端拿到正常结果。
-    #[tokio::test]
-    async fn response_dump_writes_file_and_continues() {
-        let dir = std::env::temp_dir().join(format!("poolman-dump-{}", uuid::Uuid::new_v4()));
-        let dump = Arc::new(crate::dump::DumpConfig::new(
-            true,
-            dir.to_string_lossy().to_string(),
-        ));
-        let body = "data: {\"p\":\"response/content\",\"v\":\"答\"}\n";
-        let executor = executor(body, 0);
-        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>)
-            .with_dump(dump);
-
-        let response = model.infer(user_request()).await.expect("落盘不应打断链路");
-        assert_eq!(response.text, "答");
-        assert!(
-            !executor.requests.lock().unwrap().is_empty(),
-            "落盘后仍应发起渠道请求"
-        );
-
-        let files: Vec<_> = std::fs::read_dir(&dir)
-            .expect("落盘目录应已创建")
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .collect();
-        assert_eq!(files.len(), 1, "一次请求落一份响应快照");
-        assert!(
-            files[0]
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("response-")),
-            "快照文件名应带阶段前缀：{:?}",
-            files[0]
-        );
-
-        let doc: Value = serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap();
-        assert_eq!(doc["stage"], "response");
-        assert_eq!(doc["channel"], CHANNEL);
-        assert_eq!(doc["model"], "deepseek-web");
-        // 会话池给这次请求分配的槽位就是本次使用的网页会话
-        let pooled = executor
-            .sessions()
-            .keys()
-            .next()
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(doc["web_session"], json!(pooled));
-        assert!(!pooled.is_empty(), "应记录了本次使用的网页会话");
-        assert_eq!(doc["status"], 200);
-        assert_eq!(doc["text"], "答");
-        assert_eq!(doc["text_len"], 1);
-        assert_eq!(doc["reasoning"], "", "该次没有思考片段");
-        assert_eq!(doc["tool_calls"], json!([]));
-        assert_eq!(doc["finish_reason"], "stop");
-        assert_eq!(
-            doc["raw_len"],
-            body.len() as u64,
-            "记下网页原始返回文本长度"
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// 工具调用单独落一份：既有模型吐出的原文，也有解析出的调用，且不打扰链路。
-    #[tokio::test]
-    async fn tool_call_dump_records_raw_and_parsed() {
-        let dir = std::env::temp_dir().join(format!("poolman-dump-{}", uuid::Uuid::new_v4()));
-        let dump = Arc::new(crate::dump::DumpConfig::new(
-            true,
-            dir.to_string_lossy().to_string(),
-        ));
-        // 模型按提示词规则转义 Windows 路径：原文两级反斜杠，落值一级
-        let markup = dsml_calls(&[dsml_invoke(
-            "read_file",
-            &[("path", r#"d:\\projects\\a.rs"#)],
-        )]);
-        let body = content_frame("先读文件") + &content_frame(&markup);
-        let executor = executor(&body, 7);
-        let model =
-            DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>).with_dump(dump);
-        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
-        let sink = seen.clone();
-        model
-            .infer_stream(
-                tool_request(),
-                Box::new(move |delta| sink.lock().unwrap().push(delta)),
-            )
-            .await
-            .expect("流式推理应成功");
-
-        let doc: Value =
-            serde_json::from_slice(&std::fs::read(dump_file(&dir, "tool-call-")).unwrap()).unwrap();
-        assert_eq!(doc["stage"], "tool-call");
-        assert_eq!(doc["channel"], "deepseek-web");
-        assert_eq!(doc["raw_markup"], markup, "落的是模型吐出的标记原文");
-        assert_eq!(
-            doc["raw_markup_len"].as_u64().unwrap(),
-            markup.chars().count() as u64
-        );
-        assert_eq!(doc["calls"][0]["function"]["name"], "read_file");
-        // calls.arguments 是 JSON 字符串（客户端拿到的那层），解出来是单层反斜杠的路径
-        let arguments: Value =
-            serde_json::from_str(doc["calls"][0]["function"]["arguments"].as_str().unwrap())
-                .unwrap();
-        assert_eq!(arguments["path"], json!(r#"d:\projects\a.rs"#));
-        // parsed 是可读形态：路径就是单层反斜杠，不会因为文件再转义一层看着变多
-        assert_eq!(doc["parsed"][0]["name"], "read_file");
-        assert_eq!(
-            doc["parsed"][0]["arguments"]["path"],
-            json!(r#"d:\projects\a.rs"#)
-        );
-
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// 落盘目录里按前缀取最近写出的那份快照。
-    fn dump_file(dir: &std::path::Path, prefix: &str) -> std::path::PathBuf {
-        std::fs::read_dir(dir)
-            .expect("落盘目录应已创建")
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(prefix))
-            })
-            .unwrap_or_else(|| panic!("应落一份 {prefix}* 快照"))
-    }
-
-    /// 响应快照落的是解析后的三类内容：思考、正文、工具调用。
-    #[tokio::test]
-    async fn response_dump_records_parsed_content() {
-        let dir = std::env::temp_dir().join(format!("poolman-dump-{}", uuid::Uuid::new_v4()));
-        let dump = Arc::new(crate::dump::DumpConfig::new(
-            true,
-            dir.to_string_lossy().to_string(),
-        ));
-        let body = concat!(
-            "data: {\"v\":{\"response\":{\"message_id\":6,\"fragments\":[{\"type\":\"THINK\",\"content\":\"想\"}]}}}\n",
-            "data: {\"v\":\"一下\"}\n",
-            "data: {\"p\":\"response/fragments\",\"o\":\"APPEND\",\"v\":[{\"type\":\"RESPONSE\",\"content\":\"<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\\\"read_file\\\"><｜｜DSML｜｜ parameter name=\\\"path\\\" string=\\\"true\\\">a.rs</｜｜DSML｜｜ parameter></｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>\"}]}\n",
-        );
-        let executor = executor(body, 0);
-        let model =
-            DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>).with_dump(dump);
-        model.infer(tool_request()).await.expect("推理应成功");
-
-        let file = std::fs::read_dir(&dir)
-            .expect("落盘目录应已创建")
-            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with("response-"))
-            })
-            .expect("应落一份响应快照");
-        let doc: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-
-        assert_eq!(doc["stage"], "response");
-        assert_eq!(doc["reasoning"], "想一下", "思考原文");
-        assert_eq!(doc["reasoning_len"], 3);
-        assert_eq!(doc["text"], "", "标记不算正文");
-        assert_eq!(doc["tool_calls"][0]["function"]["name"], "read_file");
-        assert_eq!(
-            doc["tool_calls"][0]["function"]["arguments"],
-            "{\"path\":\"a.rs\"}"
-        );
-        assert_eq!(doc["finish_reason"], "tool_calls");
-        assert!(doc["raw_len"].as_u64().unwrap() > 0, "记下原始文本长度");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// 渠道会话管理由模型自行完成。

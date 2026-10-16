@@ -27,19 +27,13 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
 /// 装配完整应用：横切关注点 + 各 API 格式路由。
 pub fn create_app(state: Arc<AppState>) -> Router {
     let cors = cors_layer(&state.config);
-    // 推理接口的路由层（后者最外层，先执行）：
-    // 1) 请求落盘工具——启用时落盘后直接返回「开发中」，后续环节（含鉴权）不执行；
-    // 2) API Key 鉴权。健康检查与模型列表两者都不经过。
+    // 推理接口的路由层（后者最外层，先执行）：API Key 鉴权；健康检查与模型列表不经过它。
     let inference = Router::new()
         .merge(crate::apis::openai::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::apis::base::require_api_key,
-        ))
-        /* .route_layer(middleware::from_fn_with_state(
-            state.dump.clone(),
-            crate::dump::require_dump,
-        )) */;
+        ));
     Router::new()
         .merge(crate::apis::base::routes())
         .merge(inference)

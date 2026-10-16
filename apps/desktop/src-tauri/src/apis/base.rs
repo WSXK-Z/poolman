@@ -35,8 +35,6 @@ pub struct AppState {
     pub config: ServerConfig,
     /// 外部接入凭据。
     pub api_keys: Arc<ApiKeyStore>,
-    /// 请求落盘工具配置（开发期链路排查）。
-    pub dump: Arc<crate::dump::DumpConfig>,
 }
 
 /// 调用方身份：由鉴权中间件解析后注入请求扩展，handler 从扩展读取。
