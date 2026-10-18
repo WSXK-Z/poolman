@@ -77,6 +77,7 @@ export default defineContentScript({
     'https://gemini.google.com/*',
     'https://kimi.moonshot.cn/*',
     'https://tongyi.aliyun.com/*',
+    'https://yuanbao.tencent.com/*',
   ],
   world: 'ISOLATED',
   runAt: 'document_idle',
@@ -171,6 +172,7 @@ export default defineContentScript({
             url?: string;
             headers?: Record<string, string>;
             body?: string | null;
+            bodyBase64?: string | null;
             streaming?: boolean;
           }
         | undefined;
@@ -187,6 +189,7 @@ export default defineContentScript({
             url: msg.url,
             headers: msg.headers,
             body: msg.body,
+            bodyBase64: msg.bodyBase64,
             streaming: msg.streaming,
           },
           '*',
@@ -257,5 +260,6 @@ function detectProvider(hostname: string): string | null {
   if (hostname.includes('gemini')) return 'gemini-web';
   if (hostname.includes('kimi') || hostname.includes('moonshot')) return 'kimi-web';
   if (hostname.includes('tongyi') || hostname.includes('aliyun')) return 'qwen-web';
+  if (hostname.includes('yuanbao')) return 'yuanbao-web';
   return null;
 }

@@ -39,6 +39,8 @@ pub struct ExecuteRequestPayload {
     pub method: String,
     pub headers: Vec<(String, String)>,
     pub body: String,
+    /// 请求体字节（base64 编码）。有值时扩展按字节还原并作为 fetch body 发出，`body` 被忽略。
+    pub body_base64: Option<String>,
     /// 本次请求所属的会话键（网页会话 id）。调度层用它维持会话粘性，
     /// 让同一会话固定落到同一台插件上（避免网页端会话状态分裂）。
     pub session_key: Option<String>,
@@ -294,6 +296,7 @@ impl WebSocketBridge {
                 "url": payload.url,
                 "headers": headers_obj,
                 "body": body_field,
+                "bodyBase64": payload.body_base64,
                 "streaming": on_chunk.is_some(),
             }
         });
@@ -669,6 +672,7 @@ mod tests {
                             method: "POST".to_string(),
                             headers: vec![],
                             body: "{}".to_string(),
+                            body_base64: None,
                             session_key: Some("sess-e2e".to_string()),
                         },
                         5_000,
@@ -774,6 +778,7 @@ mod tests {
             method: "POST".to_string(),
             headers: vec![],
             body: "{}".to_string(),
+            body_base64: None,
             session_key: None,
         }
     }

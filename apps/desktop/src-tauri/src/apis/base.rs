@@ -213,18 +213,29 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 }
 
 /// 模型列表：由供应商注册表提供，已按启停过滤。
+///
+/// 每条记录附带模型的输入 / 输出上限，取值来自承载该模型的渠道；渠道不可用时省略这两个键。
 pub async fn models_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let models: Vec<_> = state
         .chat_router
         .list_models()
         .into_iter()
         .map(|model| {
-            serde_json::json!({
+            let capability = state
+                .chat_router
+                .channel(&ChatRouter::map_model(&model.id))
+                .map(|channel| channel.capability());
+            let mut item = serde_json::json!({
                 "id": model.id,
                 "object": "model",
                 "owned_by": model.owned_by,
                 "provider": model.provider,
-            })
+            });
+            if let Some(capability) = capability {
+                item["context_length"] = serde_json::json!(capability.context_length);
+                item["max_output_tokens"] = serde_json::json!(capability.max_output_tokens);
+            }
+            item
         })
         .collect();
     AxumJson(serde_json::json!({ "object": "list", "data": models }))

@@ -62,6 +62,7 @@ export async function handleServerMessage(
           url: payload.url,
           headers: payload.headers,
           body: payload.body,
+          bodyBase64: payload.bodyBase64,
           streaming: payload.streaming,
         });
         // 注意：这里不回传结果。content 执行过程中会以 EXECUTE_CHUNK/RESULT/ERROR 回包，
@@ -113,10 +114,11 @@ export async function handleServerMessage(
         backgroundState.setSettings({ enabledProviders });
         await browser.storage.local.set(backgroundState.settings as unknown as Record<string, unknown>);
         if (action === 'connect') {
-          await getProvider(provider).open();
+          const target = getProvider(provider);
+          await target.open();
           backgroundState.setProviderStatus(provider, {
             connected: true,
-            authed: !!backgroundState.getToken(provider),
+            authed: await target.checkAuth(),
             tokenCaptured: !!backgroundState.getToken(provider),
           });
         } else {

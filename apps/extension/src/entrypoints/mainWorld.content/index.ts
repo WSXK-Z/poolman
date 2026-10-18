@@ -18,6 +18,7 @@ export default defineContentScript({
     'https://gemini.google.com/*',
     'https://kimi.moonshot.cn/*',
     'https://tongyi.aliyun.com/*',
+    'https://yuanbao.tencent.com/*',
   ],
   world: 'MAIN',
   runAt: 'document_start',
@@ -34,6 +35,7 @@ export default defineContentScript({
       if (hostname.includes('gemini')) return 'gemini-web';
       if (hostname.includes('kimi') || hostname.includes('moonshot')) return 'kimi-web';
       if (hostname.includes('tongyi') || hostname.includes('aliyun')) return 'qwen-web';
+      if (hostname.includes('yuanbao')) return 'yuanbao-web';
       return null;
     }
 
@@ -76,7 +78,8 @@ export default defineContentScript({
      *  注意排除 create_pow_challenge / chat_session 等辅助接口，避免污染聊天接口模板。 */
     function isChatApi(url: string): boolean {
       if (/(create_pow_challenge|chat_session|session\/create)/i.test(url)) return false;
-      return /(chat\/completion|completion|conversation|chat\/send|api\/v\d+\/chat\/completion)/i.test(url);
+      // `api/chat/` 覆盖元宝这类「/api/chat/{会话 id}」形态的对话接口。
+      return /(chat\/completion|completion|conversation|chat\/send|api\/chat\/|api\/v\d+\/chat\/completion)/i.test(url);
     }
 
     /** 从请求体 JSON 中提取「模板字段」（不含具体消息内容） */
@@ -85,6 +88,10 @@ export default defineContentScript({
       try {
         const parsed = JSON.parse(body) as Record<string, unknown>;
         if (!parsed || typeof parsed !== 'object') return null;
+        const bodyKeys = Object.keys(parsed);
+        // 空对象没有可学习的字段：元宝等页面会高频 POST `{}` 做状态轮询，
+        // 把它当聊天模板上报会反复覆盖真实模板并触发无意义的凭证同步。
+        if (bodyKeys.length === 0) return null;
         return {
           agent_name: parsed.agent_name,
           model_name: parsed.model_name,
@@ -101,11 +108,95 @@ export default defineContentScript({
           thinking_enabled: typeof parsed.thinking_enabled === 'boolean' ? parsed.thinking_enabled : undefined,
           search_enabled: typeof parsed.search_enabled === 'boolean' ? parsed.search_enabled : undefined,
           // 记录请求体顶层所有字段名，便于完整还原 schema
-          body_keys: Object.keys(parsed),
+          body_keys: bodyKeys,
         };
       } catch {
         return null;
       }
+    }
+
+    /**
+     * 按接口族缓存的真实请求头：签名头与接口绑定，不同接口族混用会互相覆盖。
+     * 键为 URL 的资源段（如 `chat`、`user`），值为该族最近一次真实请求的完整头。
+     */
+    const cachedHeadersByFamily = new Map<string, Record<string, string>>();
+
+    /**
+     * 最近一次捕获的真实请求头：页面重载 / 扩展重载后，目标接口族可能还没被观察过
+     * （例如元宝的聊天族只在页面里手动提问时出现），此时用它兜底补齐签名头。
+     */
+    let lastCapturedHeaders: Record<string, string> | null = null;
+
+    /**
+     * 请求头缓存的持久化 key（按页面源隔离）：页面重载后聊天族签名头不会凭空消失，
+     * 否则要等用户在页面里再聊一次才能恢复。
+     */
+    const HEADER_CACHE_KEY = '__ai_gateway_request_headers';
+
+    /** 从 localStorage 恢复上一次捕获的请求头。 */
+    function loadHeaderCache(): void {
+      try {
+        const raw = localStorage.getItem(HEADER_CACHE_KEY);
+        if (!raw) return;
+        const stored = JSON.parse(raw) as {
+          byFamily?: Record<string, Record<string, string>>;
+          last?: Record<string, string>;
+        };
+        for (const [family, headers] of Object.entries(stored.byFamily ?? {})) {
+          if (headers && typeof headers === 'object') cachedHeadersByFamily.set(family, headers);
+        }
+        if (stored.last && typeof stored.last === 'object') lastCapturedHeaders = stored.last;
+      } catch {
+        /* 存储不可用或内容损坏时忽略 */
+      }
+    }
+
+    /** 持久化当前请求头缓存。 */
+    function saveHeaderCache(): void {
+      try {
+        localStorage.setItem(
+          HEADER_CACHE_KEY,
+          JSON.stringify({
+            byFamily: Object.fromEntries(cachedHeadersByFamily),
+            last: lastCapturedHeaders,
+          }),
+        );
+      } catch {
+        /* 存储不可用时只保留内存缓存 */
+      }
+    }
+
+    /** 取 URL 的资源段作为接口族标识：跳过 `api` 前缀，取其后第一段。 */
+    function headerFamily(url: string): string {
+      try {
+        const path = new URL(url, location.origin).pathname;
+        const segments = path.split('/').filter(Boolean);
+        const index = segments[0] === 'api' ? 1 : 0;
+        return segments[index] ?? '';
+      } catch {
+        return '';
+      }
+    }
+
+    /** 浏览器托管或与单次请求绑定的头：复用会破坏请求，必须剔除。 */
+    const UNREPLAYABLE_HEADERS = new Set([
+      'content-length',
+      'host',
+      'connection',
+      'cookie',
+      'origin',
+      'referer',
+      'accept-encoding',
+    ]);
+
+    /** 过滤缓存头，只保留可跨请求复用的部分（伪头与非白名单字段一律丢弃）。 */
+    function reusableHeaders(headers: Record<string, string>): Record<string, string> {
+      const out: Record<string, string> = {};
+      for (const [key, value] of Object.entries(headers)) {
+        if (key.startsWith(':') || UNREPLAYABLE_HEADERS.has(key)) continue;
+        out[key] = value;
+      }
+      return out;
     }
 
     function report(
@@ -121,6 +212,11 @@ export default defineContentScript({
       const headerRecord = headersToRecord(headers);
 
       if (isChat) {
+        cachedHeadersByFamily.set(headerFamily(url), headerRecord);
+        lastCapturedHeaders = headerRecord;
+        saveHeaderCache();
+      }
+      if (isChat && template) {
         // DeepSeek 完成接口需要 x-hif-leim / x-hif-dliq（会话级静态头），单独提取上报
         const hifHeaders: { leim?: string; dliq?: string } = {};
         if (headerRecord['x-hif-leim']) hifHeaders.leim = headerRecord['x-hif-leim'];
@@ -145,6 +241,9 @@ export default defineContentScript({
         );
       }
     }
+
+    // 页面重载后先用上次持久化的请求头填缓存，随后真实请求会覆盖为最新值。
+    loadHeaderCache();
 
     // 拦截 fetch
     const origFetch = window.fetch.bind(window);
@@ -202,6 +301,7 @@ export default defineContentScript({
       url: string;
       headers: Record<string, string>;
       body?: string | null;
+      bodyBase64?: string | null;
       streaming?: boolean;
     }): Promise<void> {
       // 防挂起：非流式用总超时（页面偶发对 pow / 会话接口挂起，不返回也不关闭）；
@@ -222,12 +322,31 @@ export default defineContentScript({
         // 重要：这里必须用被拦截器保存的原始 origFetch，而不是被包装后的 window.fetch，
         // 否则执行器请求也会被上面的拦截器劫持（report 捕获 + 包装），既污染模板捕获，
         // 也可能因拦截逻辑干扰到真实执行。
+        // bodyBase64 有值时按字节还原为二进制体（multipart 等）；否则用文本 body；
+        // 两者都为空则传 undefined：GET/HEAD 请求不能携带 body（否则浏览器报 "Request with GET/HEAD method cannot have body"）
+        let fetchBody: BodyInit | undefined;
+        if (opts.bodyBase64) {
+          const binary = atob(opts.bodyBase64);
+          const bytes = new Uint8Array(binary.length);
+          for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+          fetchBody = bytes;
+        } else if (opts.body) {
+          fetchBody = opts.body;
+        }
+        // 签名头（x-uskey 等）由页面 JS 生成，桌面端无法离线复刻：以拦截到的真实聊天请求头
+        // 为基础，再用服务端下发的头覆盖，补齐页面 fetch 不会自动附加的部分。
+        // 目标接口族尚未被观察过时退回最近一次的缓存头，避免整条签名头缺失。
+        // 缓存头先过滤掉浏览器托管字段，否则 content-length / host 等会破坏请求。
+        const family = headerFamily(opts.url);
+        const cached = cachedHeadersByFamily.get(family) ?? lastCapturedHeaders ?? {};
+        const mergedHeaders: Record<string, string> = {
+          ...reusableHeaders(cached),
+          ...opts.headers,
+        };
         const res = await origFetch(opts.url, {
           method: opts.method || 'POST',
-          // 服务端已过滤 forbidden headers（host/origin/cookie 等），只保留 x-* + Content-Type/Authorization
-          headers: opts.headers,
-          // 空 body 转 undefined：GET/HEAD 请求不能携带 body（否则浏览器报 "Request with GET/HEAD method cannot have body"）
-          body: opts.body ? opts.body : undefined,
+          headers: mergedHeaders,
+          body: fetchBody,
           // 同源请求默认带 cookie；DeepSeek 鉴权走 Authorization 头，cookie 无鉴权不影响
           credentials: 'same-origin',
           signal: controller.signal,

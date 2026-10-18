@@ -149,6 +149,7 @@ impl ChatRouter {
             "gemini" | "gemini-web" => "gemini-web",
             "kimi" | "kimi-web" => "kimi-web",
             "qwen" | "qwen-web" => "qwen-web",
+            "yuanbao" | "yuanbao-web" => "yuanbao-web",
             "deepseek" | "deepseek-web" => "deepseek-web",
             model if model.starts_with("gpt-") => "chatgpt-web",
             model if model.starts_with("claude-") => "claude-web",
@@ -224,6 +225,7 @@ mod tests {
                 stream: true,
                 tools: self.tools,
                 vision: false,
+                ..ModelCapability::basic()
             }
         }
 

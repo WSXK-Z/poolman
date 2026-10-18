@@ -70,6 +70,8 @@ export interface ExecuteRequestPayload {
   headers: Record<string, string>;
   /** 请求体 JSON 字符串 */
   body?: string | null;
+  /** 请求体字节（base64 编码）。有值时插件按字节还原为 fetch body，`body` 被忽略 */
+  bodyBase64?: string | null;
   /** 是否流式读取响应体（流式时逐块回 EXECUTE_CHUNK，最后回 EXECUTE_RESULT） */
   streaming?: boolean;
 }

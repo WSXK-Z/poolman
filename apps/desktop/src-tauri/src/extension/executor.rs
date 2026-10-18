@@ -68,6 +68,7 @@ impl PluginChannelExecutor {
             method: request.method,
             headers: request.headers,
             body: request.body.unwrap_or_default(),
+            body_base64: request.body_base64,
             session_key: request.session_key,
         }
     }
@@ -89,6 +90,12 @@ impl ChannelExecutor for PluginChannelExecutor {
 
     fn settings_token(&self) -> Option<String> {
         self.credentials.get_settings_token(&self.channel)
+    }
+
+    fn api_template(&self) -> Option<serde_json::Value> {
+        self.credentials
+            .get(&self.channel)
+            .and_then(|creds| creds.api_template)
     }
 
     fn execute(&self, request: ChannelRequest) -> BoxFuture<'_, Result<ChannelResponse>> {
@@ -392,6 +399,7 @@ mod tests {
                 method: "POST".to_string(),
                 headers: vec![("Content-Type".to_string(), "application/json".to_string())],
                 body: Some("{}".to_string()),
+                body_base64: None,
                 session_key: Some("sess-1".to_string()),
             })
             .await
@@ -515,6 +523,7 @@ mod tests {
                     method: "POST".to_string(),
                     headers: vec![],
                     body: Some("{}".to_string()),
+                    body_base64: None,
                     session_key: None,
                 },
                 Box::new(move |delta| collected.lock().unwrap().push(delta)),
@@ -564,6 +573,7 @@ mod tests {
                 method: "POST".to_string(),
                 headers: vec![],
                 body: None,
+                body_base64: None,
                 session_key: None,
             })
             .await
@@ -588,6 +598,7 @@ mod tests {
             method: "GET".to_string(),
             headers: vec![],
             body: None,
+            body_base64: None,
             session_key: Some("s".to_string()),
         });
         assert_eq!(payload.provider, "deepseek-web");

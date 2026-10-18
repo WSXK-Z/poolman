@@ -124,15 +124,21 @@ pub struct ModelCapability {
     pub tools: bool,
     /// 支持图像输入。
     pub vision: bool,
+    /// 单次请求可容纳的输入上限（token）。
+    pub context_length: u32,
+    /// 单次回答的输出上限（token）。
+    pub max_output_tokens: u32,
 }
 
 impl ModelCapability {
-    /// 基础能力：支持流式与工具调用。
+    /// 基础能力：支持流式与工具调用，输入上限 64K、输出上限 8K。
     pub fn basic() -> Self {
         Self {
             stream: true,
             tools: true,
             vision: false,
+            context_length: 64 * 1024,
+            max_output_tokens: 8 * 1024,
         }
     }
 }
@@ -148,6 +154,9 @@ pub struct ChannelRequest {
     pub headers: Vec<(String, String)>,
     /// 请求体（GET 等无体请求为 None）。
     pub body: Option<String>,
+    /// 请求体字节（base64 编码）。有值时执行器按字节还原后作为请求体发出，`body` 被忽略；
+    /// 用于 multipart 等含二进制段的请求。
+    pub body_base64: Option<String>,
     /// 本次请求所属渠道会话（供传输层维持会话粘性）。
     pub session_key: Option<String>,
 }
@@ -200,6 +209,11 @@ pub trait ChannelExecutor: Send + Sync {
 
     /// 渠道设置令牌。
     fn settings_token(&self) -> Option<String>;
+
+    /// 插件捕获的网页请求模板（含真实签名头）；未捕获时为 None。
+    fn api_template(&self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// 执行一次请求，返回完整响应。
     fn execute(&self, request: ChannelRequest) -> BoxFuture<'_, Result<ChannelResponse>>;
