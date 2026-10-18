@@ -35,7 +35,7 @@ use extension::credentials::CredentialStore;
 use extension::executor::PluginChannelExecutor;
 use extension::manager::ExtensionManager;
 use extension::websocket::WebSocketBridge;
-use models::{DeepSeekWebModel, PluginModel, SessionPoolStore};
+use models::{DeepSeekWebModel, PluginModel, SessionPoolStore, YuanbaoWebModel};
 use providers::provider_control::{read_enablement_file, ProviderControl};
 use providers::{seed, ProviderManager};
 use session::manager::SessionManager;
@@ -197,6 +197,21 @@ fn build_plugin_models(
                             .with_concurrency(concurrency)
                             .with_session_store(pool_store.clone()),
                     ) as Arc<dyn PluginModel>,
+                );
+            }
+            "yuanbao-web" => {
+                let executor = Arc::new(
+                    PluginChannelExecutor::new(
+                        bridge.clone(),
+                        credentials.clone(),
+                        row.channel.clone(),
+                        timeout_ms,
+                    )
+                    .with_stream_idle_timeout(stream_idle_timeout_ms),
+                );
+                models.push(
+                    Arc::new(YuanbaoWebModel::new(row.display_name.clone(), executor))
+                        as Arc<dyn PluginModel>,
                 );
             }
             other => info!("渠道 {} 暂无桌面端模型实现，跳过实例化", other),

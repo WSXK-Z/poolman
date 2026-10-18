@@ -13,7 +13,10 @@ pub mod defs;
 pub mod model;
 pub mod plugin;
 pub mod pow;
+pub mod prompt;
+pub mod yuanbao_web;
 
 pub use deepseek_web::DeepSeekWebModel;
+pub use yuanbao_web::YuanbaoWebModel;
 pub use defs::{Concurrency, InferRequest, ModelResponse, SessionPoolStore};
 pub use plugin::PluginModel;

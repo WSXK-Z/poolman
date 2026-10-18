@@ -56,13 +56,14 @@ impl ProviderControl {
 
     /// 合并固定供应商目录、扩展实时状态和桌面启用状态供界面展示。
     pub fn list(&self, extension_status: &serde_json::Value) -> Vec<ManagedProvider> {
-        const PROVIDERS: [(&str, &str); 6] = [
+        const PROVIDERS: [(&str, &str); 7] = [
             ("deepseek-web", "DeepSeek"),
             ("chatgpt-web", "ChatGPT"),
             ("claude-web", "Claude"),
             ("gemini-web", "Gemini"),
             ("kimi-web", "Kimi"),
             ("qwen-web", "通义千问"),
+            ("yuanbao-web", "腾讯元宝"),
         ];
         PROVIDERS
             .iter()

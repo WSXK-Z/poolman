@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use base64::Engine;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
@@ -33,38 +34,38 @@ use crate::models::deepseek_web::sse_frame_processor::{SseFrameProcessor, Upstre
 pub const CHANNEL: &str = "deepseek-web";
 
 /// 拼装提示词时置顶的前缀：网页会话本身带着历史对话，要求模型只依据本次内容作答。
-const PROMPT_PREFIX: &str =
+pub(crate) const PROMPT_PREFIX: &str =
     "不需要考虑之前的内容，输出中文思考和正文，你只需要根据以下内容回答问题：";
 
 /// 系统提示词段标题：正文取自全部 system 消息。
-const SYSTEM_HEADING: &str = "以下是【系统提示词】：";
+pub(crate) const SYSTEM_HEADING: &str = "以下是【系统提示词】：";
 
 /// 历史对话段标题：正文是除最新一条记录以外的消息。
-const HISTORY_HEADING: &str = "以下是【历史对话内容】：";
+pub(crate) const HISTORY_HEADING: &str = "以下是【历史对话内容】：";
 
 /// 工具调用格式与限定规则段标题。
-const TOOL_RULE_HEADING: &str = "以下是【工具调用格式和限定规则】：";
+pub(crate) const TOOL_RULE_HEADING: &str = "以下是【工具调用格式和限定规则】：";
 
 /// 可用工具段标题。
-const TOOLS_HEADING: &str = "以下是【可用工具】：";
+pub(crate) const TOOLS_HEADING: &str = "以下是【可用工具】：";
 
 /// 工具调用块的开边 / 闭边（DSML 标记，全角竖线）。
-const CALLS_OPEN: &str = "<｜｜DSML｜｜ calls>";
-const CALLS_CLOSE: &str = "</｜｜DSML｜｜ calls>";
+pub(crate) const CALLS_OPEN: &str = "<｜｜DSML｜｜ calls>";
+pub(crate) const CALLS_CLOSE: &str = "</｜｜DSML｜｜ calls>";
 
 /// 单次调用的开边前缀（后面接 `工具名">`）/ 闭边。
-const INVOKE_OPEN: &str = "<｜｜DSML｜｜ invoke";
-const INVOKE_CLOSE: &str = "</｜｜DSML｜｜ invoke>";
+pub(crate) const INVOKE_OPEN: &str = "<｜｜DSML｜｜ invoke";
+pub(crate) const INVOKE_CLOSE: &str = "</｜｜DSML｜｜ invoke>";
 
 /// 参数的开边前缀（后面接 `参数名" string="…">`）/ 闭边。
-const PARAMETER_OPEN: &str = "<｜｜DSML｜｜ parameter";
-const PARAMETER_CLOSE: &str = "</｜｜DSML｜｜ parameter>";
+pub(crate) const PARAMETER_OPEN: &str = "<｜｜DSML｜｜ parameter";
+pub(crate) const PARAMETER_CLOSE: &str = "</｜｜DSML｜｜ parameter>";
 
 /// 工具调用格式与限定规则：网页版没有原生工具调用，靠这段文字约束模型按 DSML 标记输出调用。
 ///
 /// 标记形态必须与 [`ChatStreamProcessor`] 认的一致，
 /// 且与 [`DeepSeekWebModel::render_tool_calls`] 渲染历史调用的方式一致。
-const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
+pub(crate) const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 
 - **要调工具**：整条回复**只**输出 DSML，标记外零字符。
 - **不调工具**：只输出正文，禁止出现任何 DSML 标签。
@@ -107,7 +108,7 @@ const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
 
 /// 工具调用修复提示词（`src/prompts/dsml_normalizer.md`，编译期嵌入）：DSML 解析失败时
 /// 把坏块交给模型按它重写；`{{REGISTERED_TOOLS}}` 占位符由 [`DeepSeekWebModel::repair_prompt`] 填充。
-const NORMALIZER_PROMPT: &str = include_str!("../prompts/dsml_normalizer.md");
+pub(crate) const NORMALIZER_PROMPT: &str = include_str!("../prompts/dsml_normalizer.md");
 
 const COMPLETION_URL: &str = "https://chat.deepseek.com/api/v0/chat/completion";
 const SESSION_CREATE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/create";
@@ -116,10 +117,22 @@ const SESSION_DELETE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/
 const SESSION_TITLE_URL: &str = "https://chat.deepseek.com/api/v0/chat_session/update_title";
 const HISTORY_URL: &str = "https://chat.deepseek.com/api/v0/chat/history_messages";
 const POW_CHALLENGE_URL: &str = "https://chat.deepseek.com/api/v0/chat/create_pow_challenge";
+const UPLOAD_FILE_URL: &str = "https://chat.deepseek.com/api/v0/file/upload_file";
+const FETCH_FILES_URL: &str = "https://chat.deepseek.com/api/v0/file/fetch_files";
+
+/// PoW 挑战与应答共用的 `target_path`：按接口区分，两边必须是同一条路径。
+const COMPLETION_PATH: &str = "/api/v0/chat/completion";
+const UPLOAD_FILE_PATH: &str = "/api/v0/file/upload_file";
 
 /// 网页版默认模型类型与思考开关。
 const MODEL_TYPE: &str = "default";
 const THINKING_ENABLED: bool = true;
+
+/// 网页端单次请求可容纳的输入上限（token）。
+const CONTEXT_LENGTH: u32 = 1024 * 1024;
+
+/// 网页端单次回答的输出上限（token）。
+const MAX_OUTPUT_TOKENS: u32 = 300 * 1024;
 
 /// 网页端报告的「对话达到长度上限」结束原因：这个池内会话要换新。
 const CONTEXT_LIMIT_REASON: &str = "context_length_exceeded";
@@ -167,7 +180,7 @@ pub struct DeepSeekWebModel {
 ///
 /// 渲染历史调用（[`DeepSeekWebModel::render_tool_calls`]）必须用它，否则同一个值渲染后再解析回来
 /// 会被反转义吃掉一层反斜杠（如 UNC 路径 `\\server\share` 变成 `\server\share`）。
-fn escape(text: &str) -> String {
+pub(crate) fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
@@ -254,6 +267,7 @@ impl DeepSeekWebModel {
                 method: method.to_string(),
                 headers: self.default_headers(),
                 body,
+                body_base64: None,
                 session_key: session_key.map(str::to_string),
             })
             .await?;
@@ -268,14 +282,17 @@ impl DeepSeekWebModel {
     }
 
     /// 取得并求解一次 PoW 挑战，返回 `x-ds-pow-response` 头值；失败时返回 None。
-    async fn pow_header(&self, session_key: Option<&str>) -> Option<String> {
+    ///
+    /// `target_path` 为目标接口路径：挑战按它下发，应答头也必须按它回填。
+    async fn pow_header(&self, session_key: Option<&str>, target_path: &str) -> Option<String> {
         let response = self
             .executor
             .execute(ChannelRequest {
                 url: POW_CHALLENGE_URL.to_string(),
                 method: "POST".to_string(),
                 headers: self.default_headers(),
-                body: Some(json!({ "target_path": "/api/v0/chat/completion" }).to_string()),
+                body: Some(json!({ "target_path": target_path }).to_string()),
+                body_base64: None,
                 session_key: session_key.map(str::to_string),
             })
             .await
@@ -355,277 +372,36 @@ impl DeepSeekWebModel {
             _ => Value::Null,
         }
     }
-
-    /// 把推理请求拼成渠道所需的 prompt，顺序固定为：
-    /// 固定前缀 → 系统提示词 → 历史对话 → 工具调用格式与限定规则 → 可用工具 → 最新一条记录。
-    ///
-    /// 工具结果的标题带上工具名与调用 id，与助手标记里那次 `invoke` 一一对应。
-    /// 提示词组装不属于模型；这里只做渠道所需的最小拼接。
-    fn prompt_of(request: &InferRequest) -> String {
-        let mut sections: Vec<String> = vec![PROMPT_PREFIX.to_string()];
-
-        let system = Self::render_system(&request.messages);
-        if !system.is_empty() {
-            sections.push(format!("{}\n{}", SYSTEM_HEADING, system));
-        }
-
-        // system 消息已单独成段，其余消息里末尾那条是最新记录，之前的都算历史对话。
-        let turns: Vec<&Value> = request
-            .messages
-            .iter()
-            .filter(|message| !Self::is_system(message))
-            .collect();
-        let Some((latest, history)) = turns.split_last() else {
-            return sections.join("\n\n");
-        };
-        let tool_names = Self::tool_names(&request.messages);
-        let history = history
-            .iter()
-            .filter_map(|message| Self::render_message(message, &tool_names))
-            .collect::<Vec<_>>();
-        if !history.is_empty() {
-            sections.push(format!("{}\n{}", HISTORY_HEADING, history.join("\n\n")));
-        }
-        // 工具段只在确实有工具时出现：格式规则与工具清单成对给出。
-        if let Some(tools) = Self::render_tools(request.tools.as_ref()) {
-            sections.push(format!("{}\n{}", TOOL_RULE_HEADING, TOOL_RULE));
-            sections.push(format!("{}\n{}", TOOLS_HEADING, tools));
-        }
-        if let Some(latest) = Self::render_message(latest, &tool_names) {
-            sections.push(latest);
-        }
-        sections.join("\n\n")
+    /// 把推理请求拼成渠道所需的 prompt（规则见 [`super::prompt`]）。
+    pub(crate) fn prompt_of(request: &InferRequest) -> String {
+        super::prompt::build_prompt(request)
     }
 
-    /// 组装修复提示词：规范化器提示词（`dsml_normalizer.md`）填上可用工具清单，
-    /// 末尾附上解析失败的坏块原文——模型对它只回规范 DSML 调用块或「无」。
+    /// 组装修复提示词（规则见 [`super::prompt`]）。
     fn repair_prompt(tools: Option<&Value>, broken_markup: &str) -> String {
-        let registered = Self::render_tools(tools).unwrap_or_else(|| "（无）".to_string());
-        format!(
-            "{}\n\n{}\n\n以下是用户输入内容：\n{}",
-            PROMPT_PREFIX,
-            NORMALIZER_PROMPT.replace("{{REGISTERED_TOOLS}}", &registered),
-            broken_markup
-        )
+        super::prompt::repair_prompt(tools, broken_markup)
     }
 
-    /// 是否为 system 消息。
-    fn is_system(message: &Value) -> bool {
-        message.get("role").and_then(Value::as_str) == Some("system")
-    }
-
-    /// 系统提示词段：取全部 system 消息正文，多条之间空行分隔。
-    fn render_system(messages: &[Value]) -> String {
-        messages
-            .iter()
-            .filter(|message| Self::is_system(message))
-            .map(Self::message_content)
-            .filter(|content| !content.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    }
-
-    /// 取消息正文：字符串，或多模态内容数组里的文本片段；非文本片段只留占位标记，
-    /// 避免把图片的 base64 塞进提示词。
-    fn message_content(message: &Value) -> String {
-        match message.get("content") {
-            Some(Value::String(text)) => text.clone(),
-            Some(Value::Array(parts)) => parts
-                .iter()
-                .map(Self::render_part)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n"),
-            _ => String::new(),
-        }
-    }
-
-    /// 单条消息 → `【角色】正文`；助手消息里的历史工具调用按 DSML 标记接在正文之后。
-    ///
-    /// 正文只有空白时按空处理：模型写在标记前后的排版、客户端存下的空段都不算回答内容，
-    /// 原样写进提示词只会变成大段空行。
-    /// 工具结果消息的标题带上工具名与调用 id，模型才能把它和上面那次 `invoke` 一一对上。
-    fn render_message(message: &Value, tool_names: &HashMap<String, String>) -> Option<String> {
-        let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-        let mut content = Self::message_content(message);
-        if content.trim().is_empty() {
-            content.clear();
-        }
-        for call in Self::render_tool_calls(message) {
-            if !content.is_empty() {
-                content.push('\n');
-            }
-            content.push_str(&call);
-        }
-        if role.is_empty() && content.is_empty() {
-            return None;
-        }
-        let heading = match Self::tool_result_label(message, tool_names) {
-            Some(label) => format!("【{}】{}", role, label),
-            None => format!("【{}】", role),
-        };
-        if content.is_empty() {
-            return Some(heading);
-        }
-        Some(format!("{}\n{}", heading, content))
-    }
-
-    /// 工具结果消息的来源标签：`name=工具名 id=调用id`，缺哪半就只写另一半，都缺则不标。
-    ///
-    /// 字段名跟着写上，模型不必猜哪个是工具名、哪个是调用编号。
-    /// 工具名优先取消息自带的 `name`，没有就按 `tool_call_id` 到本轮全部助手消息的
-    /// `tool_calls` 里反查——客户端通常只回 `tool_call_id`。
-    fn tool_result_label(message: &Value, tool_names: &HashMap<String, String>) -> Option<String> {
-        if message.get("role").and_then(Value::as_str) != Some("tool") {
-            return None;
-        }
-        let id = message.get("tool_call_id").and_then(Value::as_str);
-        let name = message
-            .get("name")
-            .and_then(Value::as_str)
-            .or_else(|| id.and_then(|id| tool_names.get(id).map(String::as_str)));
-        match (name, id) {
-            (Some(name), Some(id)) => Some(format!("name={name} id={id}")),
-            (Some(name), None) => Some(format!("name={name}")),
-            (None, Some(id)) => Some(format!("id={id}")),
-            (None, None) => None,
-        }
-    }
-
-    /// 全部助手消息里的 `tool_calls` → `调用id → 工具名`，供工具结果标注来源。
-    fn tool_names(messages: &[Value]) -> HashMap<String, String> {
-        let mut names = HashMap::new();
-        for message in messages {
-            let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-                continue;
-            };
-            for call in calls {
-                let Some(id) = call.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                let function = call.get("function").unwrap_or(call);
-                if let Some(name) = function.get("name").and_then(Value::as_str) {
-                    names.insert(id.to_string(), name.to_string());
-                }
-            }
-        }
-        names
-    }
-
-    /// 助手消息里的 `tool_calls` → DSML 标记，一次调用一层 `invoke`，多个平铺在一个 `calls` 块里。
-    ///
-    /// 参数是字符串时按 JSON 解析成对象，解析不了就原样保留。渲染出来的标记与解析器认的格式一致：
-    /// 字符串参数标 `string="true"` 原样写，其余（数字 / 布尔 / 数组 / 对象）标 `string="false"` 按 JSON 写，
-    /// 这样同一段标记被解析回来仍是同一个调用（见 `history_markup_round_trips_through_parser`）。
-    /// 调用带 `id` 时一并写进 `invoke` 属性（解析器不读它），与工具结果标题上的 id 对应。
+    /// 助手消息里的 `tool_calls` → DSML 标记（规则见 [`super::prompt`]）。
     fn render_tool_calls(message: &Value) -> Vec<String> {
-        let Some(calls) = message.get("tool_calls").and_then(Value::as_array) else {
-            return Vec::new();
-        };
-        let mut lines = Vec::new();
-        for call in calls {
-            let function = call.get("function").unwrap_or(call);
-            let Some(name) = function.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let id = call
-                .get("id")
-                .and_then(Value::as_str)
-                .map(|id| format!(" id=\"{id}\""))
-                .unwrap_or_default();
-            let arguments = match function.get("arguments") {
-                Some(Value::String(raw)) => {
-                    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.clone()))
-                }
-                Some(other) => other.clone(),
-                None => json!({}),
-            };
-            let Some(params) = arguments.as_object() else {
-                // 参数不是对象（客户端给了坏数据）：只还原工具名，别编造参数
-                warn!(
-                    "历史工具调用的 arguments 不是 JSON 对象，按无参还原：{}",
-                    name
-                );
-                lines.push(format!(
-                    "{INVOKE_OPEN} name=\"{name}\"{id}>{INVOKE_CLOSE}"
-                ));
-                continue;
-            };
-            lines.push(format!("{INVOKE_OPEN} name=\"{name}\"{id}>"));
-            for (key, value) in params {
-                // 字符串参数按解析端的反转义规则转义，保证渲染后再解析回来还是同一个值
-                let (flag, literal) = match value {
-                    Value::String(text) => ("true", escape(text)),
-                    other => ("false", other.to_string()),
-                };
-                lines.push(format!(
-                    "{PARAMETER_OPEN} name=\"{key}\" string=\"{flag}\">{literal}{PARAMETER_CLOSE}"
-                ));
-            }
-            lines.push(INVOKE_CLOSE.to_string());
-        }
-        if lines.is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::with_capacity(lines.len() + 2);
-        out.push(CALLS_OPEN.to_string());
-        out.extend(lines);
-        out.push(CALLS_CLOSE.to_string());
-        out
+        super::prompt::render_tool_calls(message)
     }
 
-    /// 多模态内容片段 → 文本；非文本片段给占位标记（如 `[image_url]`）。
-    fn render_part(part: &Value) -> String {
-        if let Some(text) = part.get("text").and_then(Value::as_str) {
-            return text.to_string();
-        }
-        let kind = part
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or("未知片段");
-        format!("[{}]", kind)
-    }
-
-    /// 工具清单：每项一行 `- 名称：描述`，参数以紧凑 JSON 附在其后；没有可用工具时返回 None。
-    fn render_tools(tools: Option<&Value>) -> Option<String> {
-        let items = tools
-            .and_then(Value::as_array)
-            .filter(|items| !items.is_empty())?;
-        let lines = items
-            .iter()
-            .filter_map(|item| {
-                let function = item.get("function").unwrap_or(item);
-                let name = function.get("name").and_then(Value::as_str).unwrap_or("");
-                if name.is_empty() {
-                    return None;
-                }
-                let mut line = format!("- {}", name);
-                if let Some(description) = function.get("description").and_then(Value::as_str) {
-                    if !description.is_empty() {
-                        line.push_str(&format!("：{}", description));
-                    }
-                }
-                if let Some(parameters) = function.get("parameters") {
-                    line.push_str(&format!("\n  参数：{}", parameters));
-                }
-                Some(line)
-            })
-            .collect::<Vec<_>>();
-        if lines.is_empty() {
-            return None;
-        }
-        Some(lines.join("\n"))
-    }
-
-    /// 聊天完成请求体。
-    fn completion_body(&self, session_id: &str, parent_message_id: &Value, prompt: &str) -> String {
+    /// 聊天完成请求体；`ref_file_ids` 为本轮引用的附件 id，无附件时为空。
+    fn completion_body(
+        &self,
+        session_id: &str,
+        parent_message_id: &Value,
+        prompt: &str,
+        ref_file_ids: &[String],
+    ) -> String {
         json!({
             "chat_session_id": session_id,
             "parent_message_id": parent_message_id,
             "model_type": MODEL_TYPE,
             "prompt": prompt,
             "thinking_enabled": THINKING_ENABLED,
-            "ref_file_ids": [],
+            "ref_file_ids": ref_file_ids,
             "search_enabled": false,
         })
         .to_string()
@@ -634,10 +410,168 @@ impl DeepSeekWebModel {
     /// 聊天头（含 PoW 应答，取不到则不附带）。
     async fn completion_headers(&self, session_key: Option<&str>) -> Vec<(String, String)> {
         let mut headers = self.default_headers();
-        if let Some(pow) = self.pow_header(session_key).await {
+        if let Some(pow) = self.pow_header(session_key, COMPLETION_PATH).await {
             headers.push(("x-ds-pow-response".to_string(), pow));
         }
         headers
+    }
+
+    /// 上传一个附件：按字节拼 multipart 表单，经渠道以二进制体发出，返回网页端文件 id。
+    ///
+    /// 网页端要求 `file` 字段带文件名与 MIME，并附 `x-file-size` 等头；请求体由传输层按
+    /// base64 还原后原样发出（`body` 被忽略）。
+    async fn upload_file(&self, bytes: &[u8], file_name: &str, mime: &str) -> Result<String> {
+        const BOUNDARY: &str = "----AiGatewayBoundary9c1f4e7a";
+        let mut body: Vec<u8> = Vec::new();
+        body.extend_from_slice(format!("--{BOUNDARY}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"file\"; filename=\"{file_name}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {mime}\r\n\r\n").as_bytes());
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+        let mut headers = self.default_headers();
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Content-Type"));
+        headers.push((
+            "Content-Type".to_string(),
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        ));
+        headers.push(("x-file-size".to_string(), bytes.len().to_string()));
+        headers.push(("x-model-type".to_string(), MODEL_TYPE.to_string()));
+        headers.push((
+            "x-thinking-enabled".to_string(),
+            if THINKING_ENABLED { "1" } else { "0" }.to_string(),
+        ));
+        if let Some(pow) = self.pow_header(None, UPLOAD_FILE_PATH).await {
+            headers.push(("x-ds-pow-response".to_string(), pow));
+        }
+
+        let response = self
+            .executor
+            .execute(ChannelRequest {
+                url: UPLOAD_FILE_URL.to_string(),
+                method: "POST".to_string(),
+                headers,
+                body: None,
+                body_base64: Some(base64::engine::general_purpose::STANDARD.encode(&body)),
+                session_key: None,
+            })
+            .await?;
+        if !response.ok {
+            anyhow::bail!(
+                "附件上传失败（HTTP {}）：{}",
+                response.status,
+                response.body.chars().take(200).collect::<String>()
+            );
+        }
+        let json: Value = serde_json::from_str(&response.body).unwrap_or(Value::Null);
+        let file_id = json
+            .get("data")
+            .and_then(|data| data.get("biz_data"))
+            .and_then(|biz| biz.get("id"))
+            .or_else(|| json.get("data").and_then(|data| data.get("id")))
+            .or_else(|| json.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        if file_id.is_empty() {
+            anyhow::bail!(
+                "附件上传响应缺少文件 id：{}",
+                response.body.chars().take(200).collect::<String>()
+            );
+        }
+        Ok(file_id.to_string())
+    }
+
+    /// 轮询附件解析状态，直到 `SUCCESS`；超时或上游报错时返回错误。
+    ///
+    /// 状态机为 `PENDING` → `PARSING` → `SUCCESS`，解析完成前该文件不能参与对话。
+    async fn wait_file_ready(&self, file_id: &str) -> Result<()> {
+        const TIMEOUT: Duration = Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + TIMEOUT;
+        let mut backoff = Duration::from_millis(500);
+        loop {
+            let url = format!("{FETCH_FILES_URL}?file_ids={file_id}");
+            let json = self.send("GET", &url, None, None).await?;
+            let status = json
+                .get("data")
+                .and_then(|data| data.get("biz_data"))
+                .and_then(|biz| biz.get("files"))
+                .and_then(Value::as_array)
+                .and_then(|files| files.first())
+                .and_then(|file| file.get("status"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            match status {
+                "SUCCESS" => return Ok(()),
+                "FAILED" | "ERROR" => anyhow::bail!("附件解析失败：{}", file_id),
+                _ => {}
+            }
+            if tokio::time::Instant::now() + backoff > deadline {
+                anyhow::bail!("等待附件解析超时：{}", file_id);
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(4));
+        }
+    }
+
+    /// 从消息里提取附件并上传，返回网页端文件 id 列表。
+    ///
+    /// 附件按 OpenAI 多模态形态承载：内容数组里的 `image_url` 片段，其 `url` 为
+    /// `data:<mime>;base64,<数据>`。逐个上传并等待解析完成，任一失败即整轮报错。
+    async fn collect_ref_file_ids(&self, messages: &[Value]) -> Result<Vec<String>> {
+        let mut file_ids = Vec::new();
+        let mut index = 0usize;
+        for message in messages {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("image_url") {
+                    continue;
+                }
+                let Some(url) = part
+                    .get("image_url")
+                    .and_then(|image| image.get("url"))
+                    .and_then(Value::as_str)
+                else {
+                    continue;
+                };
+                let Some((mime, bytes)) = Self::parse_data_uri(url) else {
+                    warn!("附件 data URI 无法解析，已跳过：{}", head_chars(url, 60));
+                    continue;
+                };
+                index += 1;
+                let extension = match mime.as_str() {
+                    "image/png" => "png",
+                    "image/jpeg" => "jpg",
+                    "image/webp" => "webp",
+                    "image/gif" => "gif",
+                    "application/pdf" => "pdf",
+                    _ => "bin",
+                };
+                let file_name = format!("attachment-{index}.{extension}");
+                let file_id = self.upload_file(&bytes, &file_name, &mime).await?;
+                self.wait_file_ready(&file_id).await?;
+                file_ids.push(file_id);
+            }
+        }
+        Ok(file_ids)
+    }
+
+    /// 解析 `data:<mime>;base64,<数据>`，返回 MIME 与解码后的字节。
+    fn parse_data_uri(url: &str) -> Option<(String, Vec<u8>)> {
+        let rest = url.strip_prefix("data:")?;
+        let (meta, payload) = rest.split_once(',')?;
+        let mime = meta.strip_suffix(";base64")?;
+        if mime.is_empty() {
+            return None;
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .ok()?;
+        Some((mime.to_string(), bytes))
     }
 
     /// 聊天共用实现：`on_chunk` 为 Some 时流式回吐正文增量，工具调用在收尾时解析；
@@ -654,6 +588,8 @@ impl DeepSeekWebModel {
     ) -> Result<ModelResponse> {
         self.token()?;
         let prompt = Self::prompt_of(&request);
+        // 附件先上传并等解析完成：只有解析成功的文件才能参与本轮对话。
+        let ref_file_ids = self.collect_ref_file_ids(&request.messages).await?;
         // 请求没带工具时不做工具检测：模型就算写了 DSML 标记也只当正文。
         let recognize_tools = request
             .tools
@@ -687,6 +623,7 @@ impl DeepSeekWebModel {
                     &session_id,
                     &parent_message_id,
                     &prompt,
+                    &ref_file_ids,
                     recognize_tools,
                     &schemas,
                     forwarding_sink(&sink_cell),
@@ -734,7 +671,7 @@ impl DeepSeekWebModel {
                 .map(|id| Value::Number(id.into()))
                 .unwrap_or(Value::Null);
             match self
-                .run_completion_round(&session_id, &parent, &prompt, true, &schemas, None)
+                .run_completion_round(&session_id, &parent, &prompt, &[], true, &schemas, None)
                 .await
             {
                 Ok(attempt) => {
@@ -791,6 +728,10 @@ impl DeepSeekWebModel {
 
         let has_calls = !tool_calls.is_empty();
         let finish_reason = if has_calls { "tool_calls" } else { "stop" };
+        // 按本轮实际发送的 prompt 与返回正文估算用量：网页端只回报会话累计值，不能当作本轮消耗。
+        let prompt_tokens = estimate_tokens(&prompt);
+        let completion_tokens = estimate_tokens(&text);
+        let total_tokens = prompt_tokens + completion_tokens;
         if text.trim().is_empty() && !has_calls {
             // 上游原文留一段打出来：否则「请求走完了但客户端什么都没有」无从排查
             let raw = head_chars(&raw_body, RAW_HEAD_CHARS);
@@ -827,7 +768,11 @@ impl DeepSeekWebModel {
             } else {
                 None
             },
-            usage: None,
+            usage: Some(json!({
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "total_tokens": total_tokens,
+            })),
             finish_reason: Some(finish_reason.to_string()),
             is_complete: true,
         })
@@ -842,6 +787,7 @@ impl DeepSeekWebModel {
         session_id: &str,
         parent_message_id: &Value,
         prompt: &str,
+        ref_file_ids: &[String],
         recognize_tools: bool,
         schemas: &ToolSchemas,
         on_chunk: Option<ChunkSink>,
@@ -850,14 +796,23 @@ impl DeepSeekWebModel {
             url: COMPLETION_URL.to_string(),
             method: "POST".to_string(),
             headers: self.completion_headers(Some(session_id)).await,
-            body: Some(self.completion_body(session_id, parent_message_id, prompt)),
+            body: Some(self.completion_body(session_id, parent_message_id, prompt, ref_file_ids)),
+            body_base64: None,
             session_key: Some(session_id.to_string()),
         };
         // 排队等放行：网页端每秒最多接受一次提问。
         self.ask_queue.enqueue().await;
 
-        let (text, reasoning, tool_calls, parse_failure, upstream_error, message_id, status, raw_body) =
-            match on_chunk {
+        let (
+            text,
+            reasoning,
+            tool_calls,
+            parse_failure,
+            upstream_error,
+            message_id,
+            status,
+            raw_body,
+        ) = match on_chunk {
                 Some(user_sink) => {
                     // 帧处理器与增量处理器各自独立：闭包是 FnMut，跨 chunk 的状态用 Arc<Mutex> 共享。
                     let frames = Arc::new(Mutex::new(SseFrameProcessor::new()));
@@ -1080,7 +1035,11 @@ impl Model for DeepSeekWebModel {
     }
 
     fn capability(&self) -> ModelCapability {
-        ModelCapability::basic()
+        ModelCapability {
+            context_length: CONTEXT_LENGTH,
+            max_output_tokens: MAX_OUTPUT_TOKENS,
+            ..ModelCapability::basic()
+        }
     }
 
     fn concurrency(&self) -> Concurrency {
@@ -1167,6 +1126,7 @@ impl PluginModel for DeepSeekWebModel {
                     method: "POST".to_string(),
                     headers: self.default_headers(),
                     body: Some(body),
+                    body_base64: None,
                     session_key: Some(session_id.to_string()),
                 })
                 .await?;
@@ -1225,13 +1185,32 @@ fn head_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
 }
 
+/// 按字符估算 token 数：非 ASCII 字符计 1，ASCII 字符 4 个计 1。
+/// 网页上游不回传用量，这里给出近似值，与真实计费存在偏差。
+fn estimate_tokens(text: &str) -> u32 {
+    let mut wide = 0usize;
+    let mut narrow = 0usize;
+    for ch in text.chars() {
+        if ch.is_ascii() {
+            narrow += 1;
+        } else {
+            wide += 1;
+        }
+    }
+    (wide + narrow.div_ceil(4)) as u32
+}
+
 /// 解析整段响应文本（非流式情形）：返回收尾后的增量处理器（供读取正文 / 思考 / 工具调用）
 /// 与响应消息 id（供下轮 `parent_message_id`）。
 fn parse_sse_text(
     body: &str,
     recognize_tools: bool,
     schemas: &ToolSchemas,
-) -> (ChatStreamProcessor, Option<i64>, Option<UpstreamError>) {
+) -> (
+    ChatStreamProcessor,
+    Option<i64>,
+    Option<UpstreamError>,
+) {
     let mut frames = SseFrameProcessor::new();
     let mut processor =
         ChatStreamProcessor::new(Box::new(|_| {}), recognize_tools).with_tool_schemas(schemas.clone());
@@ -1262,7 +1241,10 @@ fn encode_query(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::session_pool::POOL_TITLE_PREFIX;
-    use super::{AskQueue, DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL, PROMPT_PREFIX};
+    use super::{
+        estimate_tokens, AskQueue, DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL,
+        PROMPT_PREFIX,
+    };
     use crate::models::defs::{
         ChannelExecutor, ChannelRequest, ChannelResponse, ChunkSink, InferRequest, PooledSession,
         SessionPoolStore,
@@ -2346,6 +2328,23 @@ mod tests {
         let logged = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
         assert!(logged.contains("网页回答为空"), "{}", logged);
         assert!(logged.contains("会话无效"), "应打出原始响应：{}", logged);
+    }
+
+    /// 网页端的 `accumulated_token_usage` 是整段网页会话的累计值，不能当作本轮用量。
+    #[tokio::test]
+    async fn usage_reports_this_round_not_session_accumulated() {
+        let body = concat!(
+            "data: {\"v\":{\"response\":{\"message_id\":1,\"accumulated_token_usage\":763137}}}\n",
+            "data: {\"p\":\"response/content\",\"v\":\"答\"}\n",
+        );
+        let response = model(body).infer(user_request()).await.expect("推理应成功");
+        let usage = response.usage.expect("应带用量");
+        let total = usage["total_tokens"].as_u64().expect("total_tokens");
+        assert!(total < 20_000, "会话累计用量不能当作本轮用量：{usage}");
+        assert_eq!(
+            usage["completion_tokens"].as_u64(),
+            Some(estimate_tokens("答") as u64)
+        );
     }
 
     /// 网页端一个字都没回：这条会话的消息链已经和 parent 对不上（沿用它只会一直回空），

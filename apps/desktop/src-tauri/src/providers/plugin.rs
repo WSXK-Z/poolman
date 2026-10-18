@@ -68,6 +68,8 @@ pub const WEB_MODELS: &[WebModel] = &[
     // 通义千问
     WebModel { id: "qwen-max", platform: "qwen-web" },
     WebModel { id: "qwen-plus", platform: "qwen-web" },
+    // 腾讯元宝
+    WebModel { id: "yuanbao-web", platform: "yuanbao-web" },
 ];
 
 /// 对外模型名 → 承载它的网页渠道。
@@ -90,6 +92,7 @@ pub fn channel_label(channel: &str) -> &str {
         "gemini-web" => "Gemini",
         "kimi-web" => "Kimi",
         "qwen-web" => "通义千问",
+        "yuanbao-web" => "腾讯元宝",
         other => other,
     }
 }
