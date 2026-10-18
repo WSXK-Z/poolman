@@ -26,6 +26,7 @@ const providers = computed(() => {
         authed: status?.authed ?? false,
         active: enabled && (status?.authed ?? false),
         tokenCaptured: status?.tokenCaptured ?? false,
+        templateCaptured: status?.templateCaptured ?? false,
       };
     },
   );
@@ -83,7 +84,11 @@ async function selectAction(key: string): Promise<void> {
         <span class="provider-logo" :class="`logo-${provider.id}`">{{ provider.label.slice(0, 1) }}</span>
         <span class="provider-label">{{ provider.label }}</span>
         <span class="provider-status">{{ provider.active ? '已连接' : provider.enabled ? '未登录' : '已断开' }}</span>
-        <span v-if="provider.tokenCaptured" class="credential-mark" title="已捕获凭证">✓</span>
+        <span
+          v-if="provider.tokenCaptured || provider.templateCaptured"
+          class="credential-mark"
+          :title="provider.tokenCaptured ? '已捕获访问凭证' : '已捕获页面聊天接口'"
+        >✓</span>
       </button>
     </div>
     <div v-else class="empty-state">正在读取供应商状态…</div>

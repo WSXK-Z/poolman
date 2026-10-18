@@ -15,6 +15,7 @@ export default defineConfig({
       'https://gemini.google.com/*',
       'https://kimi.moonshot.cn/*',
       'https://tongyi.aliyun.com/*',
+      'https://yuanbao.tencent.com/*',
     ],
     action: {
       default_title: 'AI Gateway',

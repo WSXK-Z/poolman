@@ -7,6 +7,7 @@ import { claudeProvider } from './claude';
 import { geminiProvider } from './gemini';
 import { kimiProvider } from './kimi';
 import { qwenProvider } from './qwen';
+import { yuanbaoProvider } from './yuanbao';
 import type { AIProvider } from './base';
 
 /** Provider 注册表：ModelProvider 标识 -> 适配器实例 */
@@ -22,6 +23,7 @@ register(claudeProvider);
 register(geminiProvider);
 register(kimiProvider);
 register(qwenProvider);
+register(yuanbaoProvider);
 
 /** 根据 Provider 标识获取适配器 */
 export function getProvider(id: ModelProvider): AIProvider {

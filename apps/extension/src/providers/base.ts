@@ -15,7 +15,7 @@ export interface AIProvider {
   url: string;
   /** 标签页匹配模式（host_permissions 需覆盖） */
   matches: string[];
-  /** 检测是否已登录 */
+  /** 检测是否已登录（凭访问凭证或页面真实聊天请求等登录证据） */
   checkAuth(): Promise<boolean>;
   /** 平台支持的对外模型名 */
   getModels(): string[];

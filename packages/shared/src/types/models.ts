@@ -28,6 +28,8 @@ export const ModelMapping = {
   // Qwen
   'qwen-max': 'qwen-web',
   'qwen-plus': 'qwen-web',
+  // 腾讯元宝
+  'yuanbao-web': 'yuanbao-web',
 } as const;
 
 /** 对外暴露的模型名 */

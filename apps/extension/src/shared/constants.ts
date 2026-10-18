@@ -32,6 +32,7 @@ export const PROVIDER_LABELS: Record<ModelProvider, string> = {
   'gemini-web': 'Gemini',
   'kimi-web': 'Kimi',
   'qwen-web': 'Qwen',
+  'yuanbao-web': '腾讯元宝',
 };
 
 export interface LogEntry {

@@ -82,7 +82,8 @@ async function refreshOneProviderStatus(provider: ReturnType<typeof getProvider>
     });
     return false;
   }
-  const authed = !!backgroundState.getToken(provider.id);
+  // 各平台的登录证据不同：有的看访问凭证，有的（元宝）看页面真实聊天请求的模板。
+  const authed = await provider.checkAuth();
   backgroundState.setProviderStatus(provider.id, {
     connected: true,
     authed,
@@ -206,13 +207,17 @@ export default defineBackground(() => {
   log.info('AI Gateway background started');
 
   // 1. 恢复持久化的捕获结果 + 加载设置
-  void backgroundState.loadPersisted();
-  void browser.storage.local.get(DEFAULT_SETTINGS as unknown as Record<string, unknown>).then((stored) => {
+  // 先恢复凭证/模板再算状态：元宝等平台的登录证据就是持久化的接口模板，顺序反了会先报未登录。
+  void (async () => {
+    await backgroundState.loadPersisted();
+    const stored = await browser.storage.local.get(
+      DEFAULT_SETTINGS as unknown as Record<string, unknown>,
+    );
     const settings: AppSettings = { ...DEFAULT_SETTINGS, ...(stored as Partial<AppSettings>) };
     backgroundState.setSettings(settings);
     startConnection();
     void refreshProviderStatus();
-  });
+  })();
 
   // 2. 周期刷新凭证状态（同时用于 SW 心跳）
   setInterval(() => void refreshProviderStatus(), 60_000);
@@ -350,6 +355,8 @@ export default defineBackground(() => {
             }
             // 连接器化：接口模板捕获后立即同步给服务端
             syncCredentialsToServer(message.payload.provider);
+            // 模板同样是登录证据（元宝等 cookie 鉴权平台无 token），刷新后状态栏才能变为已连接
+            void refreshOneProviderStatus(getProvider(message.payload.provider));
             backgroundState.addLog('info', `捕获到 ${message.payload.provider} 接口模板: ${message.payload.url}`);
           }
           return;
