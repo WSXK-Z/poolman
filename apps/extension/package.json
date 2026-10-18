@@ -1,6 +1,6 @@
 {
   "name": "@ai-gateway/extension",
-  "version": "0.1.13",
+  "version": "0.2.3",
   "private": true,
   "type": "module",
   "scripts": {
