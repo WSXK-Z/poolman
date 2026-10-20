@@ -303,6 +303,7 @@ export default defineBackground(() => {
           }
           if (hasToken || hasSettings) {
             const provider = getProvider(message.payload.provider);
+            const wasAuthed = backgroundState.providers[message.payload.provider]?.authed ?? false;
             backgroundState.setProviderStatus(message.payload.provider, {
               connected: true,
               authed: !!backgroundState.getToken(message.payload.provider),
@@ -310,6 +311,9 @@ export default defineBackground(() => {
               tokenCaptured: !!backgroundState.getToken(message.payload.provider),
               templateCaptured: !!backgroundState.getApiTemplate(message.payload.provider),
             });
+            // 状态刚变化（含 Service Worker 重启后首次捕获）立即上报，不等 15 秒周期：
+            // 这期间桌面端会因为没有可用状态而回「没有可分配该供应商请求的已连接插件」。
+            if (changed || !wasAuthed) connection?.sendStatus();
           }
           // 连接器化：凭证有变化才同步给服务端（服务端存储与使用）并记录日志
           if (changed) {
@@ -356,7 +360,10 @@ export default defineBackground(() => {
             // 连接器化：接口模板捕获后立即同步给服务端
             syncCredentialsToServer(message.payload.provider);
             // 模板同样是登录证据（元宝等 cookie 鉴权平台无 token），刷新后状态栏才能变为已连接
-            void refreshOneProviderStatus(getProvider(message.payload.provider));
+            void refreshOneProviderStatus(getProvider(message.payload.provider)).then(() => {
+              // 状态刷新后立即上报，别让桌面端在下一个 15 秒周期前判定「没有可用插件」
+              connection?.sendStatus();
+            });
             backgroundState.addLog('info', `捕获到 ${message.payload.provider} 接口模板: ${message.payload.url}`);
           }
           return;

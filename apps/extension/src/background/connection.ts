@@ -122,7 +122,8 @@ export class GatewayConnection {
     }
   }
 
-  private sendStatus(): void {
+  /** 立即上报一次供应商状态：状态刚变化（捕获到凭证 / 模板）时调用，避免等下一个周期。 */
+  sendStatus(): void {
     if (!this.connected) return;
     const status: StatusSync = {
       id: `status_${Date.now().toString(36)}`,

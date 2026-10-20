@@ -128,6 +128,31 @@ export default defineContentScript({
     let lastCapturedHeaders: Record<string, string> | null = null;
 
     /**
+     * 页面自己的客户端标识（版本 / 设备）：从该站点的任意请求里学，页面升级后自动跟上，
+     * 桌面端不用再为了 `x-client-version` 升级而改常量。桌面端下发的同名头只作兜底。
+     */
+    const PAGE_IDENTITY_KEYS = ['x-client-version', 'x-device-id', 'x-device-model'] as const;
+    let pageIdentity: Record<string, string> = {};
+
+    /** 从一次请求头里挑出客户端标识（缺失的键不返回）。 */
+    function pickPageIdentity(headers: Record<string, string>): Record<string, string> {
+      const out: Record<string, string> = {};
+      for (const name of PAGE_IDENTITY_KEYS) {
+        const value = headers[name];
+        if (value !== undefined) out[name] = value;
+      }
+      return out;
+    }
+
+    /** 设置请求头：同名不区分大小写地先删掉，避免出现两个版本号被合并成一个值。 */
+    function setHeader(headers: Record<string, string>, name: string, value: string): void {
+      for (const key of Object.keys(headers)) {
+        if (key.toLowerCase() === name) delete headers[key];
+      }
+      headers[name] = value;
+    }
+
+    /**
      * 请求头缓存的持久化 key（按页面源隔离）：页面重载后聊天族签名头不会凭空消失，
      * 否则要等用户在页面里再聊一次才能恢复。
      */
@@ -141,11 +166,15 @@ export default defineContentScript({
         const stored = JSON.parse(raw) as {
           byFamily?: Record<string, Record<string, string>>;
           last?: Record<string, string>;
+          identity?: Record<string, string>;
         };
         for (const [family, headers] of Object.entries(stored.byFamily ?? {})) {
           if (headers && typeof headers === 'object') cachedHeadersByFamily.set(family, headers);
         }
         if (stored.last && typeof stored.last === 'object') lastCapturedHeaders = stored.last;
+        if (stored.identity && typeof stored.identity === 'object') {
+          pageIdentity = pickPageIdentity(stored.identity);
+        }
       } catch {
         /* 存储不可用或内容损坏时忽略 */
       }
@@ -159,6 +188,7 @@ export default defineContentScript({
           JSON.stringify({
             byFamily: Object.fromEntries(cachedHeadersByFamily),
             last: lastCapturedHeaders,
+            identity: pageIdentity,
           }),
         );
       } catch {
@@ -187,13 +217,29 @@ export default defineContentScript({
       'origin',
       'referer',
       'accept-encoding',
+      // PoW 应答只对一次挑战有效：把页面上一次的 `x-ds-pow-response` 复用到新的挑战 /
+      // 对话请求上，上游会直接拒绝（日志里表现为挑战 422、对话 415）。
+      'x-ds-pow-response',
+      // 附件上传的单次头，不能带到对话请求上。
+      'x-file-size',
+      'x-model-type',
+      'x-thinking-enabled',
     ]);
 
-    /** 过滤缓存头，只保留可跨请求复用的部分（伪头与非白名单字段一律丢弃）。 */
-    function reusableHeaders(headers: Record<string, string>): Record<string, string> {
+    /** 设备标识头：页面在所有接口上都会带；PoW 与 x-hif 签名只出现在对话接口上。 */
+    const DEVICE_HEADERS = new Set(['x-device-id', 'x-device-model']);
+
+    /** 过滤缓存头，只保留可跨请求复用的部分（伪头与非白名单字段一律丢弃）。
+     *  `deviceOnly` 用于辅助接口：只复用设备标识，避免把对话请求的签名头带过去。 */
+    function reusableHeaders(
+      headers: Record<string, string>,
+      deviceOnly = false,
+    ): Record<string, string> {
       const out: Record<string, string> = {};
       for (const [key, value] of Object.entries(headers)) {
-        if (key.startsWith(':') || UNREPLAYABLE_HEADERS.has(key)) continue;
+        const name = key.toLowerCase();
+        if (key.startsWith(':') || UNREPLAYABLE_HEADERS.has(name)) continue;
+        if (deviceOnly && !DEVICE_HEADERS.has(name)) continue;
         out[key] = value;
       }
       return out;
@@ -210,6 +256,18 @@ export default defineContentScript({
       const isChat = isChatApi(url);
       const template = isChat ? extractApiTemplate(body) : null;
       const headerRecord = headersToRecord(headers);
+
+      // 客户端标识从任意接口学（settings / 会话列表都带）：只在变化时落盘。
+      const identity = pickPageIdentity(headerRecord);
+      if (Object.keys(identity).length > 0) {
+        const changed = Object.entries(identity).some(
+          ([name, value]) => pageIdentity[name] !== value,
+        );
+        if (changed) {
+          pageIdentity = { ...pageIdentity, ...identity };
+          saveHeaderCache();
+        }
+      }
 
       if (isChat) {
         cachedHeadersByFamily.set(headerFamily(url), headerRecord);
@@ -337,12 +395,29 @@ export default defineContentScript({
         // 为基础，再用服务端下发的头覆盖，补齐页面 fetch 不会自动附加的部分。
         // 目标接口族尚未被观察过时退回最近一次的缓存头，避免整条签名头缺失。
         // 缓存头先过滤掉浏览器托管字段，否则 content-length / host 等会破坏请求。
+        // DeepSeek 页面只在对话接口上带 PoW 与 x-hif 签名：挑战 / 建会话等辅助接口只复用
+        // 设备标识，否则会把上一次对话的签名头带到别的接口上（会触发 422）。
         const family = headerFamily(opts.url);
         const cached = cachedHeadersByFamily.get(family) ?? lastCapturedHeaders ?? {};
-        const mergedHeaders: Record<string, string> = {
-          ...reusableHeaders(cached),
-          ...opts.headers,
-        };
+        const deviceOnly =
+          detectProvider(location.hostname) === 'deepseek-web' && !isChatApi(opts.url);
+        // 合并必须按大小写不敏感去重：缓存头是小写 `content-type`，桌面端下发的是
+        // `Content-Type`，直接展开会让 fetch 把两个值合并成
+        // `application/json, application/json`，上游直接回 415
+        //（Expected request with `Content-Type: application/json`）。
+        const mergedHeaders: Record<string, string> = {};
+        for (const [name, value] of Object.entries(reusableHeaders(cached, deviceOnly))) {
+          mergedHeaders[name.toLowerCase()] = value;
+        }
+        for (const [name, value] of Object.entries(opts.headers)) {
+          mergedHeaders[name.toLowerCase()] = value;
+        }
+        // 页面自己的客户端版本 / 设备标识优先：桌面端的常量只作页面还没被观察过时的兜底，
+        // 这样网页端升级后不用再改桌面端。
+        for (const name of PAGE_IDENTITY_KEYS) {
+          const value = pageIdentity[name];
+          if (value !== undefined) setHeader(mergedHeaders, name, value);
+        }
         const res = await origFetch(opts.url, {
           method: opts.method || 'POST',
           headers: mergedHeaders,

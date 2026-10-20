@@ -66,6 +66,21 @@ class BackgroundState {
       if (settingsTokens) this.settingsTokens = { ...this.settingsTokens, ...settingsTokens };
       if (templates) this.apiTemplates = { ...this.apiTemplates, ...templates };
       if (hif) this.hifHeaders = { ...this.hifHeaders, ...hif };
+      // 用持久化的凭证 / 模板先填一份「已连接」状态：Service Worker 或扩展刚重启时，
+      // 页面还没来得及回报，空状态会让桌面端判定「没有可分配的插件」而拒绝刚进来的请求。
+      // 真实的登录校验随后由 refreshOneProviderStatus 覆盖。
+      const persistedProviders = new Set<ModelProvider>([
+        ...(Object.keys(this.tokens) as ModelProvider[]),
+        ...(Object.keys(this.apiTemplates) as ModelProvider[]),
+      ]);
+      for (const provider of persistedProviders) {
+        this.setProviderStatus(provider, {
+          connected: true,
+          authed: true,
+          tokenCaptured: !!this.tokens[provider],
+          templateCaptured: !!this.apiTemplates[provider],
+        });
+      }
       if (!this.id) this.saveId(randomId(16));
     } catch {
       /* ignore */
