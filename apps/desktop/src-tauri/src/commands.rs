@@ -8,6 +8,7 @@ mod api_keys;
 mod plugins;
 mod providers;
 mod sessions;
+mod settings;
 
 use tauri::ipc::Invoke;
 
@@ -27,5 +28,6 @@ pub fn handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + 'static 
         sessions::handler(),
         plugins::handler(),
         providers::handler(),
+        settings::handler(),
     ]
 }

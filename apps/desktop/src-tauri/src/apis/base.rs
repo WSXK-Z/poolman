@@ -22,6 +22,7 @@ use crate::chat_router::ChatRouter;
 use crate::config::ServerConfig;
 use crate::extension::credentials::CredentialStore;
 use crate::extension::websocket::WebSocketBridge;
+use crate::throttle::ChatFrequency;
 
 /// 入口层共享状态：各 API 格式的 handler 都从这里取依赖。
 pub struct AppState {
@@ -35,6 +36,8 @@ pub struct AppState {
     pub config: ServerConfig,
     /// 外部接入凭据。
     pub api_keys: Arc<ApiKeyStore>,
+    /// 对话请求频率（网页渠道相邻两次提问的最小间隔）。
+    pub chat_frequency: Arc<ChatFrequency>,
 }
 
 /// 调用方身份：由鉴权中间件解析后注入请求扩展，handler 从扩展读取。
@@ -205,6 +208,8 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
             "port": state.config.port,
             "ws_port": state.config.ws_port,
             "request_timeout_ms": state.config.request_timeout_ms,
+            "max_request_body_bytes": state.config.max_request_body_bytes,
+            "chat_interval_ms": state.chat_frequency.interval_ms(),
         }),
         "credentials": state.credentials.summary(),
         "api_formats": crate::apis::supported_formats(),

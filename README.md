@@ -48,7 +48,7 @@ pnpm --filter @ai-gateway/desktop dev
 pnpm --filter @ai-gateway/extension dev
 ```
 
-- **桌面应用**：启动后提供 HTTP 服务，默认监听 `http://127.0.0.1:13213`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。同时打开 GUI 窗口用于状态查看和配置。
+- **桌面应用**：启动后提供 HTTP 服务，默认监听 `http://127.0.0.1:13213`，WebSocket 桥接监听 `ws://127.0.0.1:3001`。同时打开 GUI 窗口用于状态查看和配置；「配置 → 对话请求频率」可限制每个网页渠道每 x 秒最多发起一次对话请求，避免请求过快被网页端报错。
 - **插件**：在 Chrome 扩展程序页（`chrome://extensions`）开启“开发者模式”，加载已解压扩展，选择 `apps/extension/.output/chrome-mv3`（开发模式）或 `apps/extension/dist`（构建后）。插件会自动连接桌面应用的 WebSocket。
 
 ## 调用示例

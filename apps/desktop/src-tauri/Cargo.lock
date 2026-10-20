@@ -1247,7 +1247,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.2.9"
+version = "0.2.10"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -1266,6 +1266,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-tungstenite",
+ "tower",
  "tower-http 0.5.2",
  "tracing",
  "tracing-appender",

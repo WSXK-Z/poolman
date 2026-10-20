@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.2.9"
+version = "0.2.10"
 description = "poolman"
 authors = ["wushi"]
 edition = "2024"
@@ -41,4 +41,10 @@ url = "2"
 base64 = "0.22"
 serde_yaml = "0.9"
 sea-orm = { version = "2.0.2", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "schema-sync"] }
+
+[dev-dependencies]
+# 单测用暂停时钟（`#[tokio::test(start_paused = true)]`）精确验证排队间隔
+tokio = { version = "1", features = ["test-util"] }
+# 单测用 `ServiceExt::oneshot` 直接向 axum 应用发请求（验证请求体上限）
+tower = "0.5"
 

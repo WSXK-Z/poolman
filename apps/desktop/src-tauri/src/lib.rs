@@ -18,6 +18,7 @@ mod prompts;
 mod providers;
 mod session;
 mod stream_processor;
+mod throttle;
 mod utils;
 
 use std::sync::Arc;
@@ -42,6 +43,7 @@ use session::manager::SessionManager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
+use throttle::ChatFrequency;
 
 /// 数据目录（数据库/日志）：环境变量 AI_GATEWAY_DATA 覆盖；
 /// 开发模式(debug)用项目 data 目录(../data，保持现有数据不丢)，
@@ -113,6 +115,7 @@ async fn start_server(
     credentials: Arc<CredentialStore>,
     bridge: Arc<WebSocketBridge>,
     chat_router: Arc<ChatRouter>,
+    chat_frequency: Arc<ChatFrequency>,
 ) -> anyhow::Result<()> {
     init_logging();
     info!("正在启动 Rust AI 网关服务端（Tauri 集成）...");
@@ -143,6 +146,7 @@ async fn start_server(
         credentials: credentials.clone(),
         config: config.clone(),
         api_keys,
+        chat_frequency,
     });
     let app = create_app(state);
 
@@ -164,6 +168,7 @@ fn build_plugin_models(
     credentials: Arc<CredentialStore>,
     timeout_ms: u64,
     stream_idle_timeout_ms: u64,
+    chat_frequency: Arc<ChatFrequency>,
     pool_store: Arc<dyn SessionPoolStore>,
 ) -> Vec<Arc<dyn PluginModel>> {
     let mut models: Vec<Arc<dyn PluginModel>> = Vec::new();
@@ -191,13 +196,12 @@ fn build_plugin_models(
                     .with_stream_idle_timeout(stream_idle_timeout_ms),
                 );
                 let concurrency = providers::plugin::channel_concurrency(rows, &row.channel);
-                models.push(
-                    Arc::new(
-                        DeepSeekWebModel::new(row.display_name.clone(), executor)
-                            .with_concurrency(concurrency)
-                            .with_session_store(pool_store.clone()),
-                    ) as Arc<dyn PluginModel>,
-                );
+                models.push(Arc::new(
+                    DeepSeekWebModel::new(row.display_name.clone(), executor)
+                        .with_concurrency(concurrency)
+                        .with_chat_frequency(chat_frequency.clone())
+                        .with_session_store(pool_store.clone()),
+                ) as Arc<dyn PluginModel>);
             }
             "yuanbao-web" => {
                 let executor = Arc::new(
@@ -209,10 +213,10 @@ fn build_plugin_models(
                     )
                     .with_stream_idle_timeout(stream_idle_timeout_ms),
                 );
-                models.push(
-                    Arc::new(YuanbaoWebModel::new(row.display_name.clone(), executor))
-                        as Arc<dyn PluginModel>,
-                );
+                models.push(Arc::new(
+                    YuanbaoWebModel::new(row.display_name.clone(), executor)
+                        .with_chat_frequency(chat_frequency.clone()),
+                ) as Arc<dyn PluginModel>);
             }
             other => info!("渠道 {} 暂无桌面端模型实现，跳过实例化", other),
         }
@@ -379,6 +383,8 @@ pub fn run() {
         Some(sessions.clone()),
     ));
     let startup_config = ServerConfig::from_env();
+    // 对话请求频率：界面可改、立即生效，持久化在数据目录的 settings.json
+    let chat_frequency = ChatFrequency::load(&data_dir);
     // 按持久化的模型行构建运行期渠道模型，组装模型分派入口
     let plugin_models = build_plugin_models(
         &model_rows,
@@ -386,6 +392,7 @@ pub fn run() {
         credentials.clone(),
         startup_config.request_timeout_ms,
         startup_config.stream_idle_timeout_ms,
+        chat_frequency.clone(),
         provider_manager.clone() as Arc<dyn SessionPoolStore>,
     );
     info!("已实例化渠道模型 {} 个", plugin_models.len());
@@ -397,6 +404,7 @@ pub fn run() {
     let credentials_server = credentials.clone();
     let bridge_server = bridge.clone();
     let chat_router_server = chat_router.clone();
+    let chat_frequency_server = chat_frequency.clone();
 
     // 在独立线程中启动 HTTP 服务器（避免阻塞 Tauri UI）
     std::thread::spawn(move || {
@@ -406,6 +414,7 @@ pub fn run() {
             credentials_server,
             bridge_server,
             chat_router_server,
+            chat_frequency_server,
         )) {
             eprintln!("HTTP 服务端错误: {}", e);
         }
@@ -420,6 +429,7 @@ pub fn run() {
         .manage(extensions)
         .manage(bridge)
         .manage(chat_router)
+        .manage(chat_frequency)
         .invoke_handler(commands::handler())
         .setup(|app| {
             setup_tray(app)?;

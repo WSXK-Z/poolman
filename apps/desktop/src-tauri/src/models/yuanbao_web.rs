@@ -26,6 +26,7 @@ use super::model::Model;
 use super::plugin::PluginModel;
 use super::yuanbao_web::frame_processor::YuanbaoFrameProcessor;
 use crate::apis::base::DeltaChunk;
+use crate::throttle::{ChatFrequency, ChatThrottle, DEFAULT_CHAT_INTERVAL_MS};
 
 /// 渠道标识。
 pub const CHANNEL: &str = "yuanbao-web";
@@ -115,9 +116,6 @@ const MIN_SESSION_ID_LEN: usize = 10;
 /// 空回答排查时留存的原始响应长度（字符）。
 const RAW_HEAD_CHARS: usize = 2_000;
 
-/// 相邻两次提问的最小间隔：网页端对提问频率有限制，连续提交会回「服务繁忙」。
-const MIN_CHAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-
 /// 元宝上游在流里报的错（如「服务繁忙，请稍后再试。」）。
 #[derive(Debug)]
 struct UpstreamFailure(String);
@@ -138,8 +136,8 @@ pub struct YuanbaoWebModel {
     executor: std::sync::Arc<dyn ChannelExecutor>,
     /// 调用方会话标识 → 网页会话 id：同一调用方复用同一网页会话，避免每轮新建。
     sessions: Mutex<HashMap<String, String>>,
-    /// 上一次提问的时刻：用于限制提问频率。
-    last_chat: tokio::sync::Mutex<Option<tokio::time::Instant>>,
+    /// 对话请求排队：网页端限制提问频率，间隔由桌面端「对话请求频率」决定。
+    throttle: ChatThrottle,
 }
 
 impl YuanbaoWebModel {
@@ -149,20 +147,14 @@ impl YuanbaoWebModel {
             display_name: display_name.into(),
             executor,
             sessions: Mutex::new(HashMap::new()),
-            last_chat: tokio::sync::Mutex::new(None),
+            throttle: ChatThrottle::new(ChatFrequency::in_memory(DEFAULT_CHAT_INTERVAL_MS)),
         }
     }
 
-    /// 限制提问频率：距上次提问不足 [`MIN_CHAT_INTERVAL`] 时先等待。
-    async fn throttle(&self) {
-        let mut last = self.last_chat.lock().await;
-        if let Some(previous) = *last {
-            let elapsed = previous.elapsed();
-            if elapsed < MIN_CHAT_INTERVAL {
-                tokio::time::sleep(MIN_CHAT_INTERVAL - elapsed).await;
-            }
-        }
-        *last = Some(tokio::time::Instant::now());
+    /// 改用共享的对话请求频率：各渠道共用一份设置，桌面端修改后立即生效。
+    pub fn with_chat_frequency(mut self, frequency: std::sync::Arc<ChatFrequency>) -> Self {
+        self.throttle = frequency.throttle();
+        self
     }
 
     /// 把推理请求拼成渠道所需的 prompt（规则见 [`super::prompt`]）。
@@ -321,7 +313,8 @@ impl YuanbaoWebModel {
                 attempt
             );
             let body = Self::completion_body(&conversation_id, &prompt);
-            self.throttle().await;
+            // 排队等放行：网页端对提问频率有限制，间隔由「对话请求频率」设置决定。
+            self.throttle.wait().await;
             let result = match pending_sink.take() {
                 Some(sink) => self.stream_once(url, body, sink).await,
                 None => self.complete_once(url, body).await,
@@ -342,8 +335,13 @@ impl YuanbaoWebModel {
                         return Err(error);
                     }
                     // 上游明确报错（如「服务繁忙」）时先退避，立即重试只会继续撞限流。
+                    // 至少退避一秒：频率设为「不限制」时也要给网页端一点喘息时间。
                     if error.downcast_ref::<UpstreamFailure>().is_some() {
-                        tokio::time::sleep(MIN_CHAT_INTERVAL * 2).await;
+                        let backoff = self
+                            .throttle
+                            .interval()
+                            .max(std::time::Duration::from_secs(1));
+                        tokio::time::sleep(backoff * 2).await;
                     }
                 }
             }

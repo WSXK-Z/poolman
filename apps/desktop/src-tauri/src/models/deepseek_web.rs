@@ -29,6 +29,7 @@ use super::pow::{build_pow_header, solve_pow};
 use crate::apis::base::DeltaChunk;
 use crate::models::deepseek_web::chat_stream_processor::{ChatStreamProcessor, ToolSchemas};
 use crate::models::deepseek_web::sse_frame_processor::{SseFrameProcessor, UpstreamError};
+use crate::throttle::{ChatFrequency, ChatThrottle, DEFAULT_CHAT_INTERVAL_MS};
 
 /// 渠道标识。
 pub const CHANNEL: &str = "deepseek-web";
@@ -124,6 +125,13 @@ const FETCH_FILES_URL: &str = "https://chat.deepseek.com/api/v0/file/fetch_files
 const COMPLETION_PATH: &str = "/api/v0/chat/completion";
 const UPLOAD_FILE_PATH: &str = "/api/v0/file/upload_file";
 
+/// 网页端客户端版本（请求头 `x-client-version`）的兜底值。
+///
+/// 正常情况下插件会从页面自身请求里学到真实版本，并在下发执行时覆盖本值——网页端升级后
+/// 自动跟上，不用再改这里；只有页面还没被观察过（缓存为空）时才用这个常量。
+/// 版本过旧会被上游拒绝：PoW 挑战返回 422、对话接口返回 415。
+const CLIENT_VERSION: &str = "2.5.0";
+
 /// 网页版默认模型类型与思考开关。
 const MODEL_TYPE: &str = "default";
 const THINKING_ENABLED: bool = true;
@@ -170,8 +178,8 @@ pub struct DeepSeekWebModel {
     slot_cursor: AtomicUsize,
     /// 会话 id → 最近一次响应消息 id（下轮请求的 parent_message_id）。
     session_map: Mutex<HashMap<String, i64>>,
-    /// 提问队列：网页端限制提问频率，提问按到达顺序排队，每秒放行一个。
-    ask_queue: AskQueue,
+    /// 对话请求排队：网页端限制提问频率，提问按到达顺序排队，间隔由桌面端「对话请求频率」决定。
+    throttle: ChatThrottle,
     /// 并发语义（网页渠道：会话池并发）。
     concurrency: Concurrency,
 }
@@ -198,9 +206,15 @@ impl DeepSeekWebModel {
             gate: tokio::sync::Semaphore::new(1),
             slot_cursor: AtomicUsize::new(0),
             session_map: Mutex::new(HashMap::new()),
-            ask_queue: AskQueue::new(),
+            throttle: ChatThrottle::new(ChatFrequency::in_memory(DEFAULT_CHAT_INTERVAL_MS)),
             concurrency: Concurrency::single(),
         }
+    }
+
+    /// 改用共享的对话请求频率：各渠道共用一份设置，桌面端修改后立即生效。
+    pub fn with_chat_frequency(mut self, frequency: Arc<ChatFrequency>) -> Self {
+        self.throttle = frequency.throttle();
+        self
     }
 
     /// 设置渠道并发：同时决定会话池容量与在途上限（网页渠道会话有状态，靠会话池并行）。
@@ -226,13 +240,18 @@ impl DeepSeekWebModel {
                 "com.deepseek.chat".to_string(),
             ),
             ("x-client-platform".to_string(), "web".to_string()),
-            ("x-client-version".to_string(), "2.4.0".to_string()),
+            (
+                "x-client-version".to_string(),
+                CLIENT_VERSION.to_string(),
+            ),
             ("x-client-locale".to_string(), "zh_CN".to_string()),
             ("x-client-timezone-offset".to_string(), "28800".to_string()),
-            ("Content-Type".to_string(), "application/json".to_string()),
+            // 头名统一小写：插件按原样合并请求头，`Content-Type` 与 `content-type` 同时存在时
+            // 会被 fetch 合并成 `application/json, application/json`，上游直接回 415。
+            ("content-type".to_string(), "application/json".to_string()),
         ];
         if let Some(token) = self.executor.token() {
-            headers.push(("Authorization".to_string(), format!("Bearer {}", token)));
+            headers.push(("authorization".to_string(), format!("Bearer {}", token)));
         }
         if let Some(settings_token) = self.executor.settings_token() {
             headers.push(("x-settings-token".to_string(), settings_token));
@@ -298,7 +317,12 @@ impl DeepSeekWebModel {
             .await
             .ok()?;
         if !response.ok || response.body.is_empty() {
-            warn!("PoW 挑战获取失败（HTTP {}）", response.status);
+            // 带上上游原文：422 之类拒绝原因（版本过旧、anti-bot、参数不符）只记状态码查不出来。
+            warn!(
+                "PoW 挑战获取失败（HTTP {}）原始响应：{}",
+                response.status,
+                head_chars(&response.body, RAW_HEAD_CHARS)
+            );
             return None;
         }
         let json: Value = serde_json::from_str(&response.body).ok()?;
@@ -433,9 +457,9 @@ impl DeepSeekWebModel {
         body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
 
         let mut headers = self.default_headers();
-        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("Content-Type"));
+        headers.retain(|(name, _)| !name.eq_ignore_ascii_case("content-type"));
         headers.push((
-            "Content-Type".to_string(),
+            "content-type".to_string(),
             format!("multipart/form-data; boundary={BOUNDARY}"),
         ));
         headers.push(("x-file-size".to_string(), bytes.len().to_string()));
@@ -800,8 +824,8 @@ impl DeepSeekWebModel {
             body_base64: None,
             session_key: Some(session_id.to_string()),
         };
-        // 排队等放行：网页端每秒最多接受一次提问。
-        self.ask_queue.enqueue().await;
+        // 排队等放行：网页端对提问频率有限制，间隔由「对话请求频率」设置决定。
+        self.throttle.wait().await;
 
         let (
             text,
@@ -846,6 +870,12 @@ impl DeepSeekWebModel {
                         )
                         .await?;
                     if !response.ok {
+                        // 上游原文是排查 415/422 的唯一线索：错误响应里通常带 code / msg。
+                        warn!(
+                            "DeepSeek 网页推理失败：HTTP {} 原始响应：{}",
+                            response.status,
+                            head_chars(&response.body, RAW_HEAD_CHARS)
+                        );
                         anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
                     }
                     // 缓冲区里可能还留着没换行的尾巴：收尾时一并放出，再让处理器补完检测。
@@ -879,6 +909,11 @@ impl DeepSeekWebModel {
                 None => {
                     let response = self.executor.execute(channel_request).await?;
                     if !response.ok {
+                        warn!(
+                            "DeepSeek 网页推理失败：HTTP {} 原始响应：{}",
+                            response.status,
+                            head_chars(&response.body, RAW_HEAD_CHARS)
+                        );
                         anyhow::bail!("DeepSeek 网页推理失败（HTTP {}）", response.status);
                     }
                     let (processor, message_id, upstream_error) =
@@ -905,54 +940,6 @@ impl DeepSeekWebModel {
             status,
             raw_body,
         })
-    }
-}
-
-/// 提问队列：提问按到达顺序排队，每秒放行一个。
-///
-/// 网页端对提问频率有限制，提交太快会直接报错；这里给每个提问定一个放行时刻，
-/// 排在队尾之后 [`AskQueue::INTERVAL`]，因此相邻两次提问的间隔不小于一秒。
-struct AskQueue {
-    /// 队尾的放行时刻；None 表示队列为空。
-    tail: tokio::sync::Mutex<Option<tokio::time::Instant>>,
-}
-
-impl AskQueue {
-    /// 相邻两次放行之间的间隔。
-    const INTERVAL: Duration = Duration::from_secs(1);
-
-    fn new() -> Self {
-        Self {
-            tail: tokio::sync::Mutex::new(None),
-        }
-    }
-
-    /// 排到队尾，等到轮到自己再返回。
-    ///
-    /// 队伍空时立即放行；否则接在上一个提问之后一秒。取号在锁内完成，
-    /// 因此放行顺序与排队顺序一致。
-    async fn enqueue(&self) {
-        let scheduled = {
-            let mut tail = self.tail.lock().await;
-            let (scheduled, next) = Self::reserve(*tail, tokio::time::Instant::now());
-            *tail = Some(next);
-            scheduled
-        };
-        tokio::time::sleep_until(scheduled).await;
-    }
-
-    /// 取号：定出这次提问的放行时刻，并给出队尾的新时刻。
-    ///
-    /// 队尾已经过去（队列空了一会儿）就地放行，否则接在队尾之后一个间隔。
-    fn reserve(
-        tail: Option<tokio::time::Instant>,
-        now: tokio::time::Instant,
-    ) -> (tokio::time::Instant, tokio::time::Instant) {
-        let scheduled = match tail {
-            Some(previous) if previous > now => previous,
-            _ => now,
-        };
-        (scheduled, scheduled + Self::INTERVAL)
     }
 }
 
@@ -1242,8 +1229,7 @@ fn encode_query(value: &str) -> String {
 mod tests {
     use super::session_pool::POOL_TITLE_PREFIX;
     use super::{
-        estimate_tokens, AskQueue, DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL,
-        PROMPT_PREFIX,
+        estimate_tokens, DeepSeekWebModel, ToolSchemas, parse_sse_text, CHANNEL, PROMPT_PREFIX,
     };
     use crate::models::defs::{
         ChannelExecutor, ChannelRequest, ChannelResponse, ChunkSink, InferRequest, PooledSession,
@@ -1256,7 +1242,6 @@ mod tests {
     use std::collections::{BTreeMap, VecDeque};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
-    use std::time::Duration;
 
     /// 记录请求并按 URL 返回预设响应。
     ///
@@ -2249,63 +2234,6 @@ mod tests {
         assert_eq!(used[0], used[2], "槽位按容量轮转回到起点");
     }
 
-    /// 提问排队取号：队尾在将来就接在队尾之后，否则立即放行；相邻放行固定隔一个间隔。
-    #[tokio::test]
-    async fn ask_queue_reserves_one_slot_per_interval() {
-        let now = tokio::time::Instant::now();
-
-        let (scheduled, tail) = AskQueue::reserve(None, now);
-        assert_eq!(scheduled, now, "空队列立即放行");
-        assert_eq!(tail, now + AskQueue::INTERVAL, "队尾顺延一个间隔");
-
-        let (scheduled, tail) = AskQueue::reserve(Some(tail), now);
-        assert_eq!(scheduled, now + AskQueue::INTERVAL, "接在上一个提问之后");
-        assert_eq!(tail, now + AskQueue::INTERVAL * 2);
-
-        let (scheduled, tail) = AskQueue::reserve(Some(now - AskQueue::INTERVAL), now);
-        assert_eq!(scheduled, now, "队尾已过去时按当前时刻排");
-        assert_eq!(tail, now + AskQueue::INTERVAL);
-    }
-
-    /// 提问排队：按到达顺序放行，三个提问要跨两个间隔才走完。
-    #[tokio::test]
-    async fn ask_queue_releases_asks_in_queue_order() {
-        let queue = Arc::new(AskQueue::new());
-        let entered = Arc::new(Mutex::new(None::<tokio::time::Instant>));
-        let released = Arc::new(Mutex::new(Vec::<(usize, tokio::time::Instant)>::new()));
-        let mut handles = Vec::new();
-        for index in 0..3 {
-            let queue = queue.clone();
-            let entered = entered.clone();
-            let released = released.clone();
-            handles.push(tokio::spawn(async move {
-                entered
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(tokio::time::Instant::now);
-                queue.enqueue().await;
-                released
-                    .lock()
-                    .unwrap()
-                    .push((index, tokio::time::Instant::now()));
-            }));
-        }
-        for handle in handles {
-            handle.await.expect("排队任务不应结束于失败");
-        }
-
-        let released = released.lock().unwrap();
-        let order: Vec<usize> = released.iter().map(|(index, _)| *index).collect();
-        assert_eq!(order, vec![0, 1, 2], "放行顺序应与排队顺序一致");
-        // 计时从入队之前算起、记在放行之后结束，两头只会往长里算；容差留给定时器提前几毫秒到点。
-        let entered = entered.lock().unwrap().expect("应记录过入队时刻");
-        let elapsed = released.last().unwrap().1 - entered;
-        assert!(
-            elapsed + Duration::from_millis(20) >= AskQueue::INTERVAL * 2,
-            "三个提问应跨两个间隔，实际 {elapsed:?}"
-        );
-    }
-
     /// 空回答必须把原始响应打进日志：否则「请求走完了但客户端什么都没有」无从排查。
     #[tokio::test]
     async fn empty_answer_logs_raw_response() {
@@ -3268,5 +3196,14 @@ mod tests {
         );
         assert!(response.tool_calls.is_none(), "{:?}", response.tool_calls);
         assert!(response.text.is_empty(), "「无」不应当成回答发给客户端");
+    }
+
+    /// 请求头名统一小写：插件会把它和页面缓存头原样合并，`Content-Type` 与 `content-type`
+    /// 同时存在时会被 fetch 合并成 `application/json, application/json`，上游直接回 415。
+    #[test]
+    fn request_header_names_are_lowercase() {
+        for (name, _) in model("").default_headers() {
+            assert_eq!(name, name.to_lowercase(), "请求头名应统一小写：{name}");
+        }
     }
 }
