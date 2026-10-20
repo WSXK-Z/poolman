@@ -1,9 +1,13 @@
-//! 对话请求频率限制：网页渠道对提问频率有上限，提交太快会直接报错。
+//! 对话请求频率限制：网页渠道对提问频率有上限，提问太密会直接报错。
 //!
-//! 每个渠道一条排队（[`ChatThrottle`]）：相邻两次对话请求的**发起**间隔不小于配置值，
-//! 也就是「每 x 秒最多向同一网页渠道提一个问题」。频率值由 [`ChatFrequency`] 全渠道
-//! 共享一份并持久化到数据目录的 `settings.json`——桌面端「配置 → 对话请求频率」修改后
-//! 立即生效，重启后沿用；环境变量 `CHAT_INTERVAL_MS` 优先级更高，只在进程启动时读取。
+//! 每个渠道一条串行通道（[`ChatThrottle`]）：同一时刻只允许一个对话在途，
+//! 上一个对话**结束**后再等待配置的间隔才放行下一个，也就是
+//! 「对话完成后 x 秒内不再提新问题」。间隔从完成时刻算起，而不是从发起时刻——
+//! 对话本身跑了多久都不影响，只保证两轮之间有足够的喘息时间。
+//!
+//! 频率值由 [`ChatFrequency`] 全渠道共享一份并持久化到数据目录的 `settings.json`——
+//! 桌面端「配置 → 对话请求频率」修改后立即生效，重启后沿用；环境变量
+//! `CHAT_INTERVAL_MS` 优先级更高，只在进程启动时读取。
 //!
 //! 只限制**对话请求**：建会话、拉历史、取 PoW 挑战等辅助请求不排队，否则会把它们
 //! 也一起拖慢，而网页端真正限流的是提问。
@@ -16,10 +20,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
 
-/// 默认的相邻对话请求间隔（毫秒）：网页端每秒最多接受一次提问。
+/// 默认的对话完成后等待间隔（毫秒）。
 pub const DEFAULT_CHAT_INTERVAL_MS: u64 = 1_000;
 
 /// 间隔上限（毫秒）：配置写错时也不至于把请求排到几小时后。
@@ -33,7 +37,7 @@ const CHAT_INTERVAL_KEY: &str = "chat_interval_ms";
 
 /// 对话请求频率设置：全渠道共享一份，修改后对之后排队的请求立即生效。
 pub struct ChatFrequency {
-    /// 相邻两次对话请求的最小间隔（毫秒）；0 表示不限制。
+    /// 上一个对话完成后需要等待的间隔（毫秒）；0 表示不限制。
     interval_ms: AtomicU64,
     /// 持久化文件；None 表示只存在内存里（测试）。
     path: Option<PathBuf>,
@@ -86,25 +90,32 @@ impl ChatFrequency {
         Ok(interval_ms)
     }
 
-    /// 为一个渠道建立独立排队：频率共用，队列各排各的，互不阻塞。
+    /// 为一个渠道建立独立串行通道：频率共用，通道各走各的，互不阻塞。
     pub fn throttle(self: &Arc<Self>) -> ChatThrottle {
         ChatThrottle::new(self.clone())
     }
 }
 
-/// 一个渠道的对话请求排队：按到达顺序放行，相邻放行间隔为一个频率值。
+/// 一个渠道的对话串行通道。
+///
+/// `wait` 获取通道后，先等「上一个对话完成时刻 + 间隔」，再返回 guard；
+/// guard 在对话结束时 drop，这一刻才记为新的完成时刻。因此并发请求会自动排队：
+/// 后到的必须等前一个真正跑完，而不是按发起顺序排时刻。
 pub struct ChatThrottle {
     /// 共用的频率设置。
     frequency: Arc<ChatFrequency>,
-    /// 队尾的放行时刻；None 表示队列为空。
-    tail: Mutex<Option<Instant>>,
+    /// 串行门：同一渠道同一时刻只允许一个对话在途。
+    gate: Arc<Mutex<()>>,
+    /// 上一次对话结束的时刻；None 表示本进程还没完成过对话。
+    last_finished: Arc<Mutex<Option<Instant>>>,
 }
 
 impl ChatThrottle {
     pub fn new(frequency: Arc<ChatFrequency>) -> Self {
         Self {
             frequency,
-            tail: Mutex::new(None),
+            gate: Arc::new(Mutex::new(())),
+            last_finished: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -113,34 +124,51 @@ impl ChatThrottle {
         self.frequency.interval()
     }
 
-    /// 排到队尾，等到轮到自己再返回。
+    /// 排到通道上，等上一个对话完成满一个间隔后放行。
     ///
-    /// 队列空时立即放行，否则接在上一个请求之后一个间隔；取号在锁内完成，
-    /// 因此放行顺序与排队顺序一致。频率为 0（不限制）时不等也不占位。
-    pub async fn wait(&self) {
+    /// 返回的 guard 必须持有到本轮对话结束（`let _guard = ...`，别直接丢弃），
+    /// 它 drop 的时刻就是下一次计时的起点。频率为 0（不限制）时返回 `None`，
+    /// 不占通道也不等待。
+    pub async fn wait(&self) -> Option<ThrottleGuard> {
         let interval = self.frequency.interval();
         if interval.is_zero() {
-            return;
+            return None;
         }
+        // 拿不到通道就一直排着：保证「完成时刻」始终只对应一个对话。
+        let gate = self.gate.clone().lock_owned().await;
         let scheduled = {
-            let mut tail = self.tail.lock().await;
-            let (scheduled, next) = reserve(*tail, Instant::now(), interval);
-            *tail = Some(next);
-            scheduled
+            let last = self.last_finished.lock().await;
+            last.map(|finished| finished + interval)
         };
-        tokio::time::sleep_until(scheduled).await;
+        if let Some(scheduled) = scheduled {
+            let now = Instant::now();
+            if scheduled > now {
+                tokio::time::sleep_until(scheduled).await;
+            }
+        }
+        Some(ThrottleGuard {
+            _gate: gate,
+            last_finished: self.last_finished.clone(),
+        })
     }
 }
 
-/// 取号：定出这次请求的放行时刻，并给出队尾的新时刻。
-///
-/// 队尾已经过去（队列空了一会儿）就地放行，否则接在队尾之后一个间隔。
-fn reserve(tail: Option<Instant>, now: Instant, interval: Duration) -> (Instant, Instant) {
-    let scheduled = match tail {
-        Some(previous) if previous > now => previous,
-        _ => now,
-    };
-    (scheduled, scheduled + interval)
+/// 对话进行中的凭据：drop 即宣告本轮完成，并记下完成时刻。
+pub struct ThrottleGuard {
+    /// 持有串行门直到对话结束。
+    _gate: OwnedMutexGuard<()>,
+    /// 完成时刻的存放处。
+    last_finished: Arc<Mutex<Option<Instant>>>,
+}
+
+impl Drop for ThrottleGuard {
+    fn drop(&mut self) {
+        // drop 不能 await；try_lock 失败说明有别的锁持有者，此时跳过记录即可，
+        // 下一次 wait 会按「没有完成记录」立即放行，最坏是多放一次而非死锁。
+        if let Ok(mut last) = self.last_finished.try_lock() {
+            *last = Some(Instant::now());
+        }
+    }
 }
 
 /// 读取已保存的间隔；文件不存在、损坏或没有该键时返回 None。
@@ -179,7 +207,7 @@ fn clamp_interval(interval_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_interval, read_interval, reserve, resolve_interval, ChatFrequency, ChatThrottle,
+        clamp_interval, read_interval, resolve_interval, ChatFrequency, ChatThrottle,
         DEFAULT_CHAT_INTERVAL_MS, MAX_CHAT_INTERVAL_MS,
     };
     use serde_json::Value;
@@ -195,69 +223,83 @@ mod tests {
         dir
     }
 
-    /// 取号：空队列立即放行；接在队尾之后；队尾已过去时按当前时刻排。
-    #[test]
-    fn reserve_schedules_after_queue_tail() {
-        let now = Instant::now();
-        let interval = Duration::from_millis(1_000);
-
-        let (scheduled, tail) = reserve(None, now, interval);
-        assert_eq!(scheduled, now, "空队列立即放行");
-        assert_eq!(tail, now + interval, "队尾顺延一个间隔");
-
-        let (scheduled, tail) = reserve(Some(tail), now, interval);
-        assert_eq!(scheduled, now + interval, "接在上一个请求之后");
-        assert_eq!(tail, now + interval * 2);
-
-        let (scheduled, tail) = reserve(Some(now - interval), now, interval);
-        assert_eq!(scheduled, now, "队尾已过去时按当前时刻排");
-        assert_eq!(tail, now + interval);
-    }
-
-    /// 连续提问按间隔放行：第一个立即，后面每个都等一个间隔。
+    /// 间隔从上一个对话**结束**时刻算起：对话本身跑了 3 秒，下一个也只等配置的 1 秒。
     #[tokio::test(start_paused = true)]
-    async fn waits_one_interval_between_requests() {
+    async fn next_request_waits_interval_after_previous_finishes() {
         let frequency = ChatFrequency::in_memory(1_000);
         let throttle = frequency.throttle();
 
-        throttle.wait().await;
-        let start = Instant::now();
-        throttle.wait().await;
-        assert_eq!(start.elapsed(), Duration::from_millis(1_000));
+        let first = throttle.wait().await;
+        // 对话本身耗时 3 秒，这期间不应有人被放进通道
+        tokio::time::advance(Duration::from_secs(3)).await;
+        drop(first);
 
         let start = Instant::now();
-        throttle.wait().await;
-        assert_eq!(start.elapsed(), Duration::from_millis(1_000));
+        let second = throttle.wait().await;
+        assert_eq!(
+            start.elapsed(),
+            Duration::from_millis(1_000),
+            "间隔应从上一个对话结束时算起，而不是从发起时刻"
+        );
+        drop(second);
     }
 
-    /// 队列空了一会儿之后不再补等：间隔从这次请求重新算起。
+    /// 完成已过去很久时不再补等。
     #[tokio::test(start_paused = true)]
-    async fn idle_queue_releases_immediately() {
+    async fn idle_channel_releases_immediately() {
         let frequency = ChatFrequency::in_memory(1_000);
         let throttle = frequency.throttle();
 
-        throttle.wait().await;
+        let first = throttle.wait().await;
+        drop(first);
         tokio::time::advance(Duration::from_secs(5)).await;
+
         let start = Instant::now();
-        throttle.wait().await;
+        let second = throttle.wait().await;
         assert_eq!(start.elapsed(), Duration::ZERO);
+        drop(second);
     }
 
-    /// 0 表示不限制：不等待，也不占用队尾。
+    /// 并发的第二个请求要等前一个真正完成，而不是按发起顺序立即排到。
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_requests_serialize_on_completion() {
+        let frequency = ChatFrequency::in_memory(1_000);
+        let throttle = Arc::new(frequency.throttle());
+
+        let first = throttle.wait().await;
+        let waiting = tokio::spawn({
+            let throttle = throttle.clone();
+            async move { throttle.wait().await }
+        });
+        // 让出执行权：第二个请求此时应卡在串行门上
+        tokio::time::advance(Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(!waiting.is_finished(), "前一个对话未结束时不能放行");
+
+        // 前一个完成后再等一个间隔
+        let start = Instant::now();
+        drop(first);
+        let second = waiting.await.expect("排队任务不应 panic");
+        assert_eq!(start.elapsed(), Duration::from_millis(1_000));
+        drop(second);
+    }
+
+    /// 0 表示不限制：不等待、不占通道。
     #[tokio::test(start_paused = true)]
     async fn zero_interval_never_waits() {
         let frequency = ChatFrequency::in_memory(1_000);
         let throttle = frequency.throttle();
 
-        throttle.wait().await;
+        let first = throttle.wait().await;
+        drop(first);
         frequency.set_interval_ms(0).unwrap();
+
         let start = Instant::now();
-        throttle.wait().await;
-        throttle.wait().await;
+        assert!(throttle.wait().await.is_none());
         assert_eq!(start.elapsed(), Duration::ZERO);
     }
 
-    /// 改频率对之后的请求立即生效，且各渠道各排各的队。
+    /// 改频率对之后的请求立即生效，且各渠道各走各的通道。
     #[tokio::test(start_paused = true)]
     async fn new_interval_applies_per_channel() {
         let frequency = ChatFrequency::in_memory(1_000);
@@ -265,13 +307,20 @@ mod tests {
 
         let first: ChatThrottle = frequency.throttle();
         let second = frequency.throttle();
-        first.wait().await;
-        // 另一条渠道不受第一条渠道排队影响
-        second.wait().await;
+
+        let first_guard = first.wait().await;
+        drop(first_guard);
 
         let start = Instant::now();
-        first.wait().await;
+        let second_guard = first.wait().await;
         assert_eq!(start.elapsed(), Duration::from_millis(2_500));
+        drop(second_guard);
+
+        // 另一条渠道没有完成记录，不受第一条渠道的冷却影响
+        let start = Instant::now();
+        let other = second.wait().await;
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        drop(other);
     }
 
     /// 设置持久化到 settings.json：重启后沿用，且不丢掉文件里的其他键。
