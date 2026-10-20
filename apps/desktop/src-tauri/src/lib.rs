@@ -19,6 +19,7 @@ mod providers;
 mod session;
 mod stream_processor;
 mod throttle;
+mod tokenizer;
 mod utils;
 
 use std::sync::Arc;

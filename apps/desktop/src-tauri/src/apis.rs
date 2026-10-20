@@ -6,11 +6,12 @@ use crate::{apis::base::AppState, config::ServerConfig};
 
 // API 层：按 API 类型组织，每种类型下按接口格式分文件
 pub mod base;
+pub mod deepseek;
 pub mod openai;
 
 /// 入口层当前已实现的 API 格式（供健康检查展示）。
 pub fn supported_formats() -> Vec<&'static str> {
-    vec!["openai"]
+    vec!["openai", "deepseek"]
 }
 /// 按配置构造 CORS 层。
 fn cors_layer(config: &ServerConfig) -> CorsLayer {
@@ -36,6 +37,7 @@ pub fn create_app(state: Arc<AppState>) -> Router {
     // 推理接口的路由层（后者最外层，先执行）：API Key 鉴权；健康检查与模型列表不经过它。
     let inference = Router::new()
         .merge(crate::apis::openai::routes())
+        .merge(crate::apis::deepseek::routes())
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             crate::apis::base::require_api_key,

@@ -39,6 +39,16 @@ pub struct ChatCompletionRequest {
     pub tools: Option<Value>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
+}
+
+/// 流式选项：`include_usage` 为 true 时，按 OpenAI 约定在结束帧之后再补一个只带
+/// `usage` 的块（`choices` 为空数组），供客户端统计本轮消耗。
+#[derive(Debug, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default)]
+    pub include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -153,7 +163,12 @@ pub async fn chat_completions_handler(
     };
 
     if req.stream {
-        return sse_response(state, request, model);
+        // `stream_options.include_usage`：客户端要求时，在结束帧后补一个只带 usage 的块
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .is_some_and(|options| options.include_usage);
+        return sse_response(state, request, model, include_usage);
     }
 
     match state.chat_router.chat_completions(request).await {
@@ -221,7 +236,16 @@ fn sse_response(
     state: Arc<AppState>,
     request: InferRequest,
     model: String,
+    include_usage: bool,
 ) -> axum::response::Response {
+    // 用量口径：网页渠道不回传本轮用量，这里用官方分词器按本轮实际发送的
+    // prompt 计数（含每条消息的角色标记开销），与上游分词结果一致。
+    let prompt_tokens = crate::tokenizer::count_messages(
+        request
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str)),
+    );
     let base = serde_json::json!({
         "id": format!("chatcmpl-{}", chrono::Utc::now().timestamp_millis()),
         "object": "chat.completion.chunk",
@@ -267,6 +291,8 @@ fn sse_response(
         let mut content_chars = 0usize;
         let mut reasoning_chars = 0usize;
         let mut tool_calls = 0usize;
+        // 正文全文：渠道没回传 usage 时用它估算输出用量
+        let mut completion_text = String::new();
         while let Some(item) = rx.recv().await {
             let delta = match item {
                 Ok(delta) => delta,
@@ -307,6 +333,7 @@ fn sse_response(
             let mut delta_obj = serde_json::json!({});
             if !chunk.content.is_empty() {
                 content_chars += chunk.content.chars().count();
+                completion_text.push_str(&chunk.content);
                 delta_obj["content"] = serde_json::json!(chunk.content);
             }
             if !chunk.reasoning.is_empty() {
@@ -345,11 +372,33 @@ fn sse_response(
             "choices": [{ "index": 0, "delta": {}, "finish_reason": finish_reason }],
         });
         yield Ok::<_, Infallible>(Event::default().data(serde_json::to_string(&end).unwrap()));
+        // OpenAI 约定：`stream_options.include_usage` 时，结束帧之后再补一个只带 usage 的块，
+        // 客户端按它统计本轮消耗。渠道没有回传真实用量时按正文估算。
+        if include_usage {
+            // 输出用量按本轮实际返回的正文统计，口径与 prompt 一致。
+            let completion_tokens = crate::tokenizer::count(&completion_text);
+            let usage_frame = serde_json::json!({
+                "id": base["id"],
+                "object": base["object"],
+                "created": base["created"],
+                "model": base["model"],
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": prompt_tokens + completion_tokens,
+                },
+            });
+            yield Ok::<_, Infallible>(
+                Event::default().data(serde_json::to_string(&usage_frame).unwrap()),
+            );
+        }
         yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
     };
 
     (StatusCode::OK, Sse::new(stream)).into_response()
 }
+
 
 /// 本格式的路由：`POST /v1/chat/completions`。
 pub fn routes() -> Router<Arc<AppState>> {

@@ -110,7 +110,7 @@ fn usage_object(usage: Option<&Value>, text: &str) -> Value {
     let output = usage
         .and_then(|u| u.get("completion_tokens"))
         .and_then(Value::as_u64)
-        .unwrap_or_else(|| text.chars().count() as u64);
+        .unwrap_or_else(|| u64::from(crate::tokenizer::count(text)));
     let total = usage
         .and_then(|u| u.get("total_tokens"))
         .and_then(Value::as_u64)
@@ -124,6 +124,14 @@ fn usage_object(usage: Option<&Value>, text: &str) -> Value {
 
 /// 流式响应接口：输出命名事件。
 fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> axum::response::Response {
+    // 用量口径：网页渠道不回传本轮用量，用官方分词器按本轮实际发送的 prompt
+    // 计数（含每条消息的角色标记开销），与上游分词结果一致。
+    let prompt_tokens = u64::from(crate::tokenizer::count_messages(
+        request
+            .messages
+            .iter()
+            .filter_map(|message| message.get("content").and_then(Value::as_str)),
+    ));
     let stream = async_stream::stream! {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
         let chunk_tx = tx.clone();
@@ -175,7 +183,13 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
             );
         }
 
-        let completed = response_object(&model, &text, None);
+        // 收尾事件必须带上本轮用量：客户端读 `response.completed` 里的 usage 统计消耗，
+        // 这里传 None 会让前端一直显示 0。
+        let usage = serde_json::json!({
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": u64::from(crate::tokenizer::count(&text)),
+        });
+        let completed = response_object(&model, &text, Some(&usage));
         yield Ok::<_, Infallible>(
             Event::default()
                 .event("response.completed")
