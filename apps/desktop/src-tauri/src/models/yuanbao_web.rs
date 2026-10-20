@@ -313,8 +313,9 @@ impl YuanbaoWebModel {
                 attempt
             );
             let body = Self::completion_body(&conversation_id, &prompt);
-            // 排队等放行：网页端对提问频率有限制，间隔由「对话请求频率」设置决定。
-            self.throttle.wait().await;
+            // 排队等放行：网页端对提问频率有限制，间隔从上一个对话**结束**时算起。
+            // guard 持有到本次尝试结束，drop 时才记下完成时刻。
+            let _guard = self.throttle.wait().await;
             let result = match pending_sink.take() {
                 Some(sink) => self.stream_once(url, body, sink).await,
                 None => self.complete_once(url, body).await,

@@ -824,8 +824,9 @@ impl DeepSeekWebModel {
             body_base64: None,
             session_key: Some(session_id.to_string()),
         };
-        // 排队等放行：网页端对提问频率有限制，间隔由「对话请求频率」设置决定。
-        self.throttle.wait().await;
+        // 排队等放行：网页端对提问频率有限制，间隔从上一个对话**结束**时算起。
+        // guard 必须持有到本轮结束（`_guard` 别改成 `_`），drop 时才记下完成时刻。
+        let _guard = self.throttle.wait().await;
 
         let (
             text,
