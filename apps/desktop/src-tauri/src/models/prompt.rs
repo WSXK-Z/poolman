@@ -60,15 +60,18 @@ pub(crate) fn build_prompt(request: &InferRequest) -> String {
     sections.join(&DOUBLE_NEWLINE)
 }
 
-/// 组装修复提示词：规范化器提示词填上可用工具清单，
-/// 末尾附上解析失败的坏块原文——模型对它只回规范调用块或「无」。
-pub(crate) fn repair_prompt(tools: Option<&Value>, broken_markup: &str) -> String {
+/// 组装修复提示词：规范化器提示词填上可用工具清单（含每个参数的 JSON Schema 与必填项），
+/// 末尾附上**本轮失败的具体原因**与解析失败的坏块原文——模型据此知道该补哪一处，
+/// 而不是笼统地「重写一遍」。
+pub(crate) fn repair_prompt(tools: Option<&Value>, broken_markup: &str, reason: &str) -> String {
     let registered = render_tools(tools).unwrap_or_else(|| "（无）".to_string());
     format!(
-        "{}{}{}{}以下是用户输入内容：{}{}",
+        "{}{}{}{}本轮失败原因：{}{}以下是用户输入内容：{}{}",
         PROMPT_PREFIX,
         DOUBLE_NEWLINE,
         NORMALIZER_PROMPT.replace("{{REGISTERED_TOOLS}}", &registered),
+        DOUBLE_NEWLINE,
+        reason,
         DOUBLE_NEWLINE,
         NEWLINE,
         broken_markup

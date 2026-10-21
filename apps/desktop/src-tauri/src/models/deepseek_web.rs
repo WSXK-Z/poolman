@@ -5,7 +5,6 @@
 //!
 //! 渠道细节（URL、PoW、SSE 分行）不外露；具体由哪台插件实例执行由插件管理器调度。
 pub mod chat_stream_processor;
-pub mod dsml_stream_parser;
 pub mod session_pool;
 pub mod sse_frame_processor;
 use std::collections::{HashMap, HashSet};
@@ -66,35 +65,35 @@ pub(crate) const PARAMETER_CLOSE: &str = "</｜｜DSML｜｜ parameter>";
 ///
 /// 标记形态必须与 [`ChatStreamProcessor`] 认的一致，
 /// 且与 [`DeepSeekWebModel::render_tool_calls`] 渲染历史调用的方式一致。
-pub(crate) const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束）
+pub(crate) const TOOL_RULE: &str = r#"## DSML 工具调用（硬约束）
 
-- **要调工具**：整条回复**只**输出 DSML，标记外零字符。
-- **不调工具**：只输出正文，禁止出现任何 DSML 标签。
-- **数量上限**：一次回复里 `invoke` 最多 3 个，单个 `invoke` 里 `parameter` 最多 10 个；超出的调用拆到后续轮次，不要挤在同一条回复里。
-- **闭标签带斜杠**：闭标签一律写成 `</｜｜DSML｜｜ invoke>`、`</｜｜DSML｜｜ parameter>`、`</｜｜DSML｜｜ calls>`（`<` 之后紧跟 `/`），闭标签上不写属性；漏掉那个 `/` 会被当成新的开标签，整块调用作废。
+- **要调工具**：整条回复只输出 DSML，标记外零字符；**不调工具**：只输出正文，禁止出现任何 DSML 标签。
+- **每个标签写全名字**：开标签是 `<｜｜DSML｜｜ calls>`、`<｜｜DSML｜｜ invoke name="工具名">`、`<｜｜DSML｜｜ parameter name="参数名" string="true">`；
+  闭标签是 `</｜｜DSML｜｜ invoke>`、`</｜｜DSML｜｜ parameter>`、`</｜｜DSML｜｜ calls>`（`<` 之后紧跟 `/`，闭标签上不写属性）。
+  **不要**省略 `parameter`、`invoke` 这两个词，**不要**把「闭上一个参数 + 开下一个参数」合成一个闭标签，**不要**在参数写完后多补闭合标签——这三种写法都会让整块调用作废。
+- 竖线必须全角 `｜｜DSML｜｜`；`<`、`>`、`/`、`=`、`"` 一律半角；不要套 Markdown 代码块围栏。
 
-```dsml
+骨架（照抄结构，替换工具名、参数名与值）：
+
 <｜｜DSML｜｜ calls>
 <｜｜DSML｜｜ invoke name="工具名">
 <｜｜DSML｜｜ parameter name="参数名" string="true">值</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>
-```
 
 | 规则 | 写法 |
 |---|---|
-| 分隔符 | 竖线**必须全角** `｜｜DSML｜｜`；`< > / = "` 全半角 |
-| 标签 | 成对、不嵌套、不改写、不套代码块；闭标签 `<` 后紧跟 `/`，且不带属性 |
-| 字符串参数 | `string="true"`，原样写；`\`→`\\`，`"`→`\"` |
+| 标签 | 成对、不嵌套、不改写；闭标签 `<` 后紧跟 `/`，且不带属性 |
+| 字符串参数 | `string="true"`，值原样写；`\`→`\\`，`"`→`\"` |
 | 非字符串 | `string="false"`，值写 JSON：`30`、`true`、`[1,2]` |
-| 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内，最多 3 个；单个 `invoke` 的 `parameter` 最多 10 个 |
+| 多工具 | 多个 `invoke` **平铺**在同一 `calls` 内 |
 | 命名 | `name` 与工具定义**逐字一致**；必填参数不可省 |
 | 新调用 | **不写** `id`；`id` 仅历史用于关联 |
 | 结果标题 | `【tool】name=工具名 id=调用编号` |
 | 禁区 | 参数值内**不得含** `</｜｜DSML｜｜ parameter>` 或任何 DSML 片段 |
 
-示例：
-```dsml
+示例（长参数值跨行原样写在值里，值内不要再套任何标签）：
+
 <｜｜DSML｜｜ calls>
 <｜｜DSML｜｜ invoke name="read_file">
 <｜｜DSML｜｜ parameter name="path" string="true">d:\\project\\src\\main.rs</｜｜DSML｜｜ parameter>
@@ -104,7 +103,6 @@ pub(crate) const TOOL_RULE: &str = r#"## DSML 工具调用（极简·硬约束�
 <｜｜DSML｜｜ parameter name="timeout" string="false">30000</｜｜DSML｜｜ parameter>
 </｜｜DSML｜｜ invoke>
 </｜｜DSML｜｜ calls>
-```
 "#;
 
 /// 工具调用修复提示词（`src/prompts/dsml_normalizer.md`，编译期嵌入）：DSML 解析失败时
@@ -402,8 +400,8 @@ impl DeepSeekWebModel {
     }
 
     /// 组装修复提示词（规则见 [`super::prompt`]）。
-    fn repair_prompt(tools: Option<&Value>, broken_markup: &str) -> String {
-        super::prompt::repair_prompt(tools, broken_markup)
+    fn repair_prompt(tools: Option<&Value>, broken_markup: &str, reason: &str) -> String {
+        super::prompt::repair_prompt(tools, broken_markup, reason)
     }
 
     /// 助手消息里的 `tool_calls` → DSML 标记（规则见 [`super::prompt`]）。
@@ -684,11 +682,20 @@ impl DeepSeekWebModel {
             }
             break attempt;
         };
-        // 工具调用没写完：用规范化器提示词（dsml_normalizer.md）把坏块重写一轮，修出调用就当正常结果
+        // 工具调用没写完/校验没过：用规范化器提示词（dsml_normalizer.md）把坏块重写一轮，
+        // 修出调用就当正常结果；修不出来就明确报错，不把失败伪装成回答。
         let mut repaired = false;
         if let Some(broken) = round.parse_failure.take() {
-            let prompt = Self::repair_prompt(request.tools.as_ref(), &broken);
-            info!("工具调用解析失败，发起修复重写 prompt_len={}", prompt.len());
+            let reason = round
+                .parse_reason
+                .take()
+                .unwrap_or_else(|| "块内标签序列无法判定".to_string());
+            let prompt = Self::repair_prompt(request.tools.as_ref(), &broken, &reason);
+            info!(
+                "工具调用解析失败，发起修复重写 reason={} prompt_len={}",
+                reason,
+                prompt.len()
+            );
             // 修复请求接在本轮回答之后：网页会话里它是紧接着的下一条消息
             let parent = round
                 .message_id
@@ -731,10 +738,13 @@ impl DeepSeekWebModel {
                 Err(error) => warn!("工具调用修复请求失败，按解析失败处理：{}", error),
             }
             if !repaired {
-                // 修复不成（模型回「无」或请求失败）：流式客户端补一条解析失败提示（非流式维持空回答）
-                if let Some(sink) = forwarding_sink(&sink_cell) {
-                    emit_delta(sink, DeltaChunk::RESPONSE, json!("工具调用格式不正确"));
-                }
+                // 修复不成（模型回「无」或请求失败）：明确失败，让调用方按错误处理并重试。
+                // 不要把「格式不正确」当助手正文发给流式客户端——它会作为回答进历史，
+                // 下一轮又被原样回传回来，等于继续教模型这么写。
+                anyhow::bail!(
+                    "工具调用解析失败，修复轮也没能重写出可解析的 DSML 调用（原因：{}）",
+                    reason
+                );
             }
         }
         let CompletionRound {
@@ -746,6 +756,7 @@ impl DeepSeekWebModel {
             status,
             raw_body,
             parse_failure: _,
+            parse_reason: _,
         } = round;
         // 记下本轮响应的消息 id：下一轮请求的 parent_message_id 靠它接上服务端的消息链。
         self.remember_message_id(&session_id, message_id);
@@ -833,6 +844,7 @@ impl DeepSeekWebModel {
             reasoning,
             tool_calls,
             parse_failure,
+            parse_reason,
             upstream_error,
             message_id,
             status,
@@ -901,6 +913,7 @@ impl DeepSeekWebModel {
                         processor.reasoning().to_string(),
                         processor.tool_calls().to_vec(),
                         processor.parse_failure().map(str::to_string),
+                        processor.failure_reason().map(str::to_string),
                         upstream_error,
                         message_id,
                         response.status,
@@ -924,6 +937,7 @@ impl DeepSeekWebModel {
                         processor.reasoning().to_string(),
                         processor.tool_calls().to_vec(),
                         processor.parse_failure().map(str::to_string),
+                        processor.failure_reason().map(str::to_string),
                         upstream_error,
                         message_id,
                         response.status,
@@ -936,6 +950,7 @@ impl DeepSeekWebModel {
             reasoning,
             tool_calls,
             parse_failure,
+            parse_reason,
             upstream_error,
             message_id,
             status,
@@ -951,6 +966,8 @@ struct CompletionRound {
     tool_calls: Vec<Value>,
     /// DSML 块开了却没写出可解析的调用时的坏块原文：触发一次规范化修复重写。
     parse_failure: Option<String>,
+    /// 解析/校验失败的原因（未声明的工具、缺必填参数、参数里混进标记等），给修复提示词用。
+    parse_reason: Option<String>,
     upstream_error: Option<UpstreamError>,
     message_id: Option<i64>,
     status: u16,
@@ -1749,17 +1766,21 @@ mod tests {
         assert_eq!(response.finish_reason.as_deref(), Some("stop"));
     }
 
-    /// 块没闭合（模型写一半断了）时这轮没有可用回答：写坏的标记不当回答发出去，只落一条空回答。
+    /// 块没闭合（模型写一半断了）且修复轮也救不回来：这轮明确报错，写坏的标记绝不当回答发出去。
     #[tokio::test]
     async fn infer_drops_unclosed_dsml_markup() {
         let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
-        let response = model(&content_frame(half))
+        // 队列只预设首轮的坏块：修复轮回落到默认响应体「无」
+        let executor = executor(&content_frame("无"), 0);
+        executor.queue_completions(&[content_frame(half)]);
+        let model = DeepSeekWebModel::new("DeepSeek", executor as Arc<dyn ChannelExecutor>);
+
+        let error = model
             .infer(tool_request())
             .await
-            .expect("写坏的标记不是正文，也不该让整轮请求失败");
-
-        assert_eq!(response.text, "", "写坏的标记不能当回答发出去");
-        assert!(response.tool_calls.is_none());
+            .expect_err("修不回来就该报错，不能返回一条空回答");
+        let message = format!("{error}");
+        assert!(message.contains("工具调用解析失败"), "{}", message);
     }
 
     /// 上游用 `event: hint` 说明这轮为什么没有回答（例如达到对话长度上限）：
@@ -1880,8 +1901,21 @@ mod tests {
         );
         let body = content_frame(&dsml_calls(&[dsml_invoke("a", &[])]))
             + &content_frame(&dsml_calls(&[numeric.to_string()]));
+        // 两个工具都要在请求里声明：出口校验会拦未声明的工具
+        let mut request = tool_request();
+        request.tools = Some(json!([
+            { "type": "function", "function": { "name": "a", "description": "第一个" } },
+            {
+                "type": "function",
+                "function": {
+                    "name": "b",
+                    "description": "第二个",
+                    "parameters": { "properties": { "n": { "type": "number" } } }
+                }
+            }
+        ]));
         let response = model(&body)
-            .infer(tool_request())
+            .infer(request)
             .await
             .expect("推理应成功");
 
@@ -3094,17 +3128,20 @@ mod tests {
         }
     }
 
-    /// 工具规则与修复提示词给出的硬性要求必须一致：调用数量 / 参数个数上限、闭标签带 `/`。
+    /// 工具规则与修复提示词给出的硬性要求必须一致：都写全标记，且都不再声明调用数量上限。
     #[test]
     fn tool_rule_and_normalizer_agree_on_hard_rules() {
         for text in [super::TOOL_RULE, super::NORMALIZER_PROMPT] {
             for needle in [
-                "`invoke` 最多 3 个",
-                "`parameter` 最多 10 个",
                 super::INVOKE_CLOSE,
                 super::INVOKE_OPEN,
+                super::PARAMETER_CLOSE,
             ] {
                 assert!(text.contains(needle), "应写上 {needle}：{text}");
+            }
+            // 规范化器早已取消数量上限，规则段不能还留着旧上限（两处打架会推高写错率）
+            for stale in ["`invoke` 最多 3 个", "`parameter` 最多 10 个"] {
+                assert!(!text.contains(stale), "不该再有数量上限 {stale}：{text}");
             }
         }
     }
@@ -3113,7 +3150,7 @@ mod tests {
     #[test]
     fn repair_prompt_fills_tools_and_appends_broken_markup() {
         let tools = json!([{ "function": { "name": "read_file", "description": "读取文件" } }]);
-        let prompt = DeepSeekWebModel::repair_prompt(Some(&tools), "<坏块>");
+        let prompt = DeepSeekWebModel::repair_prompt(Some(&tools), "<坏块>", "参数未闭合");
         assert!(prompt.starts_with(super::PROMPT_PREFIX), "{}", prompt);
         assert!(
             !prompt.contains("{{REGISTERED_TOOLS}}"),
@@ -3121,10 +3158,11 @@ mod tests {
             prompt
         );
         assert!(prompt.contains("- read_file：读取文件"), "{}", prompt);
+        assert!(prompt.contains("参数未闭合"), "应带上失败原因：{}", prompt);
         assert!(prompt.ends_with("<坏块>"), "{}", prompt);
 
         // 没有工具时占位符填「（无）」：修复模型对任何输入都只能回「无」
-        let empty = DeepSeekWebModel::repair_prompt(None, "x");
+        let empty = DeepSeekWebModel::repair_prompt(None, "x", "缺必填参数");
         assert!(!empty.contains("{{REGISTERED_TOOLS}}"), "{}", empty);
     }
 
@@ -3165,9 +3203,10 @@ mod tests {
         assert!(repair_prompt.contains(half), "应带上坏块原文：{}", repair_prompt);
     }
 
-    /// 修复也失败（模型没给出调用）：流式客户端收到一条解析失败提示，整轮仍不报错。
+    /// 修复也失败（模型没给出调用）：整轮明确报错，不再把「格式不正确」当回答发给客户端——
+    /// 那句提示会作为 assistant 正文进历史，下一轮又被原样回传，等于继续教模型这么写。
     #[tokio::test]
-    async fn repair_failure_reports_to_stream() {
+    async fn repair_failure_is_reported_as_error() {
         let half = "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">";
         // 队列只预设首轮的坏块：修复轮回落到默认响应体「无」
         let executor = executor(&content_frame("无"), 0);
@@ -3176,13 +3215,15 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let sink = seen.clone();
 
-        let response = model
+        let error = model
             .infer_stream(
                 tool_request(),
                 Box::new(move |delta| sink.lock().unwrap().push(delta)),
             )
             .await
-            .expect("修复失败也不该让整轮请求报错");
+            .expect_err("修复失败应让整轮报错，而不是伪装成空回答");
+        let message = format!("{error}");
+        assert!(message.contains("工具调用解析失败"), "{}", message);
 
         let contents: Vec<String> = seen
             .lock()
@@ -3190,13 +3231,11 @@ mod tests {
             .iter()
             .map(|delta| crate::apis::base::parse_delta(delta).content)
             .collect();
-        assert_eq!(
-            contents,
-            vec!["工具调用格式不正确".to_string()],
-            "修复不成才提示解析失败"
+        assert!(
+            contents.iter().all(|content| content.is_empty()),
+            "不该再补一条自然语言提示：{:?}",
+            contents
         );
-        assert!(response.tool_calls.is_none(), "{:?}", response.tool_calls);
-        assert!(response.text.is_empty(), "「无」不应当成回答发给客户端");
     }
 
     /// 请求头名统一小写：插件会把它和页面缓存头原样合并，`Content-Type` 与 `content-type`

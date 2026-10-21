@@ -8,14 +8,25 @@
 //! 键名取自 [`DeltaChunk`] 的常量：网页协议里 `RESPONSE` / `THINK` 这两种片段名与中间增量的键
 //! 本就是同一套词，只在 `apis::base` 定义一次，渠道侧不另立副本。
 //!
-//! 每段正文增量都先过一遍 [`DsmlStreamParser`] 的**工具检测**，再决定它怎么走：
-//! - 检测到「没有工具调用」：这段内容当正文发出去（`{"RESPONSE":…}`）；第一段非空白正文之前的
+//! ## 标记解析：按上下文推断元素，不依赖标签名逐字写对
+//!
+//! 网页模型写 DSML 时的错法高度集中（实测 83 个坏块里 81 个属于这几类）：
+//! 闭标签丢名字（`</｜｜DSML｜｜>`）、把「闭上一个参数 + 开下一个参数」合并成一个闭标签
+//! （`</｜｜DSML｜｜ parameter name="path" …>`）、开标签丢掉 `parameter` 这个词
+//! （`<｜｜DSML｜｜ description" string="true">`）、多写一个闭合标签、标记少一根竖线。
+//! 按标签名精确匹配时，这些错法要么让整块作废，要么把标记吞进参数值（静默错误，更危险）。
+//!
+//! 因此这里只依赖 DSML 的**结构性信息**：块内位置 + `name=` / `string=` 属性。元素类型由上下文
+//! 推断，多余的闭合忽略、合并的标签拆开、缺失的标签名补回。解析出来的仍是标准 DSML 调用，
+//! 对外形态不变。
+//!
+//! 每段正文增量都先过一遍标签扫描，再决定它怎么走：
+//! - 扫描不到标签：这段内容当正文发出去（`{"RESPONSE":…}`）；第一段非空白正文之前的
 //!   纯空白不发（标记前后的空行/缩进只是排版，发出去会变成一条只有空白的回答）；
-//! - 检测到「可能有工具调用」（缓冲区尾巴正是被 chunk 切开的半个标记）：只扣住这一小段，
-//!   等下一段增量来凑齐，前面已经确定不是标记的部分照常当正文发出；
-//! - 检测到「有工具调用」：块内内容不再外泄，一直扣住到**整块闭合**（收到 `</｜｜DSML｜｜ calls>`），
-//!   这时才把这一块的调用一次性当增量发出——客户端要等工具全部解析完才能拿到，
-//!   边解析边发会让它拿到半块。
+//! - 缓冲区尾巴正是被 chunk 切开的半个标签：只扣住这一小段，等下一段增量来凑齐，
+//!   前面已经确定不是标签的部分照常当正文发出；
+//! - 进入块内：块内内容不再外泄，一直扣住到**整块闭合**，这时才把这一块的调用一次性当增量
+//!   发出——客户端要等工具全部解析完才能拿到，边解析边发会让它拿到半块。
 //!   每条调用只发一次，`index` 是它在整轮里的全局序号（重发会让客户端把参数拼两遍）。
 //!
 //! 一轮里只要出现工具调用，这条回答就**只**输出工具调用：调用之后的正文不再转发
@@ -23,29 +34,269 @@
 //!
 //! 不认工具时（`recognize_tools == false`）正文原样透传，DSML 标记也当普通文字。
 
-use anyhow::Result;
 use serde_json::{Map, Value, json};
 use tracing::{info, warn};
 
 use crate::apis::base::DeltaChunk;
-use crate::models::deepseek_web::{
-    CALLS_CLOSE, CALLS_OPEN, INVOKE_CLOSE, INVOKE_OPEN, PARAMETER_CLOSE, PARAMETER_OPEN,
-};
 use crate::models::defs::ChunkSink;
-use crate::utils::{TextRecognizerResult, text_recognizer};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum FunctionTag {
-    CallsOpen,
-    CallOpen,
-    CallName(String),
-    ParamOpen,
-    ParamName(String),
-    ParamString(String),
-    ParamValue(String),
-    ParamClose,
-    CallClose,
-    CallsClose,
+/// DSML 标签的元素类型。缺省（标签名写丢/写错）时为 [`ElementKind::Other`]，由上下文推断。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ElementKind {
+    Calls,
+    Invoke,
+    Parameter,
+    Other,
+}
+
+/// 一个解析出来的 DSML 标签。
+struct Tag {
+    /// 标签在缓冲区里的字节长度（含 `<` 与 `>`）。
+    len: usize,
+    /// 是否闭合标签（`<` 之后紧跟 `/`）。
+    closing: bool,
+    /// 标签名推断出的元素类型。
+    kind: ElementKind,
+    /// `name=` 属性的值；缺省时取标签名后误写的裸标识符（`<… description" string="true">`）。
+    name: Option<String>,
+    /// `string=` 属性的值；缺省即按字符串处理。
+    string_flag: Option<String>,
+}
+
+/// 在缓冲区里找标签的结果。
+enum TagScan {
+    /// 找到完整标签，`pos` 是它的起始下标。
+    Found { pos: usize, tag: Tag },
+    /// 还没找到，但 `pos` 之后可能是被切开的标签，要留着等下一段增量。
+    Incomplete { pos: usize },
+    /// 缓冲区里没有标签。
+    None,
+}
+
+/// 解析一个完整标签；不是标签或不完整时返回 None。
+fn parse_tag(s: &str) -> Option<Tag> {
+    let bytes = s.as_bytes();
+    if bytes.first() != Some(&b'<') {
+        return None;
+    }
+    let mut i = skip_ws(s, 1);
+    let closing = bytes.get(i) == Some(&b'/');
+    if closing {
+        i = skip_ws(s, i + 1);
+    }
+    // 标记：pipe* DSML pipe*，两侧竖线至少一根（全角 `｜` 或半角 `|` 都认）。
+    // 放宽到「少一根竖线」的形态：模型写残的 `</｜DSML｜｜ parameter>` 同样要认。
+    let mut pipes = 0;
+    while let Some(width) = pipe_len(&s[i..]) {
+        i += width;
+        pipes += 1;
+    }
+    if !s[i..].starts_with("DSML") {
+        return None;
+    }
+    i += "DSML".len();
+    while let Some(width) = pipe_len(&s[i..]) {
+        i += width;
+        pipes += 1;
+    }
+    if pipes == 0 {
+        return None;
+    }
+    i = skip_ws(s, i);
+    // 标签名（可能被写丢）
+    let name_start = i;
+    while let Some(byte) = bytes.get(i) {
+        if byte.is_ascii_alphanumeric() || *byte == b'_' {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let tag_word = &s[name_start..i];
+    let kind = match tag_word.to_ascii_lowercase().as_str() {
+        "calls" => ElementKind::Calls,
+        "invoke" => ElementKind::Invoke,
+        "parameter" => ElementKind::Parameter,
+        _ => ElementKind::Other,
+    };
+    // 属性区到 `>` 结束；中途再出现 `<` 说明这不是一个标签
+    let attrs_start = i;
+    let mut attr_end = None;
+    while let Some(byte) = bytes.get(i) {
+        match byte {
+            b'>' => {
+                attr_end = Some(i);
+                break;
+            }
+            b'<' => return None,
+            _ => i += 1,
+        }
+    }
+    let attr_end = attr_end?;
+    let (mut name, string_flag) = parse_attrs(&s[attrs_start..attr_end]);
+    // 标签名位置写成了参数名（`<｜｜DSML｜｜ description" string="true">`）：把它当参数名用
+    if name.is_none() && kind == ElementKind::Other && !tag_word.is_empty() {
+        name = Some(tag_word.to_string());
+    }
+    Some(Tag {
+        len: attr_end + 1,
+        closing,
+        kind,
+        name,
+        string_flag,
+    })
+}
+
+/// 解析属性区：`name="x"` / `string="true"`，容忍引号缺失、`name=` 整个写丢的形态。
+fn parse_attrs(attrs: &str) -> (Option<String>, Option<String>) {
+    let bytes = attrs.as_bytes();
+    let mut i = 0;
+    let mut name = None;
+    let mut string_flag = None;
+    let mut implicit_name = None;
+    loop {
+        i = skip_ws(attrs, i);
+        if i >= bytes.len() {
+            break;
+        }
+        let key_start = i;
+        while let Some(byte) = bytes.get(i) {
+            if byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.') {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+        if i == key_start {
+            i += 1;
+            continue;
+        }
+        let key = &attrs[key_start..i];
+        let after_key = skip_ws(attrs, i);
+        if bytes.get(after_key) == Some(&b'=') {
+            i = skip_ws(attrs, after_key + 1);
+            let (value, next) = read_attr_value(attrs, i);
+            i = next;
+            match key {
+                "name" => name = Some(value),
+                "string" => string_flag = Some(value),
+                _ => {}
+            }
+        } else {
+            // 没有 `=`：这段标识符就是被写丢的属性名，模型把它写成了 `<… description" string="true">`
+            if implicit_name.is_none() {
+                implicit_name = Some(key.to_string());
+            }
+            i = after_key;
+            if matches!(bytes.get(i), Some(b'"') | Some(b'\'')) {
+                i += 1;
+            }
+        }
+    }
+    (name.or(implicit_name), string_flag)
+}
+
+/// 读一个属性值：带引号读到对应引号，不带引号读到空白或 `>`。
+fn read_attr_value(s: &str, i: usize) -> (String, usize) {
+    let bytes = s.as_bytes();
+    match bytes.get(i) {
+        Some(&quote) if quote == b'"' || quote == b'\'' => {
+            let mut j = i + 1;
+            let mut value = String::new();
+            while let Some(&byte) = bytes.get(j) {
+                if byte == b'\\' {
+                    if let Some(&escaped) = bytes.get(j + 1) {
+                        if escaped.is_ascii() {
+                            value.push(escaped as char);
+                        }
+                        j += 2;
+                        continue;
+                    }
+                }
+                if byte == quote {
+                    j += 1;
+                    break;
+                }
+                let ch = s[j..].chars().next().unwrap_or('\u{0}');
+                value.push(ch);
+                j += ch.len_utf8();
+            }
+            (value, j)
+        }
+        _ => {
+            let mut j = i;
+            while let Some(&byte) = bytes.get(j) {
+                if byte.is_ascii_whitespace() || byte == b'>' {
+                    break;
+                }
+                j += 1;
+            }
+            (s[i..j].to_string(), j)
+        }
+    }
+}
+
+/// 竖线标记的字节宽度：全角 `｜` 三个字节，半角 `|` 一个字节。
+fn pipe_len(s: &str) -> Option<usize> {
+    if s.starts_with('｜') {
+        Some('｜'.len_utf8())
+    } else if s.starts_with('|') {
+        Some(1)
+    } else {
+        None
+    }
+}
+
+/// 跳过 ASCII 空白，返回首个非空白位置。
+fn skip_ws(s: &str, mut i: usize) -> usize {
+    let bytes = s.as_bytes();
+    while let Some(byte) = bytes.get(i) {
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    i
+}
+
+/// 在缓冲区里找第一个标签；`pos` 之前的部分可以安全当正文/参数值消费。
+fn find_tag(buf: &str) -> TagScan {
+    let mut from = 0;
+    while let Some(relative) = buf[from..].find('<') {
+        let pos = from + relative;
+        let rest = &buf[pos..];
+        if let Some(tag) = parse_tag(rest) {
+            return TagScan::Found { pos, tag };
+        }
+        // 可能是被切开的标签：只有「像 DSML 开头且还没出现 `>`」才留着等
+        if could_be_tag(rest) && !rest.contains('>') {
+            return TagScan::Incomplete { pos };
+        }
+        from = pos + 1;
+    }
+    TagScan::None
+}
+
+/// 这段文本（以 `<` 开头）是否可能是一个还没写完的 DSML 标签。
+fn could_be_tag(s: &str) -> bool {
+    if !s.starts_with('<') {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut i = skip_ws(s, 1);
+    if bytes.get(i) == Some(&b'/') {
+        i = skip_ws(s, i + 1);
+    }
+    let mut j = i;
+    while let Some(width) = pipe_len(&s[j..]) {
+        j += width;
+    }
+    let rest = &s[j..];
+    if rest.len() < "DSML".len() {
+        return "DSML".starts_with(rest);
+    }
+    rest.starts_with("DSML")
 }
 
 /// 片段增量 → API 中间增量的转换器。
@@ -68,18 +319,52 @@ pub struct ChatStreamProcessor {
     reasoning: String,
     /// 已发出去的工具调用（对应哪些已经发过：见 [`Self::emit_new_calls`]）。
     tool_calls: Vec<Value>,
-    /// 请求里的工具参数类型表：模型把类型标错时按它矫正。
+    /// 请求里的工具参数类型表：模型把类型标错时按它矫正，并按它校验必填参数。
     schemas: ToolSchemas,
     /// 原始正文流（全部 RESPONSE 增量的拼接，从不裁剪）：坏块原文从它截取。
     row_response_buf: String,
+    /// 跨 chunk 未消费完的尾数据。
     cache_response_buf: String,
     /// 当前 DSML 块在 [`Self::row_response_buf`] 里的起点：开块时记下、整块闭合即清。
     block_start: Option<usize>,
     /// 解析失败的坏块原文（`finish` 时落定）：上层据此发起一次规范化修复。
     parse_failure: Option<String>,
+    /// 解析失败的原因（给修复提示词用）。
+    failure_reason: Option<String>,
     /// 已组装好、还没出站的调用（OpenAI 形状的 `tool_calls[]` 元素）。
     cache_function_buf: Vec<Value>,
-    cache_tag_stack: Vec<FunctionTag>,
+    /// 当前块里已闭合、还没出站的调用。
+    block_calls: Vec<Value>,
+    /// 解析位置：块外 / 块内 / 调用内 / 参数值内。
+    state: ParserState,
+    /// 正在收集的调用。
+    call: Option<CallAcc>,
+    /// 正在收集的参数。
+    param: Option<ParamAcc>,
+    /// 遇到无法判定的结构（例如调用没闭合又出现新的 invoke）：整块交给修复链路，不猜。
+    broken: bool,
+}
+
+/// 解析位置。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParserState {
+    Outside,
+    InCalls,
+    InCall,
+    InParam,
+}
+
+/// 正在累积的调用。
+struct CallAcc {
+    name: String,
+    arguments: Map<String, Value>,
+}
+
+/// 正在收集的参数。
+struct ParamAcc {
+    name: String,
+    as_string: bool,
+    value: String,
 }
 
 impl ChatStreamProcessor {
@@ -94,12 +379,17 @@ impl ChatStreamProcessor {
             reasoning: String::new(),
             tool_calls: Vec::new(),
             schemas: ToolSchemas::default(),
-            row_response_buf: String::new(),    
+            row_response_buf: String::new(),
             cache_response_buf: String::new(),
-            cache_function_buf: Vec::new(),
-            cache_tag_stack: Vec::new(),
             block_start: None,
             parse_failure: None,
+            failure_reason: None,
+            cache_function_buf: Vec::new(),
+            block_calls: Vec::new(),
+            state: ParserState::Outside,
+            call: None,
+            param: None,
+            broken: false,
         }
     }
 
@@ -119,36 +409,29 @@ impl ChatStreamProcessor {
     /// 流结束：放出残留正文与工具调用。
     /// 结果经 [`Self::text`] / [`Self::reasoning`] / [`Self::tool_calls`] / [`Self::parse_failure`] 读取。
     pub fn finish(&mut self) {
-        if self.recognize_tools {
-            // 块没闭合（栈会被 `collect_calls` 取走，先记下来）：块内没写完的标记不是正文，整块丢掉
-            let block_open = !self.cache_tag_stack.is_empty();
-            let open_stack = block_open.then(|| format!("{:?}", self.cache_tag_stack));
-            let calls_before = self.tool_calls.len();
-            // 收尾：已闭合的调用落进缓冲，整块没等到 `</｜｜DSML｜｜ calls>` 的也在这里补发
-            self.collect_calls();
-            self.emit_new_calls();
-            match open_stack {
-                // 块内的标记不当正文；一个调用都没补出来才算工具调用失败
-                Some(stack) => {
-                    self.cache_response_buf.clear();
-                    if self.tool_calls.len() == calls_before {
-                        // 失败时打出接收原文与解析停在哪一步，便于对照模型原文排查
-                        warn!("工具调用解析失败，接收到的原始内容：{}", self.row_response_buf);
-                        warn!("工具调用解析失败，解析停在：{}", stack);
-                        // 坏块原文记下来交给上层：用规范化器提示词再问一轮修复
-                        let start = self
-                            .block_start
-                            .take()
-                            .unwrap_or(self.row_response_buf.len());
-                        self.parse_failure = Some(self.row_response_buf[start..].to_string());
-                    }
-                }
-                None => {
-                    // 块外残留（流末的普通文字）仍算正文
-                    let tail = std::mem::take(&mut self.cache_response_buf);
-                    self.push_text(&tail);
-                }
+        if !self.recognize_tools {
+            let tail = std::mem::take(&mut self.cache_response_buf);
+            self.push_text(&tail);
+            return;
+        }
+        if self.state != ParserState::Outside || self.broken {
+            // 收尾：已闭合的调用照样发，半个调用丢掉（不产出半块）。
+            if !self.broken && !self.block_calls.is_empty() {
+                self.cache_function_buf
+                    .extend(std::mem::take(&mut self.block_calls));
+                self.emit_new_calls();
+            } else {
+                // 块内没写出任何可解析的调用：整块当坏块，交给修复链路
+                self.record_failure();
             }
+            self.state = ParserState::Outside;
+            self.call = None;
+            self.param = None;
+            self.block_start = None;
+            self.broken = false;
+        } else {
+            let tail = std::mem::take(&mut self.cache_response_buf);
+            self.push_text(&tail);
         }
     }
 
@@ -172,6 +455,11 @@ impl ChatStreamProcessor {
         self.parse_failure.as_deref()
     }
 
+    /// 解析失败的原因（校验不通过 / 结构无法判定）；给修复提示词用。
+    pub fn failure_reason(&self) -> Option<&str> {
+        self.failure_reason.as_deref()
+    }
+
     /// 按片段类型分流：正文进 DSML 探测器，思考直接回吐，未知类型丢弃。
     fn feed_fragment(&mut self, ftype: &str, delta: &str) {
         match ftype {
@@ -187,7 +475,7 @@ impl ChatStreamProcessor {
         }
     }
 
-    /// 正文增量：先过工具检测，再按检测结果决定这段内容怎么走。
+    /// 正文增量：先过标签扫描，再按结果决定这段内容怎么走。
     fn push_response(&mut self, delta: &str) {
         self.row_response_buf.push_str(delta);
         if !self.recognize_tools {
@@ -199,319 +487,309 @@ impl ChatStreamProcessor {
         self.scan();
     }
 
-    /// 标签栈里记下的调用落进 `cache_function_buf`（OpenAI 形状）：只有 `</｜｜DSML｜｜ invoke>` 已到的调用
-    /// 才算完整，写了一半的调用丢掉——不产出半个工具调用。
-    fn collect_calls(&mut self) {
-        let mut name: Option<String> = None;
-        let mut arguments = Map::new();
-        let mut param: Option<(String, bool)> = None;
-        for tag in std::mem::take(&mut self.cache_tag_stack) {
-            match tag {
-                FunctionTag::CallName(call_name) => {
-                    name = Some(call_name);
-                    arguments = Map::new();
-                    param = None;
-                }
-                // 参数没写 `string` 属性时按字符串处理（缺省即字符串）
-                FunctionTag::ParamName(key) => param = Some((key, true)),
-                FunctionTag::ParamString(flag) => {
-                    if let Some((_, as_string)) = param.as_mut() {
-                        *as_string = flag != "false";
-                    }
-                }
-                FunctionTag::ParamValue(raw) => {
-                    if let Some((key, as_string)) = param.take() {
-                        arguments.insert(key, param_value(&raw, as_string));
-                    }
-                }
-                FunctionTag::CallClose => {
-                    if let Some(call_name) = name.take() {
-                        let call = tool_call_json(&call_name, &arguments, &self.schemas);
-                        self.cache_function_buf.push(call);
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    /// 按标签栈顶逐个消费标记，直到一步都推不动（等下一段增量）。
-    ///
-    /// 一步要么吃掉一段标记、要么原地不动；栈空时找整块开始标记，栈顶为 `CallsClose`
-    /// 说明本块已结束，复位后重新找正文与下一块。
+    /// 反复取下一个标签，直到缓冲区推不动（等下一段增量）。
     fn scan(&mut self) {
         loop {
-            let before = self.cache_response_buf.len();
-            self.scan_step();
-            if self.cache_response_buf.len() == before {
+            if self.broken {
                 break;
             }
+            match find_tag(&self.cache_response_buf) {
+                TagScan::Found { pos, tag } => {
+                    self.take_prefix(pos);
+                    let absolute = self.row_response_buf.len() - self.cache_response_buf.len();
+                    let raw = self.cache_response_buf[..tag.len].to_string();
+                    self.cache_response_buf.drain(..tag.len);
+                    self.dispatch(&tag, &raw, absolute);
+                }
+                TagScan::Incomplete { pos } => {
+                    self.take_prefix(pos);
+                    break;
+                }
+                TagScan::None => {
+                    let rest = std::mem::take(&mut self.cache_response_buf);
+                    self.consume_text(rest);
+                    break;
+                }
+            }
         }
     }
 
-    /// 一步状态推进：栈顶决定这一步该找哪个标记。
-    fn scan_step(&mut self) {
-        match self.cache_tag_stack.last() {
-            None => self.scan_calls_open(),
-            Some(&FunctionTag::CallsOpen) => self.scan_call_open(),
-            Some(&FunctionTag::CallOpen) => self.scan_call_name(),
-            Some(&FunctionTag::CallName(_)) => {
-                // 调用名之后：要么是参数，要么这次调用直接闭合（无参调用）
-                self.scan_param_open();
-                self.scan_call_close();
-            }
-            Some(&FunctionTag::ParamOpen) => self.scan_param_name(),
-            Some(&FunctionTag::ParamName(_)) => self.scan_param_string(),
-            Some(&FunctionTag::ParamString(_)) => self.scan_param_close(),
-            Some(&FunctionTag::ParamClose) => {
-                // 参数闭合后：要么还有下一个参数，要么这次调用闭合
-                self.scan_param_open();
-                self.scan_call_close();
-            }
-            Some(&FunctionTag::CallClose) => {
-                // 调用闭合后：要么还有下一次调用，要么整块闭合
-                self.scan_call_open();
-                self.scan_calls_close();
-            }
-            // 整块闭合：调用落定即发，标签栈复位，正文与下一块重新开始
-            Some(&FunctionTag::CallsClose) => {
-                self.collect_calls();
-                self.emit_new_calls();
-                self.cache_tag_stack.clear();
-                self.block_start = None;
-            }
-            Some(&FunctionTag::ParamValue(_)) => {}
-        }
-    }
-
-    /// 栈空时找整块开始标记 `<｜｜DSML｜｜ calls>`：标记之前是正文，标记本身消费掉，
-    /// 之后进块内状态；整段都没有标记时整段就是正文。
-    fn scan_calls_open(&mut self) {
-        match text_recognizer(CALLS_OPEN, &self.cache_response_buf) {
-            Result::Ok(TextRecognizerResult::Finded(start, end)) => {
-                // 块从这里开始：记下它在原始正文流里的起点，收尾失败时据此截出坏块原文
-                self.block_start =
-                    Some(self.row_response_buf.len() - self.cache_response_buf.len() + start);
-                self.cache_tag_stack.push(FunctionTag::CallsOpen);
-                let prefix = self.cache_response_buf[..start].to_string();
-                self.push_text(&prefix);
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {
-                // `Maybe` 已保证尾部不是半个标记：没有整块开始标记时整段都是正文
-                let text = std::mem::take(&mut self.cache_response_buf);
-                self.push_text(&text);
-            }
-            Err(_) => {}
-        }
-    }
-
-    fn scan_call_open(&mut self) {
-        match text_recognizer(INVOKE_OPEN, &self.cache_response_buf) {
-            // 前面只允许块内排版：还有别的标记（下一次调用之类）时交给那个标记先走
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                self.cache_tag_stack.push(FunctionTag::CallOpen);
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {}
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 先由 [`text_recognizer`] 找到 `name="` 标记，再在标记之后定位收尾的 `>`，
-    /// 回看它与标记之间那段里的引号，取两引号之间的名字：名字连同 `>` 一起消费，
-    /// 中间的空白一并丢掉；标记、`>` 或收尾引号还没到齐就先不动缓冲区。
-    fn scan_call_name(&mut self) {
-        match text_recognizer("name=\"", &self.cache_response_buf) {
-            // 前面只允许块内排版（标记与 `name` 之间的空白）
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                let Some(gt) = self.cache_response_buf[end..].find('>').map(|i| end + i) else {
-                    return;
-                };
-                let attr = &self.cache_response_buf[end..gt];
-                let Some(close) = attr.find('"') else {
-                    return;
-                };
-                let name = attr[..close].to_string();
-                self.cache_tag_stack.push(FunctionTag::CallName(name));
-                self.cache_response_buf = self.cache_response_buf[gt + 1..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {}
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 命中参数标记 `<｜｜DSML｜｜ parameter`：消费标记并压入 `ParamOpen`，
-    /// 标记之前的块内语法一并丢掉；标记还没到就先不动缓冲区，等下一段增量补齐。
-    fn scan_param_open(&mut self) {
-        match text_recognizer(PARAMETER_OPEN, &self.cache_response_buf) {
-            // 前面只允许块内排版：还有别的标记（`</｜｜DSML｜｜ invoke>`、下一次调用之类）时交给那个标记先走
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                self.cache_tag_stack.push(FunctionTag::ParamOpen);
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {}
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 命中 `name="` 后取引号之间的参数名，连同收尾引号一起消费并压入 `ParamName`，
-    /// 标记之前的块内语法一并丢掉；标记、名字或收尾引号还没到就先不动缓冲区，等下一段增量补齐。
-    fn scan_param_name(&mut self) {
-        match text_recognizer("name=\"", &self.cache_response_buf) {
-            // 前面只允许块内排版（标记与 `name` 之间的空白）
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                let quoted = &self.cache_response_buf[end..];
-                let Some(close) = quoted.find('"') else {
-                    return;
-                };
-                let name = quoted[..close].to_string();
-                let consumed = end + close + 1;
-                self.cache_tag_stack.push(FunctionTag::ParamName(name));
-                self.cache_response_buf = self.cache_response_buf[consumed..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {}
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 命中 `string="` 后取引号之间的标记，再找参数标签收尾的 `>`：标记、内容与 `>` 一并消费，
-    /// 压入 `ParamString`，缓冲区停在参数值开头；标记、收尾引号或 `>` 还没到就先不动缓冲区，
-    /// 等下一段增量补齐。
-    fn scan_param_string(&mut self) {
-        match text_recognizer("string=\"", &self.cache_response_buf) {
-            // 前面只允许块内排版（参数名引号与 `string` 之间的空白）
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                let quoted = &self.cache_response_buf[end..];
-                let Some(close) = quoted.find('"') else {
-                    return;
-                };
-                let flag = quoted[..close].to_string();
-                let Some(gt) = self.cache_response_buf[end + close + 1..].find('>') else {
-                    return;
-                };
-                let consumed = end + close + 1 + gt + 1;
-                self.cache_tag_stack.push(FunctionTag::ParamString(flag));
-                self.cache_response_buf = self.cache_response_buf[consumed..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {}
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 命中参数闭合标志 `</｜｜DSML｜｜ parameter>`：标志之前的内容就是参数值，
-    /// 值与标志一起消费，压入 `ParamValue` 后紧跟一个 `ParamClose`（参数已闭合，
-    /// 下一个该找 `<｜｜DSML｜｜ parameter` 或 `</｜｜DSML｜｜ invoke>`）；
-    /// 闭合标志还没到就先扣住，等下一段增量补齐。
-    fn scan_param_close(&mut self) {
-        match text_recognizer(PARAMETER_CLOSE, &self.cache_response_buf) {
-            Result::Ok(TextRecognizerResult::Finded(start, end)) => {
-                let value = self.cache_response_buf[..start].to_string();
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
-                self.cache_tag_stack.push(FunctionTag::ParamValue(value));
-                self.cache_tag_stack.push(FunctionTag::ParamClose);
-            }
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
-        }
-    }
-    /// 命中调用闭合标志 `</｜｜DSML｜｜ invoke>`，且它确实是下一个标记时：标志与它之前的块内排版
-    /// 一并消费，压入 `CallClose`（下一个该找 `<｜｜DSML｜｜ invoke` 或 `</｜｜DSML｜｜ calls>`）；
-    /// 标志还没到就先扣住，等下一段增量补齐。闭合标志写成缺 `/` 的形态时见 [`Self::scan_close_without_slash`]。
-    fn scan_call_close(&mut self) {
-        match text_recognizer(INVOKE_CLOSE, &self.cache_response_buf) {
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                self.cache_tag_stack.push(FunctionTag::CallClose);
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
-            }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {
-                // 前面还有别的标记（参数标签之类）：交给它先走，别把中间的内容一起吃掉
-            }
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
-            }
-            // 完整闭合标志没找到、也没有半个标志：可能是模型少写了一个 `/`
-            Result::Ok(TextRecognizerResult::NotFinded) => self.scan_close_without_slash(),
-            Err(_) => {}
-        }
-    }
-
-    /// 闭合标志漏写 `/` 的形态：`<｜｜DSML｜｜ invoke>`。
-    ///
-    /// 这种标签没有 `name` 属性，当开标签用不了（拿不到工具名，客户端会判整次调用非法）；
-    /// 按闭合处理，前面收好的参数就都还归这次调用，不会因为少一个字符把整块作废。
-    /// 带 `name` 的同形标签是真正的开标签，交给正常路径。
-    fn scan_close_without_slash(&mut self) {
-        let Ok(TextRecognizerResult::Finded(start, end)) =
-            text_recognizer(INVOKE_OPEN, &self.cache_response_buf)
-        else {
-            return;
-        };
-        // 前面只允许块内排版：还有别的标记时交给那个标记先走
-        if !self.cache_response_buf[..start].trim().is_empty() {
+    /// 把标签之前的那一段按当前状态消费掉（块外是正文，参数值内并入值，块内排版丢弃）。
+    fn take_prefix(&mut self, pos: usize) {
+        if pos == 0 {
             return;
         }
-        let rest = &self.cache_response_buf[end..];
-        let Some(gt) = rest.find('>') else {
-            return; // 标签还没写完：等下一段增量
-        };
-        if rest[..gt].contains("name") {
+        let prefix = self.cache_response_buf[..pos].to_string();
+        self.cache_response_buf.drain(..pos);
+        self.consume_text(prefix);
+    }
+
+    /// 一段不含标签的原文该往哪走。
+    fn consume_text(&mut self, text: String) {
+        if text.is_empty() {
             return;
         }
-        self.cache_tag_stack.push(FunctionTag::CallClose);
-        self.cache_response_buf = rest[gt + 1..].to_string();
+        match self.state {
+            ParserState::Outside => self.push_text(&text),
+            ParserState::InParam => {
+                if let Some(param) = self.param.as_mut() {
+                    param.value.push_str(&text);
+                }
+            }
+            // 块内没有标签的换行、缩进只是排版
+            _ => {}
+        }
     }
-    /// 命中整块闭合标志 `</｜｜DSML｜｜ calls>`，且它确实是下一个标记时：标志与它之前的块内排版
-    /// 一并消费，压入 `CallsClose`（本块结束）；标志还没到就先扣住，等下一段增量补齐。
-    fn scan_calls_close(&mut self) {
-        match text_recognizer(CALLS_CLOSE, &self.cache_response_buf) {
-            Result::Ok(TextRecognizerResult::Finded(start, end))
-                if self.cache_response_buf[..start].trim().is_empty() =>
-            {
-                self.cache_tag_stack.push(FunctionTag::CallsClose);
-                self.cache_response_buf = self.cache_response_buf[end..].to_string();
+
+    /// 认领一个标签：按当前状态推进，必要时补齐被模型写丢的结构。
+    fn dispatch(&mut self, tag: &Tag, raw: &str, absolute: usize) {
+        match self.state {
+            ParserState::Outside => {
+                // 块外只认「无属性的整块开标记」：正文里普通尖括号不当工具调用
+                let opens_block = !tag.closing
+                    && tag.name.is_none()
+                    && matches!(tag.kind, ElementKind::Calls | ElementKind::Other);
+                if opens_block {
+                    self.block_start = Some(absolute);
+                    self.state = ParserState::InCalls;
+                    self.broken = false;
+                    self.failure_reason = None;
+                } else {
+                    self.push_text(raw);
+                }
             }
-            Result::Ok(TextRecognizerResult::Finded(_start, _end)) => {
-                // 前面还有别的标记（下一次调用之类）：交给它先走，别把中间的内容一起吃掉
+            ParserState::InCalls => {
+                if tag.closing {
+                    // 整块闭合；其它多余的闭合标签（参数写完后多补的一行）直接忽略
+                    if tag.kind == ElementKind::Calls
+                        || (tag.kind == ElementKind::Other && tag.name.is_none())
+                    {
+                        self.close_block();
+                    }
+                } else if let Some(name) = tag.name.clone() {
+                    // 块内出现带 name 的开标签就是一次调用：`invoke` 或被写丢的 `<… name="x">`。
+                    // 孤立 `parameter`（写丢了 invoke）不当工具名，直接当排版忽略。
+                    if tag.kind != ElementKind::Parameter {
+                        self.start_call(name);
+                    }
+                }
             }
-            Result::Ok(TextRecognizerResult::Maybe(_start, _end)) => {
-                // 尾巴是半个标记：扣住，等下一段增量补齐
+            ParserState::InCall => {
+                if tag.closing {
+                    match tag.kind {
+                        ElementKind::Invoke => self.close_call(),
+                        ElementKind::Calls => {
+                            self.close_call();
+                            self.close_block();
+                        }
+                        // 合并标签落在「上一个参数已闭合」之后（实测形态）：
+                        // `</… parameter name="workdir" …>` 的 name 就是下一个参数名，按开标签处理
+                        ElementKind::Parameter if tag.name.is_some() => {
+                            self.start_param(tag.name.clone(), tag.string_flag.clone())
+                        }
+                        // `</｜｜DSML｜｜>`：写丢名字的调用闭合
+                        ElementKind::Other if tag.name.is_none() => self.close_call(),
+                        // 参数闭合写了两遍之类：多余，忽略
+                        _ => {}
+                    }
+                } else {
+                    match tag.kind {
+                        ElementKind::Parameter => {
+                            self.start_param(tag.name.clone(), tag.string_flag.clone())
+                        }
+                        // 开标签写丢 `parameter`：只剩属性区
+                        ElementKind::Other if tag.name.is_some() => {
+                            self.start_param(tag.name.clone(), tag.string_flag.clone())
+                        }
+                        // 闭合标签漏写 `/`
+                        ElementKind::Invoke if tag.name.is_none() => self.close_call(),
+                        // 调用还没闭合又出现新的 invoke：结构无法判定，整块交给修复
+                        ElementKind::Invoke => self.break_block("调用未闭合就出现了新的 invoke"),
+                        _ => {}
+                    }
+                }
             }
-            Result::Ok(TextRecognizerResult::NotFinded) => {}
-            Err(_) => {}
+            ParserState::InParam => {
+                if tag.closing {
+                    match tag.kind {
+                        ElementKind::Parameter => {
+                            if tag.name.is_some() {
+                                // 合并标签：先把当前参数落定，再用它的属性开下一个参数
+                                self.finish_param();
+                                self.start_param(tag.name.clone(), tag.string_flag.clone());
+                            } else {
+                                self.finish_param();
+                            }
+                        }
+                        ElementKind::Calls => {
+                            self.finish_param();
+                            self.close_call();
+                            self.close_block();
+                        }
+                        ElementKind::Invoke => {
+                            self.finish_param();
+                            self.close_call();
+                        }
+                        // `</｜｜DSML｜｜>`：写丢名字的参数闭合
+                        ElementKind::Other if tag.name.is_some() => {
+                            self.finish_param();
+                            self.start_param(tag.name.clone(), tag.string_flag.clone());
+                        }
+                        ElementKind::Other => self.finish_param(),
+                    }
+                } else {
+                    match tag.kind {
+                        // 漏写参数闭合标签：下一个参数开标签视为当前参数到此为止
+                        ElementKind::Parameter => {
+                            self.finish_param();
+                            self.start_param(tag.name.clone(), tag.string_flag.clone());
+                        }
+                        ElementKind::Other if tag.name.is_some() => {
+                            self.finish_param();
+                            self.start_param(tag.name.clone(), tag.string_flag.clone());
+                        }
+                        // 参数没闭合就出现新的 invoke：结构无法判定
+                        ElementKind::Invoke if tag.name.is_some() => {
+                            self.break_block("参数未闭合就出现了新的 invoke")
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// 开始收集一次调用。
+    fn start_call(&mut self, name: String) {
+        self.call = Some(CallAcc {
+            name,
+            arguments: Map::new(),
+        });
+        self.param = None;
+        self.state = ParserState::InCall;
+    }
+
+    /// 开始收集一个参数；`string` 属性缺省按字符串处理。
+    fn start_param(&mut self, name: Option<String>, string_flag: Option<String>) {
+        let name = name.unwrap_or_default();
+        self.param = Some(ParamAcc {
+            name,
+            as_string: string_flag.as_deref() != Some("false"),
+            value: String::new(),
+        });
+        self.state = ParserState::InParam;
+    }
+
+    /// 落定当前参数。
+    fn finish_param(&mut self) {
+        if let Some(param) = self.param.take() {
+            if let Some(call) = self.call.as_mut() {
+                call.arguments
+                    .insert(param.name, param_value(&param.value, param.as_string));
+            }
+        }
+        if self.state == ParserState::InParam {
+            self.state = ParserState::InCall;
+        }
+    }
+
+    /// 一次调用闭合：按 schema 校验后落进当前块；不合格就整块判失败，绝不把坏调用发出去。
+    fn close_call(&mut self) {
+        self.finish_param();
+        if let Some(call) = self.call.take() {
+            match self.build_call(&call.name, &call.arguments) {
+                Ok(value) => self.block_calls.push(value),
+                Err(reason) => {
+                    self.break_block(&reason);
+                    return;
+                }
+            }
+        }
+        self.state = ParserState::InCalls;
+    }
+
+    /// 组装并校验一次调用。
+    fn build_call(
+        &self,
+        name: &str,
+        arguments: &Map<String, Value>,
+    ) -> std::result::Result<Value, String> {
+        if name.trim().is_empty() {
+            return Err("调用没有工具名".to_string());
+        }
+        // 参数值里混进标记残片：模型把标签写进了值里（实测占成功调用的 10%），必须重写而不是照发
+        for (key, value) in arguments {
+            let text = match value {
+                Value::String(text) => text.clone(),
+                other => other.to_string(),
+            };
+            if contains_markup_residue(&text) {
+                return Err(format!("参数 {key} 的值里混进了 DSML 标记"));
+            }
+        }
+        self.schemas.check(name, arguments)?;
+        Ok(tool_call_json(name, arguments, &self.schemas))
+    }
+
+    /// 整块闭合：本块已校验的调用一次性发出，位置复位。
+    fn close_block(&mut self) {
+        self.finish_param();
+        if !self.block_calls.is_empty() {
+            self.cache_function_buf
+                .extend(std::mem::take(&mut self.block_calls));
+            self.emit_new_calls();
+        }
+        self.call = None;
+        self.param = None;
+        self.block_start = None;
+        self.state = ParserState::Outside;
+    }
+
+    /// 结构无法判定：本块作废，交给修复链路（不猜着拼调用）。
+    fn break_block(&mut self, reason: &str) {
+        self.broken = true;
+        self.failure_reason = Some(reason.to_string());
+    }
+
+    /// 落定失败：记下坏块原文与解析位置，供上层修复。
+    fn record_failure(&mut self) {
+        let start = self
+            .block_start
+            .take()
+            .unwrap_or(self.row_response_buf.len());
+        if start <= self.row_response_buf.len() {
+            self.parse_failure = Some(self.row_response_buf[start..].to_string());
+        }
+        // 失败时打出接收原文与解析停在哪一步，便于对照模型原文排查
+        warn!(
+            "工具调用解析失败，接收到的原始内容：{}",
+            self.row_response_buf
+        );
+        warn!("工具调用解析失败，解析停在：{}", self.state_label());
+        if let Some(reason) = &self.failure_reason {
+            warn!("工具调用解析失败，原因：{}", reason);
+        }
+    }
+
+    /// 解析位置的可读描述（日志与排查用；`CallName("x")` 与历史日志格式一致）。
+    fn state_label(&self) -> String {
+        match self.state {
+            ParserState::Outside => "Outside".to_string(),
+            ParserState::InCalls => "CallsOpen".to_string(),
+            ParserState::InCall => format!(
+                "CallName({:?})",
+                self.call
+                    .as_ref()
+                    .map(|call| call.name.as_str())
+                    .unwrap_or("")
+            ),
+            ParserState::InParam => format!(
+                "ParamName({:?})",
+                self.param
+                    .as_ref()
+                    .map(|param| param.name.as_str())
+                    .unwrap_or("")
+            ),
         }
     }
 
@@ -580,13 +858,25 @@ impl ChatStreamProcessor {
     }
 }
 
+/// 参数值里是否混进了 DSML 标记残片。
+///
+/// 只看标记形态（`…DSML｜｜` / `｜｜DSML` / `||DSML` / `<…DSML`），不按裸 `DSML` 判断：
+/// 文件名、文档里出现 `DSML.md` 这种字样不该被判成坏值。
+fn contains_markup_residue(text: &str) -> bool {
+    const NEEDLES: [&str; 5] = ["｜｜DSML", "DSML｜｜", "||DSML", "DSML||", "<｜｜DSML"];
+    NEEDLES.iter().any(|needle| text.contains(needle))
+}
+
 /// 一次调用（工具名 + 参数）→ OpenAI 形状的 `tool_calls[]` 元素（`arguments` 是 JSON 字符串）。
 fn tool_call_json(name: &str, arguments: &Map<String, Value>, schemas: &ToolSchemas) -> Value {
     // 参数类型以请求里的 JSON Schema 为准：模型常把数字、数组也标成 `string="true"`，
     // 照它的标注落值，客户端会因「期望数字、收到字符串」把整次调用判为非法。
     let mut coerced = Map::with_capacity(arguments.len());
     for (key, value) in arguments {
-        coerced.insert(key.clone(), coerce(value.clone(), schemas.type_of(name, key)));
+        coerced.insert(
+            key.clone(),
+            coerce(value.clone(), schemas.type_of(name, key)),
+        );
     }
     let arguments = serde_json::to_string(&coerced).unwrap_or_else(|_| "{}".to_string());
     json!({
@@ -644,12 +934,20 @@ fn unescape(text: &str) -> String {
     out
 }
 
-/// 请求里带的工具参数类型表：`工具名 → 参数名 → 期望类型`，取自 `tools[].function.parameters`。
+/// 请求里带的工具参数表：取自 `tools[].function.parameters`。
 ///
-/// 只用来矫正「字符串 ↔ 结构化值」的标注错误，不做别的猜测：类型表里没有的工具或参数保持原样。
+/// 用途有两层：矫正「字符串 ↔ 结构化值」的标注错误；在调用出站前校验「工具已声明、必填参数齐全」，
+/// 不合格的调用绝不发给客户端（客户端一定会判它非法，还会静默改错文件）。
 #[derive(Debug, Clone, Default)]
 pub struct ToolSchemas {
-    tools: std::collections::HashMap<String, std::collections::HashMap<String, ParamKind>>,
+    tools: std::collections::HashMap<String, ToolSchema>,
+}
+
+/// 单个工具的参数表：参数类型 + 必填项。
+#[derive(Debug, Clone, Default)]
+struct ToolSchema {
+    params: std::collections::HashMap<String, ParamKind>,
+    required: Vec<String>,
 }
 
 /// 参数在 JSON Schema 里的类型。
@@ -666,10 +964,8 @@ enum ParamKind {
 impl ToolSchemas {
     /// 从请求的 `tools`（OpenAI 形状）建表；没有工具或形状不认识时得到空表。
     pub fn from_tools(tools: Option<&Value>) -> Self {
-        let mut table: std::collections::HashMap<
-            String,
-            std::collections::HashMap<String, ParamKind>,
-        > = std::collections::HashMap::new();
+        let mut table: std::collections::HashMap<String, ToolSchema> =
+            std::collections::HashMap::new();
         let Some(list) = tools.and_then(Value::as_array) else {
             return Self { tools: table };
         };
@@ -678,18 +974,24 @@ impl ToolSchemas {
             let Some(name) = function.get("name").and_then(Value::as_str) else {
                 continue;
             };
-            let Some(properties) = function
-                .get("parameters")
-                .and_then(|parameters| parameters.get("properties"))
-                .and_then(Value::as_object)
-            else {
+            // 没有 parameters 的工具也要登记：否则「工具已声明但无参数」会被当成未声明而误判
+            let entry = table.entry(name.to_string()).or_default();
+            let Some(parameters) = function.get("parameters") else {
                 continue;
             };
-            let entry = table.entry(name.to_string()).or_default();
-            for (param, schema) in properties {
-                if let Some(kind) = schema_kind(schema) {
-                    entry.insert(param.clone(), kind);
+            if let Some(properties) = parameters.get("properties").and_then(Value::as_object) {
+                for (param, schema) in properties {
+                    if let Some(kind) = schema_kind(schema) {
+                        entry.params.insert(param.clone(), kind);
+                    }
                 }
+            }
+            if let Some(required) = parameters.get("required").and_then(Value::as_array) {
+                entry.required = required
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect();
             }
         }
         Self { tools: table }
@@ -697,7 +999,32 @@ impl ToolSchemas {
 
     /// 某个工具某个参数的期望类型；不知道时为 None（不做矫正）。
     fn type_of(&self, tool: &str, param: &str) -> Option<ParamKind> {
-        self.tools.get(tool)?.get(param).copied()
+        self.tools.get(tool)?.params.get(param).copied()
+    }
+
+    /// 校验一次调用：只拦「客户端一定会判非法」的两种情形——工具未声明、缺必填参数。
+    ///
+    /// 参数类型不在这里拒绝：`coerce` 已按 schema 矫正过，矫不过来是模型给的值本身有问题，
+    /// 交给客户端报更贴切的错（这里拒绝反而会把它升级成「整轮失败」）。
+    /// 空表（请求没带可用工具）时不做校验。
+    fn check(&self, name: &str, arguments: &Map<String, Value>) -> std::result::Result<(), String> {
+        if self.tools.is_empty() {
+            return Ok(());
+        }
+        let schema = self
+            .tools
+            .get(name)
+            .ok_or_else(|| format!("工具 {name} 未在请求的 tools 里声明"))?;
+        let missing = schema
+            .required
+            .iter()
+            .filter(|key| !arguments.contains_key(*key))
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!("工具 {name} 缺必填参数：{}", missing.join("、")));
+        }
+        Ok(())
     }
 }
 
@@ -893,7 +1220,11 @@ mod tests {
             .iter()
             .map(|delta| parse_delta(delta).content)
             .collect();
-        assert_eq!(content, "前", "调用之前的正文照常发、之后的正文不发：{:?}", content);
+        assert_eq!(
+            content, "前",
+            "调用之前的正文照常发、之后的正文不发：{:?}",
+            content
+        );
         assert_eq!(processor.text(), "前");
         assert_eq!(processor.tool_calls().len(), 1);
         assert_eq!(
@@ -1305,7 +1636,11 @@ mod tests {
             .iter()
             .map(|delta| parse_delta(delta).content)
             .collect();
-        assert_eq!(content, "我先看看目录", "调用之前的正文照常发：{:?}", deltas);
+        assert_eq!(
+            content, "我先看看目录",
+            "调用之前的正文照常发：{:?}",
+            deltas
+        );
         assert_eq!(processor.text(), "我先看看目录");
         assert_eq!(processor.tool_calls().len(), 1);
     }
@@ -1515,9 +1850,9 @@ mod tests {
         assert_eq!(arguments["note"], json!("120"), "schema 没写类型就不动它");
     }
 
-    /// 请求里没带的工具（类型表里查不到）不矫正：别拿别的工具的类型乱改值。
+    /// 请求里没带的工具直接判失败，不发给客户端：客户端一定会因「未声明的工具」拒绝整次调用。
     #[test]
-    fn unknown_tool_arguments_are_left_alone() {
+    fn unknown_tool_is_rejected() {
         let tools = json!([{
             "type": "function",
             "function": {
@@ -1535,13 +1870,230 @@ mod tests {
         )]);
         processor.finish();
 
+        assert!(
+            calls_of(&seen.lock().unwrap().clone()).is_empty(),
+            "未声明的工具不该外发"
+        );
+        assert!(processor.tool_calls().is_empty());
+        assert!(processor.parse_failure().is_some(), "应交给修复链路");
+        assert!(
+            processor
+                .failure_reason()
+                .is_some_and(|reason| reason.contains("unknown_tool")),
+            "失败原因要指出未声明的工具：{:?}",
+            processor.failure_reason()
+        );
+    }
+
+    /// 模型把「闭上一个参数 + 开下一个参数」合成一个闭标签（实测占失败块 33/83、静默腐蚀 44/49）：
+    /// 按上下文拆开，参数值里绝不能混进标记。
+    #[test]
+    fn merged_close_tag_is_split_instead_of_swallowed() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"edit\">",
+            "<｜｜DSML｜｜ parameter name=\"file_path\" string=\"true\">a.rs",
+            "</｜｜DSML｜｜ parameter name=\"old_string\" string=\"true\">fn a() {}",
+            "</｜｜DSML｜｜ parameter>",
+            "<｜｜DSML｜｜ parameter name=\"new_string\" string=\"true\">fn b() {}",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
         let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "应解析成一次调用：{calls:?}");
         let arguments: Value =
             serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["file_path"], json!("a.rs"), "路径里不能混进标记");
+        assert_eq!(arguments["old_string"], json!("fn a() {}"));
+        assert_eq!(arguments["new_string"], json!("fn b() {}"));
+        assert!(processor.parse_failure().is_none());
+    }
+
+    /// 开标签丢掉 `parameter` 这个词（`<｜｜DSML｜｜ description" string="true">`）：
+    /// 参数名从标签名位置与属性区推断，不整块作废。
+    #[test]
+    fn missing_parameter_word_is_inferred() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"pwsh\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">git status",
+            "</｜｜DSML｜｜ parameter>",
+            "<｜｜DSML｜｜ description\" string=\"true\">看工作区状态",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let arguments: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["command"], json!("git status"));
         assert_eq!(
-            arguments["view_range"],
-            json!("[1,60]"),
-            "类型表里没有就保持原样"
+            arguments["description"],
+            json!("看工作区状态"),
+            "写丢 `parameter` 的参数要按属性名还原"
+        );
+    }
+
+    /// 闭标签只剩标记、名字写丢（`</｜｜DSML｜｜>`）：按栈顶推断是收参数还是收调用。
+    #[test]
+    fn nameless_close_tags_are_inferred() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">",
+            "<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">a.rs</｜｜DSML｜｜>",
+            "</｜｜DSML｜｜></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "参数与调用都要按上下文闭合：{calls:?}");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert!(processor.parse_failure().is_none());
+    }
+
+    /// 多写的闭合标签（参数写完后补一行 `</parameter>`、尾部重复 `</calls>`）直接忽略。
+    #[test]
+    fn redundant_close_tags_are_ignored() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">",
+            "<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">a.rs</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+        assert!(processor.parse_failure().is_none());
+    }
+
+    /// 标记少一根竖线（`</DSML｜｜ parameter>`）同样能认出来。
+    #[test]
+    fn broken_pipe_marker_still_parses() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">",
+            "<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">a.rs</DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert_eq!(calls[0]["function"]["arguments"], "{\"path\":\"a.rs\"}");
+    }
+
+    /// 参数值里混进标记残片（历史腐蚀形态）：判失败交给修复，绝不照原样发给客户端。
+    #[test]
+    fn markup_residue_in_argument_is_rejected() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"read_file\">",
+            "<｜｜DSML｜｜ parameter name=\"path\" string=\"true\">a.rs DSML｜｜ tail",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(DeltaChunk::RESPONSE.to_string(), markup.to_string())]);
+        processor.finish();
+
+        assert!(
+            calls_of(&seen.lock().unwrap().clone()).is_empty(),
+            "坏值不该外发"
+        );
+        assert!(processor.tool_calls().is_empty());
+        assert!(processor.parse_failure().is_some());
+        assert!(
+            processor
+                .failure_reason()
+                .is_some_and(|reason| reason.contains("DSML 标记")),
+            "失败原因要说明值里混进了标记：{:?}",
+            processor.failure_reason()
+        );
+    }
+
+    /// 合并标签出现在「上一个参数已闭合」之后（真实日志里的形态）：
+    /// `</｜｜DSML｜｜ parameter name="workdir" string="true">…` 的 name 是下一个参数，不能丢。
+    #[test]
+    fn merged_close_after_closed_param_opens_next_param() {
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true);
+        let markup = concat!(
+            "<｜｜DSML｜｜ calls><｜｜DSML｜｜ invoke name=\"pwsh\">",
+            "<｜｜DSML｜｜ parameter name=\"command\" string=\"true\">cargo test",
+            "</｜｜DSML｜｜ parameter>",
+            "<｜｜DSML｜｜ parameter name=\"timeoutMs\" string=\"false\">120000",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ parameter name=\"workdir\" string=\"true\">D:\\\\work",
+            "</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke></｜｜DSML｜｜ calls>",
+        );
+        processor.feed(vec![(
+            DeltaChunk::RESPONSE.to_string(),
+            markup.to_string(),
+        )]);
+        processor.finish();
+
+        let calls = calls_of(&seen.lock().unwrap().clone());
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        let arguments: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["command"], json!("cargo test"));
+        assert_eq!(arguments["timeoutMs"], json!(120000));
+        assert_eq!(
+            arguments["workdir"],
+            json!("D:\\work"),
+            "合并标签带来的 workdir 参数不能丢"
+        );
+    }
+
+    /// 缺必填参数：按请求里的 schema 判失败，不让客户端拿到一次注定被拒的调用。
+    #[test]
+    fn missing_required_argument_is_rejected() {
+        let tools = json!([{
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "parameters": {
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                }
+            }
+        }]);
+        let schemas = ToolSchemas::from_tools(Some(&tools));
+
+        let (seen, sink) = collector();
+        let mut processor = ChatStreamProcessor::new(sink, true).with_tool_schemas(schemas);
+        processor.feed(vec![(
+            DeltaChunk::RESPONSE.to_string(),
+            dsml_call("read_file", "limit", "20"),
+        )]);
+        processor.finish();
+
+        assert!(calls_of(&seen.lock().unwrap().clone()).is_empty());
+        assert!(processor.parse_failure().is_some());
+        assert!(
+            processor
+                .failure_reason()
+                .is_some_and(|reason| reason.contains("必填")),
+            "{:?}",
+            processor.failure_reason()
         );
     }
 }
