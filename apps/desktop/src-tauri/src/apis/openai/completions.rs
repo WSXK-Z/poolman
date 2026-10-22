@@ -17,8 +17,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::apis::base::{error_response, parse_delta, ApiKeyAuth, AppState};
+use crate::apis::base::{error_response, parse_delta, request_meta, ApiKeyAuth, AppState};
 use crate::providers::InferRequest;
+use crate::request_record::RequestMeta;
 
 #[derive(Debug, Deserialize)]
 pub struct CompletionRequest {
@@ -41,6 +42,7 @@ pub struct CompletionRequest {
 pub async fn completions_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<ApiKeyAuth>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<CompletionRequest>,
 ) -> impl IntoResponse {
     let prompt = prompt_to_text(&req.prompt);
@@ -49,6 +51,7 @@ pub async fn completions_handler(
     }
 
     let model = req.model.clone();
+    let meta = request_meta("openai", "/v1/completions", &headers);
     let request = InferRequest {
         model: model.clone(),
         messages: vec![serde_json::json!({ "role": "user", "content": prompt })],
@@ -63,10 +66,10 @@ pub async fn completions_handler(
     };
 
     if req.stream {
-        return sse_response(state, request, model);
+        return sse_response(state, request, meta, model);
     }
 
-    match state.chat_router.chat_completions(request).await {
+    match state.chat_router.chat_completions(request, meta).await {
         Ok(result) => {
             let response = serde_json::json!({
                 "id": format!("cmpl-{}", chrono::Utc::now().timestamp_millis()),
@@ -91,7 +94,12 @@ pub async fn completions_handler(
 }
 
 /// 流式文本补全：SSE 逐条输出文本增量。
-fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> axum::response::Response {
+fn sse_response(
+    state: Arc<AppState>,
+    request: InferRequest,
+    meta: RequestMeta,
+    model: String,
+) -> axum::response::Response {
     let id = format!("cmpl-{}", chrono::Utc::now().timestamp_millis());
     let created = chrono::Utc::now().timestamp();
 
@@ -104,6 +112,7 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
             let result = router
                 .chat_completions_stream(
                     request,
+                    meta,
                     Box::new(move |delta: String| {
                         let _ = chunk_tx.send(Ok(delta));
                     }),

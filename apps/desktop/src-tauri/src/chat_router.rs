@@ -16,15 +16,16 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use serde_json::Value;
-use tracing::info;
+use serde_json::{json, Value};
+use tracing::{info, warn};
 
-use crate::models::PluginModel;
+use crate::apis::base::DeltaChunk;
+use crate::local_session::{LocalSessionStore, SessionAnswer, SessionPlan};
+use crate::models::{InferRequest, ModelResponse, PluginModel};
 use crate::providers::plugin::PLUGIN_PROVIDER_ID;
 use crate::providers::provider_control::ProviderControl;
-use crate::providers::{
-    ChatProvider, InferRequest, ModelDescriptor, ModelResponse, PluginProvider, ProviderRegistry,
-};
+use crate::providers::{ChatProvider, ModelDescriptor, PluginProvider, ProviderRegistry};
+use crate::request_record::{RequestMeta, RequestRecordDraft, RequestRecordStore};
 
 /// 路由输入：请求参数 + 调用方 token。
 #[derive(Debug, Clone)]
@@ -50,6 +51,9 @@ pub struct RouteDecision {
     pub provider: String,
 }
 
+/// 一次请求的待落库快照：记录库未注入时为 None。
+type PendingRecord = Option<(Arc<RequestRecordStore>, RequestRecordDraft)>;
+
 pub struct ChatRouter {
     /// 供应商注册表：模型名 → 供应商。
     registry: ProviderRegistry,
@@ -57,6 +61,10 @@ pub struct ChatRouter {
     plugin: Arc<PluginProvider>,
     /// 渠道启停状态。
     provider_control: Arc<ProviderControl>,
+    /// 本地请求记录（未注入时不记录）。
+    request_records: Option<Arc<RequestRecordStore>>,
+    /// 本地会话管理（未注入时不生成会话与标记）。
+    local_sessions: Option<Arc<LocalSessionStore>>,
 }
 
 impl ChatRouter {
@@ -68,7 +76,105 @@ impl ChatRouter {
             registry,
             plugin,
             provider_control,
+            request_records: None,
+            local_sessions: None,
         }
+    }
+
+    /// 注入本地请求记录：所有经过路由的对话请求都会写入一条记录。
+    pub fn with_request_records(mut self, store: Arc<RequestRecordStore>) -> Self {
+        self.request_records = Some(store);
+        self
+    }
+
+    /// 注入本地会话管理：每次请求归入会话，新会话在回复里写入标记。
+    pub fn with_local_sessions(mut self, store: Arc<LocalSessionStore>) -> Self {
+        self.local_sessions = Some(store);
+        self
+    }
+
+    /// 在请求交给渠道前拍快照；未注入记录库时返回 None。
+    fn begin_record(&self, request: &InferRequest, meta: &RequestMeta) -> PendingRecord {
+        self.request_records
+            .as_ref()
+            .map(|store| (store.clone(), RequestRecordDraft::from_request(request, meta)))
+    }
+
+    /// 请求交给渠道前决定本地会话；未注入会话库或查询失败时返回 None。
+    async fn begin_session_plan(&self, request: &InferRequest) -> Option<SessionPlan> {
+        let store = self.local_sessions.as_ref()?;
+        match store.plan(&request.messages).await {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                warn!("生成本地会话计划失败: {}", error);
+                None
+            }
+        }
+    }
+
+    /// 结果返回后写入会话、请求记录，并刷新该会话的内容表。
+    async fn finish_record(
+        pending: PendingRecord,
+        local_store: Option<Arc<LocalSessionStore>>,
+        session_plan: Option<SessionPlan>,
+        answer: Option<SessionAnswer>,
+        result: &Result<ModelResponse>,
+    ) {
+        let content_store = local_store.clone();
+        let entry = pending.map(|(store, draft)| {
+            let mut entry = draft.finish(result);
+            if let Some(plan) = &session_plan {
+                entry.local_session_id = Some(plan.session_id.clone());
+            }
+            (store, entry)
+        });
+        if entry.is_none() && (local_store.is_none() || session_plan.is_none()) {
+            return;
+        }
+        if let (Some(store), Some(plan)) = (local_store, session_plan) {
+            if let Err(error) = store.finalize(&plan, answer.as_ref()).await {
+                warn!("写入本地会话失败 id={} err={}", plan.session_id, error);
+            }
+        }
+        if let Some((store, entry)) = entry {
+            let id = entry.id.clone();
+            let session_id = entry.local_session_id.clone();
+            if let Err(error) = store.insert(entry).await {
+                warn!("写入本地请求记录失败 id={} err={}", id, error);
+            }
+            if let (Some(content_store), Some(session_id)) = (content_store, session_id) {
+                if let Err(error) = content_store.rebuild_session_content(&session_id).await {
+                    warn!("重建本地会话内容失败 id={} err={}", session_id, error);
+                }
+            }
+        }
+    }
+
+    /// 本轮回答快照；失败请求没有回答内容。
+    fn session_answer(result: &Result<ModelResponse>) -> Option<SessionAnswer> {
+        match result {
+            Ok(response) => Some(SessionAnswer {
+                text: response.text.clone(),
+                tool_calls: response.tool_calls.clone(),
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// 新会话标记写入回复正文最前面。
+    fn prepend_marker(text: &str, marker: &str) -> String {
+        if text.starts_with(marker) {
+            text.to_string()
+        } else if text.is_empty() {
+            marker.to_string()
+        } else {
+            format!("{marker}\n\n{text}")
+        }
+    }
+
+    /// 流式输出前先送出标记增量，客户端随后会把它作为助手内容放回历史。
+    fn marker_frame(marker: &str) -> String {
+        json!({ DeltaChunk::RESPONSE: format!("{marker}\n\n") }).to_string()
     }
 
     /// 按请求参数与调用方 token 选择模型。
@@ -170,29 +276,104 @@ impl ChatRouter {
     }
 
     /// 非流式对话：先路由（选模型 + 校验），再按模型分派给对应供应商。
-    pub async fn chat_completions(&self, request: InferRequest) -> Result<ModelResponse> {
-        let decision = self.route(&Self::route_request(&request))?;
-        info!(
-            "路由: model={} channel={} provider={}",
-            decision.model, decision.channel, decision.provider
+    pub async fn chat_completions(
+        &self,
+        request: InferRequest,
+        meta: RequestMeta,
+    ) -> Result<ModelResponse> {
+        let title_request = crate::request_record::detect_title_request(
+            &request.messages,
+            request.tools.as_ref(),
         );
-        self.registry.chat_completions(request).await
+        let session_plan = if title_request {
+            None
+        } else {
+            self.begin_session_plan(&request).await
+        };
+        let marker = session_plan.as_ref().and_then(|plan| plan.marker.clone());
+        let pending = self.begin_record(&request, &meta);
+        let request_id = pending
+            .as_ref()
+            .map(|(_, draft)| draft.id.as_str())
+            .unwrap_or("-");
+        let routed = self.route(&Self::route_request(&request));
+        let mut result = match routed {
+            Ok(decision) => {
+                info!(
+                    "路由: request_id={} model={} channel={} provider={}",
+                    request_id, decision.model, decision.channel, decision.provider
+                );
+                self.registry.chat_completions(request).await
+            }
+            Err(error) => Err(error),
+        };
+        if let (Some(marker), Ok(response)) = (marker.as_deref(), &mut result) {
+            response.text = Self::prepend_marker(&response.text, marker);
+        }
+        let answer = Self::session_answer(&result);
+        Self::finish_record(
+            pending,
+            self.local_sessions.clone(),
+            session_plan,
+            answer,
+            &result,
+        )
+        .await;
+        result
     }
 
     /// 流式对话：先路由（选模型 + 校验），再按模型分派，增量经 `on_chunk` 实时送出。
     pub async fn chat_completions_stream(
         &self,
         request: InferRequest,
+        meta: RequestMeta,
         on_chunk: Box<dyn FnMut(String) + Send + Sync>,
     ) -> Result<ModelResponse> {
-        let decision = self.route(&Self::route_request(&request))?;
-        info!(
-            "路由(流式): model={} channel={} provider={}",
-            decision.model, decision.channel, decision.provider
+        let title_request = crate::request_record::detect_title_request(
+            &request.messages,
+            request.tools.as_ref(),
         );
-        self.registry
-            .chat_completions_stream(request, on_chunk)
-            .await
+        let session_plan = if title_request {
+            None
+        } else {
+            self.begin_session_plan(&request).await
+        };
+        let marker = session_plan.as_ref().and_then(|plan| plan.marker.clone());
+        let pending = self.begin_record(&request, &meta);
+        let request_id = pending
+            .as_ref()
+            .map(|(_, draft)| draft.id.as_str())
+            .unwrap_or("-");
+        let routed = self.route(&Self::route_request(&request));
+        let mut on_chunk = on_chunk;
+        let mut result = match routed {
+            Ok(decision) => {
+                info!(
+                    "路由(流式): request_id={} model={} channel={} provider={}",
+                    request_id, decision.model, decision.channel, decision.provider
+                );
+                if let Some(marker) = marker.as_deref() {
+                    on_chunk(Self::marker_frame(marker));
+                }
+                self.registry
+                    .chat_completions_stream(request, on_chunk)
+                    .await
+            }
+            Err(error) => Err(error),
+        };
+        if let (Some(marker), Ok(response)) = (marker.as_deref(), &mut result) {
+            response.text = Self::prepend_marker(&response.text, marker);
+        }
+        let answer = Self::session_answer(&result);
+        Self::finish_record(
+            pending,
+            self.local_sessions.clone(),
+            session_plan,
+            answer,
+            &result,
+        )
+        .await;
+        result
     }
 }
 
@@ -205,6 +386,8 @@ mod tests {
     use crate::models::model::Model;
     use crate::models::PluginModel;
     use crate::providers::provider_control::ProviderControl;
+    use crate::request_record::RequestMeta;
+    use crate::local_session::LocalSessionStore;
     use anyhow::Result;
     use futures_util::future::BoxFuture;
     use serde_json::json;
@@ -389,5 +572,199 @@ mod tests {
         assert_eq!(ChatRouter::map_model("gpt-4o"), "chatgpt-web");
         assert_eq!(ChatRouter::map_model("deepseek-reasoner"), "deepseek-web");
         assert_eq!(ChatRouter::map_model("custom-model"), "custom-model");
+    }
+
+    /// 注入记录库后，每次对话请求都会落一条数据库记录（请求侧字段与回答状态都完整）。
+    #[tokio::test]
+    async fn records_each_chat_request_to_database() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-chat-router-record-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            crate::request_record::RequestRecordStore::new(db)
+                .await
+                .expect("同步请求记录表失败"),
+        );
+        let control = Arc::new(ProviderControl::new(std::collections::HashMap::new()));
+        let model = Arc::new(MockModel { tools: true }) as Arc<dyn PluginModel>;
+        let router = ChatRouter::new(vec![model], control).with_request_records(store.clone());
+
+        let mut request = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "system", "content": "系统提示" }),
+                json!({ "role": "user", "content": "用户提问" }),
+            ],
+        );
+        request.api_key = Some("sk-test".to_string());
+        let meta = RequestMeta {
+            protocol: "openai".to_string(),
+            method: "POST".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            headers: json!({ "authorization": "Bearer sk-test" }),
+        };
+        router
+            .chat_completions(request, meta)
+            .await
+            .expect("请求应完成");
+
+        // 记录写入是异步的（不阻塞响应），这里等它落库。
+        let mut records = Vec::new();
+        for _ in 0..100 {
+            records = store.list(10).await.expect("读取请求记录失败");
+            if !records.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(records.len(), 1, "每次请求应恰好一条记录");
+        let detail = store
+            .get(&records[0].id)
+            .await
+            .expect("读取详情失败")
+            .expect("记录应存在");
+        assert_eq!(detail.system_prompt, "系统提示");
+        assert_eq!(detail.user_prompt, "用户提问");
+        assert_eq!(detail.status, "success");
+        assert_eq!(detail.protocol, "openai");
+        assert_eq!(detail.endpoint, "/v1/chat/completions");
+        assert_eq!(detail.api_key, "sk-test");
+        assert!(detail.headers.contains("authorization"));
+        assert!(detail.duration_ms >= 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 新请求的回复应带会话标记；带标记的后续请求归入同一本地会话。
+    #[tokio::test]
+    async fn marks_new_session_and_reuses_it_on_follow_up() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-chat-router-session-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let sessions = Arc::new(
+            LocalSessionStore::new(db)
+                .await
+                .expect("同步本地会话表失败"),
+        );
+        let control = Arc::new(ProviderControl::new(std::collections::HashMap::new()));
+        let model = Arc::new(MockModel { tools: true }) as Arc<dyn PluginModel>;
+        let router = ChatRouter::new(vec![model], control).with_local_sessions(sessions.clone());
+        let meta = RequestMeta {
+            protocol: "openai".to_string(),
+            method: "POST".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            headers: json!({ "authorization": "Bearer sk-test" }),
+        };
+
+        let mut first = InferRequest::new(
+            "deepseek-web",
+            vec![json!({ "role": "user", "content": "第一问" })],
+        );
+        first.api_key = Some("sk-test".to_string());
+        let first_result = router
+            .chat_completions(first, meta.clone())
+            .await
+            .expect("首次请求应完成");
+        assert!(
+            first_result.text.starts_with(crate::local_session::MARKER_PREFIX),
+            "新会话回复应带标记：{}",
+            first_result.text
+        );
+
+        let mut stored = Vec::new();
+        for _ in 0..100 {
+            stored = sessions.list_sessions().await.expect("读取会话失败");
+            if !stored.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(stored.len(), 1);
+        let marker = stored[0].collision_marker.clone().expect("会话应带标记");
+        assert!(first_result.text.contains(&marker));
+
+        let mut second = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "user", "content": "第一问" }),
+                json!({ "role": "assistant", "content": first_result.text }),
+                json!({ "role": "user", "content": "第二问" }),
+            ],
+        );
+        second.api_key = Some("sk-test".to_string());
+        router
+            .chat_completions(second, meta)
+            .await
+            .expect("后续请求应完成");
+        let stored = sessions.list_sessions().await.expect("读取会话失败");
+        assert_eq!(stored.len(), 1, "带标记的后续请求不应新建会话");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 客户端的自动标题请求不生成会话，也不在回复里写标记。
+    #[tokio::test]
+    async fn title_generation_request_does_not_create_session() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-chat-router-title-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let sessions = Arc::new(
+            LocalSessionStore::new(db)
+                .await
+                .expect("同步本地会话表失败"),
+        );
+        let control = Arc::new(ProviderControl::new(std::collections::HashMap::new()));
+        let model = Arc::new(MockModel { tools: true }) as Arc<dyn PluginModel>;
+        let router = ChatRouter::new(vec![model], control).with_local_sessions(sessions.clone());
+        let meta = RequestMeta {
+            protocol: "openai".to_string(),
+            method: "POST".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            headers: json!({}),
+        };
+
+        let mut request = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({
+                    "role": "system",
+                    "content": "Create a concise title for an AI coding-assistant session from the supplied human messages."
+                }),
+                json!({
+                    "role": "user",
+                    "content": "Generate the session title from this JSON array of human messages:\n[]"
+                }),
+            ],
+        );
+        request.api_key = Some("sk-test".to_string());
+        let result = router
+            .chat_completions(request, meta)
+            .await
+            .expect("标题请求应完成");
+        assert!(result.text.is_empty(), "标题请求不应注入会话标记：{}", result.text);
+        assert!(
+            sessions
+                .list_sessions()
+                .await
+                .expect("读取会话失败")
+                .is_empty(),
+            "标题请求不应创建本地会话"
+        );
+
+        let _ = std::fs::remove_file(path);
     }
 }

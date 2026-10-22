@@ -4,7 +4,9 @@
 //! 鉴权、健康检查、模型列表等横切关注点由本模块提供，CORS 与总装配见 [`crate::apis`]。
 //! 需要鉴权的路由用 [`require_api_key`] 做 `route_layer`，handler 再经 [`ApiKeyAuth`] 扩展取身份。
 
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use axum::{
     extract::{Request, State},
@@ -22,6 +24,7 @@ use crate::chat_router::ChatRouter;
 use crate::config::ServerConfig;
 use crate::extension::credentials::CredentialStore;
 use crate::extension::websocket::WebSocketBridge;
+use crate::request_record::RequestMeta;
 use crate::throttle::ChatFrequency;
 
 /// 入口层共享状态：各 API 格式的 handler 都从这里取依赖。
@@ -114,6 +117,36 @@ pub fn mask_key(key: &str) -> String {
     format!("{}…（{} 字符）", prefix, len)
 }
 
+/// 采集一次请求的 HTTP 元数据（协议 / 方法 / 路径 / 请求头），供本地请求管理落库。
+pub fn request_meta(protocol: &str, endpoint: &str, headers: &HeaderMap) -> RequestMeta {
+    RequestMeta {
+        protocol: protocol.to_string(),
+        method: "POST".to_string(),
+        endpoint: endpoint.to_string(),
+        headers: headers_json(headers),
+    }
+}
+
+/// 请求头 → JSON 对象：名称统一小写，重复头合并为逗号分隔。
+fn headers_json(headers: &HeaderMap) -> Value {
+    let mut grouped: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (name, value) in headers {
+        let text = value
+            .to_str()
+            .map(str::to_string)
+            .unwrap_or_else(|_| format!("<{} 字节二进制>", value.as_bytes().len()));
+        grouped
+            .entry(name.as_str().to_ascii_lowercase())
+            .or_default()
+            .push(text);
+    }
+    let map = grouped
+        .into_iter()
+        .map(|(name, values)| (name, Value::String(values.join(", "))))
+        .collect::<serde_json::Map<String, Value>>();
+    Value::Object(map)
+}
+
 /// 统一错误响应（OpenAI 风格 `error` 对象）。
 pub fn error_response(status: StatusCode, message: &str, kind: &str) -> axum::response::Response {
     (
@@ -193,15 +226,28 @@ pub fn normalize_messages(messages: Vec<Value>) -> Vec<Value> {
         .collect()
 }
 
+/// HTTP 服务端启动时刻：健康检查据此返回真实运行时长。
+static SERVER_STARTED: OnceLock<Instant> = OnceLock::new();
+
+/// 标记服务端已启动（进程内只生效一次）。
+pub fn mark_started() {
+    SERVER_STARTED.get_or_init(Instant::now);
+}
+
+/// 服务端已运行秒数。
+pub fn uptime_seconds() -> u64 {
+    SERVER_STARTED
+        .get_or_init(Instant::now)
+        .elapsed()
+        .as_secs()
+}
+
 /// 健康检查：进程状态、插件连接、凭证摘要与已实现格式。
 pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let connected = state.bridge.connected.read().await;
     AxumJson(serde_json::json!({
         "status": "ok",
-        "uptime": std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        "uptime": uptime_seconds(),
         "extension_connected": *connected,
         "config": serde_json::json!({
             "host": state.config.host,
@@ -255,7 +301,21 @@ pub fn routes() -> Router<Arc<AppState>> {
 
 #[cfg(test)]
 mod tests {
-    use super::mask_key;
+    use super::{headers_json, mask_key};
+    use axum::http::{HeaderMap, HeaderValue};
+
+    /// 请求头按小写名称落成 JSON，重复头合并。
+    #[test]
+    fn headers_are_captured_as_json() {
+        let mut headers = HeaderMap::new();
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+        headers.append("x-test", HeaderValue::from_static("a"));
+        headers.append("x-test", HeaderValue::from_static("b"));
+
+        let value = headers_json(&headers);
+        assert_eq!(value["content-type"], "application/json");
+        assert_eq!(value["x-test"], "a, b");
+    }
 
     /// 短值（明显不是网关发放的 Key）原样显示并标注长度；长值只露前缀。
     #[test]

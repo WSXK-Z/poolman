@@ -3,7 +3,6 @@
 import { h, onMounted, ref } from "vue";
 import {
   NButton,
-  NCard,
   NDataTable,
   NInput,
   NModal,
@@ -40,7 +39,12 @@ function formatTime(ms: number): string {
 }
 
 const columns: DataTableColumns<ApiKey> = [
-  { title: "Key", key: "key", ellipsis: { tooltip: true } },
+  {
+    title: "Key",
+    key: "key",
+    ellipsis: { tooltip: true },
+    render: (row) => h("span", { class: "mono" }, row.key),
+  },
   {
     title: "平台",
     key: "platform",
@@ -51,21 +55,23 @@ const columns: DataTableColumns<ApiKey> = [
     title: "创建时间",
     key: "created_at",
     width: 180,
-    render: (row) => formatTime(row.created_at),
+    align: "right",
+    render: (row) => h("span", { class: "mono" }, formatTime(row.created_at)),
   },
   {
     title: "操作",
     key: "actions",
-    width: 170,
+    width: 180,
     render: (row) =>
-      h(NSpace, {}, {
+      h(NSpace, { size: 8 }, {
         default: () => [
           h(NButton, { size: "small", onClick: () => copyKey(row.key) }, { default: () => "复制" }),
           h(
             NPopconfirm,
             { onPositiveClick: () => revokeKey(row.key) },
             {
-              trigger: () => h(NButton, { size: "small", type: "error" }, { default: () => "吊销" }),
+              trigger: () =>
+                h(NButton, { size: "small", type: "error", quaternary: true }, { default: () => "吊销" }),
               default: () => "确定吊销该 API Key 吗？",
             },
           ),
@@ -122,28 +128,34 @@ onMounted(loadKeys);
 </script>
 
 <template>
-  <n-card title="API Key 管理">
-    <!-- 上部操作 bar -->
-    <n-space align="center" style="margin-bottom: 12px">
-      <n-select v-model:value="platform" :options="platformOptions" style="width: 220px" />
-      <n-button type="primary" :loading="loading" @click="createKey">创建 API Key</n-button>
-    </n-space>
+  <div>
+    <header class="page-header">
+      <div>
+        <p class="page-kicker">01 / Access</p>
+        <h1 class="page-title">API Key</h1>
+      </div>
+      <div class="toolbar">
+        <n-select v-model:value="platform" :options="platformOptions" style="width: 220px" />
+        <n-button type="primary" :loading="loading" @click="createKey">创建 API Key</n-button>
+      </div>
+    </header>
 
-    <!-- 下部表格 -->
-    <n-data-table
-      :columns="columns"
-      :data="apiKeys"
-      :loading="loading"
-      :pagination="{ pageSize: 10 }"
-      :bordered="false"
-    />
-  </n-card>
+    <section class="panel">
+      <n-data-table
+        :columns="columns"
+        :data="apiKeys"
+        :loading="loading"
+        :pagination="{ pageSize: 10 }"
+        :bordered="false"
+        size="small"
+      />
+    </section>
 
-  <!-- 创建成功弹窗 -->
-  <n-modal v-model:show="showCreated" preset="card" title="新 Key 已创建（请立即复制保存）" style="width: 560px">
-    <n-space vertical>
-      <n-input :value="createdKey?.key ?? ''" readonly />
-      <n-button type="primary" @click="createdKey && copyKey(createdKey.key)">复制</n-button>
-    </n-space>
-  </n-modal>
+    <n-modal v-model:show="showCreated" preset="card" title="新 API Key" style="width: 560px">
+      <n-space vertical :size="12">
+        <n-input :value="createdKey?.key ?? ''" readonly />
+        <n-button type="primary" @click="createdKey && copyKey(createdKey.key)">复制</n-button>
+      </n-space>
+    </n-modal>
+  </div>
 </template>

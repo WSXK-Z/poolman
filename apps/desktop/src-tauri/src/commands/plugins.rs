@@ -11,6 +11,7 @@ use crate::handlers::{command_set, CommandSet};
 pub(super) fn handler() -> CommandSet<tauri::Wry> {
     command_set![
         plugin_extension_dir,
+        open_extension_dir,
         open_extensions_page,
         list_plugins,
         set_plugin_enabled,
@@ -113,13 +114,36 @@ pub fn plugin_extension_dir(app: tauri::AppHandle) -> Result<String, String> {
     }
     for p in &candidates {
         if std::path::Path::new(p).is_dir() {
-            return Ok(p.clone());
+            return Ok(normalize_extension_path(p));
         }
     }
     Err(format!(
         "未找到插件构建目录，请先构建扩展。已检查: {}",
         candidates.join(" | ")
     ))
+}
+
+/// 打开插件构建目录（由桌面端直接调用，避免前端 opener 对 `\\?\` 路径的 scope 限制）。
+#[tauri::command]
+pub fn open_extension_dir(app: tauri::AppHandle) -> Result<(), String> {
+    let dir = plugin_extension_dir(app)?;
+    tauri_plugin_opener::open_path(&dir, None::<&str>)
+        .map_err(|error| format!("打开插件目录失败：{error}"))
+}
+
+/// Windows 资源目录可能带 `\\?\` 扩展前缀，前端展示与系统打开都换成普通路径；
+/// UNC 路径单独还原成 `\\server\share`。
+fn normalize_extension_path(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+    }
+    path.to_string()
 }
 
 #[tauri::command]
@@ -183,4 +207,30 @@ pub async fn control_plugin_provider(
         .send_provider_control(&plugin_id, &provider, &action)
         .await
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_extension_path;
+
+    /// Windows 资源目录的 `\\?\` 前缀会阻碍系统打开，返回前必须还原为普通路径；
+    /// UNC 扩展路径要还原成 `\\server\share` 形式。
+    #[test]
+    fn normalizes_extended_windows_paths() {
+        assert_eq!(
+            normalize_extension_path(r"D:\projects\app\chrome-mv3"),
+            r"D:\projects\app\chrome-mv3"
+        );
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                normalize_extension_path(r"\\?\D:\projects\app\chrome-mv3"),
+                r"D:\projects\app\chrome-mv3"
+            );
+            assert_eq!(
+                normalize_extension_path(r"\\?\UNC\server\share\chrome-mv3"),
+                r"\\server\share\chrome-mv3"
+            );
+        }
+    }
 }

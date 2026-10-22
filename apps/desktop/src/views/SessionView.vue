@@ -3,7 +3,6 @@
 import { computed, h, onMounted, ref } from "vue";
 import {
   NButton,
-  NCard,
   NDataTable,
   NDescriptions,
   NDescriptionsItem,
@@ -89,8 +88,10 @@ const columns: DataTableColumns<SessionInfo> = [
   {
     title: "原始/转换",
     key: "counts",
-    width: 100,
-    render: (row) => `${row.raw_count}/${row.converted_count}`,
+    width: 110,
+    align: "right",
+    render: (row) =>
+      h("span", { class: "mono" }, `${row.raw_count} / ${row.converted_count}`),
   },
   {
     title: "操作",
@@ -134,13 +135,14 @@ const convColumns: DataTableColumns<ConversationItem> = [
     render: (row) =>
       row.converted_content
         ? h("span", {}, row.converted_content)
-        : h("span", { style: "color:#999" }, "—"),
+        : h("span", { style: "color: var(--muted)" }, "—"),
   },
   {
     title: "创建时间",
     key: "created_at",
     width: 170,
-    render: (row) => formatTime(row.created_at),
+    align: "right",
+    render: (row) => h("span", { class: "mono" }, formatTime(row.created_at)),
   },
 ];
 
@@ -195,54 +197,63 @@ onMounted(() => {
 </script>
 
 <template>
-  <n-card title="会话管理">
-    <!-- 上部操作 bar -->
-    <n-space align="center" style="margin-bottom: 12px">
-      <n-select
-        v-model:value="selectedKey"
-        :options="keyOptions"
-        placeholder="选择 API Key（留空 = 全部）"
-        clearable
-        style="width: 340px"
-        @update:value="loadSessions"
-      />
-      <n-button :loading="loading" @click="loadSessions">刷新</n-button>
-    </n-space>
-
-    <!-- 下部表格 -->
-    <n-data-table
-      :columns="columns"
-      :data="sessions"
-      :loading="loading"
-      :pagination="{ pageSize: 10 }"
-      :bordered="false"
-    />
-  </n-card>
-
-  <!-- 详情弹窗：合并对话列表，每条消息同时展示原始内容与转换后内容 -->
-  <n-modal
-    v-model:show="showDetail"
-    preset="card"
-    :title="detail ? `会话详情 - ${detail.title}` : '会话详情'"
-    style="width: 960px"
-  >
-    <n-space v-if="detail" vertical>
-      <n-descriptions :columns="2" size="small" label-placement="left">
-        <n-descriptions-item label="自身 id">{{ detail.id }}</n-descriptions-item>
-        <n-descriptions-item label="平台 id">{{ detail.web_session_id }}</n-descriptions-item>
-        <n-descriptions-item label="网页平台">{{ detail.platform }}</n-descriptions-item>
-        <n-descriptions-item label="API Key">{{ detail.api_key }}</n-descriptions-item>
-      </n-descriptions>
-
-      <n-card size="small" title="历史对话">
-        <n-data-table
-          :columns="convColumns"
-          :data="detail.conversation"
-          size="small"
-          :max-height="480"
-          :scroll-x="1200"
+  <div>
+    <header class="page-header">
+      <div>
+        <p class="page-kicker">02 / Sessions</p>
+        <h1 class="page-title">会话</h1>
+      </div>
+      <div class="toolbar">
+        <n-select
+          v-model:value="selectedKey"
+          :options="keyOptions"
+          placeholder="全部 API Key"
+          clearable
+          style="width: 300px"
+          @update:value="loadSessions"
         />
-      </n-card>
-    </n-space>
-  </n-modal>
+        <n-button :loading="loading" @click="loadSessions">刷新</n-button>
+      </div>
+    </header>
+
+    <section class="panel">
+      <n-data-table
+        :columns="columns"
+        :data="sessions"
+        :loading="loading"
+        :pagination="{ pageSize: 10 }"
+        :bordered="false"
+        size="small"
+      />
+    </section>
+
+    <n-modal
+      v-model:show="showDetail"
+      preset="card"
+      :title="detail ? detail.title : '会话详情'"
+      style="width: 960px"
+    >
+      <n-space v-if="detail" vertical :size="16">
+        <n-descriptions :columns="2" size="small" label-placement="left" bordered>
+          <n-descriptions-item label="自身 id">{{ detail.id }}</n-descriptions-item>
+          <n-descriptions-item label="平台 id">{{ detail.web_session_id }}</n-descriptions-item>
+          <n-descriptions-item label="网页平台">{{ detail.platform }}</n-descriptions-item>
+          <n-descriptions-item label="API Key">{{ detail.api_key }}</n-descriptions-item>
+        </n-descriptions>
+
+        <div class="panel">
+          <div class="panel-head">
+            <h2 class="panel-title">历史对话</h2>
+          </div>
+          <n-data-table
+            :columns="convColumns"
+            :data="detail.conversation"
+            size="small"
+            :max-height="480"
+            :scroll-x="1200"
+          />
+        </div>
+      </n-space>
+    </n-modal>
+  </div>
 </template>

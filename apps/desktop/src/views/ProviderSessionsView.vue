@@ -2,7 +2,7 @@
 // 展示指定网页供应商的远端会话，并将删除操作委托给对应的桌面适配器。
 import { onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { NAlert, NButton, NCard, NEmpty, NPopconfirm, NScrollbar, useMessage } from "naive-ui";
+import { NAlert, NButton, NEmpty, NPopconfirm, NScrollbar, useMessage } from "naive-ui";
 
 const props = defineProps<{ providerId: string; providerName: string }>();
 const emit = defineEmits<{ back: [] }>();
@@ -68,22 +68,39 @@ onMounted(() => void loadSessions());
 
 <template>
   <div>
-    <div class="header">
-      <n-button quaternary @click="emit('back')">返回供应商</n-button>
-      <h2>{{ providerName }}会话管理</h2>
-      <n-button :loading="loading" @click="loadSessions">刷新</n-button>
-    </div>
+    <header class="page-header">
+      <div>
+        <p class="page-kicker">05.1 / Sessions</p>
+        <h1 class="page-title">{{ providerName }}</h1>
+      </div>
+      <div class="toolbar">
+        <n-button quaternary @click="emit('back')">返回插件</n-button>
+        <n-button :loading="loading" @click="loadSessions">刷新</n-button>
+      </div>
+    </header>
+
     <n-alert v-if="error" type="error" style="margin-bottom: 12px">{{ error }}</n-alert>
-    <div class="layout">
-      <n-card class="sidebar" size="small" title="会话列表">
+
+    <div class="session-layout">
+      <section class="panel session-sidebar">
+        <div class="panel-head">
+          <h2 class="panel-title">会话列表</h2>
+          <span class="mono muted">{{ sessions.length }}</span>
+        </div>
         <n-empty v-if="sessions.length === 0 && !loading" description="暂无会话记录" />
-        <n-scrollbar v-else style="max-height: calc(100vh - 190px)">
+        <n-scrollbar v-else style="max-height: calc(100vh - 260px)">
           <div class="session-list">
-            <div v-for="session in sessions" :key="session.id"
-              class="session-item" :class="{ selected: selected?.id === session.id }">
+            <div
+              v-for="session in sessions"
+              :key="session.id"
+              class="session-item"
+              :class="{ selected: selected?.id === session.id }"
+            >
               <button class="session-select" @click="selectSession(session)">
                 <strong>{{ session.title || "未命名会话" }}</strong>
-                <small>{{ session.updated_at ? new Date(session.updated_at).toLocaleString() : "时间未知" }}</small>
+                <small class="mono">
+                  {{ session.updated_at ? new Date(session.updated_at).toLocaleString() : "时间未知" }}
+                </small>
               </button>
               <n-popconfirm @positive-click="deleteSession(session.id)">
                 <template #trigger>
@@ -94,28 +111,100 @@ onMounted(() => void loadSessions());
             </div>
           </div>
         </n-scrollbar>
-      </n-card>
-      <n-card class="conversation" size="small" :title="selected?.title || '会话详情'">
-        <n-empty v-if="!selected" description="从左侧选择一个会话查看网页端会话信息" />
-        <template v-else>
-          <n-alert type="info">显示并管理 {{ providerName }} 网页端会话。选择左侧会话可查看会话元数据。</n-alert>
-          <pre class="session-data">{{ JSON.stringify(selected, null, 2) }}</pre>
-        </template>
-      </n-card>
+      </section>
+
+      <section class="panel session-detail">
+        <div class="panel-head">
+          <h2 class="panel-title">{{ selected?.title || "会话详情" }}</h2>
+        </div>
+        <n-empty v-if="!selected" description="从左侧选择一个会话" />
+        <pre v-else class="session-data">{{ JSON.stringify(selected, null, 2) }}</pre>
+      </section>
     </div>
   </div>
 </template>
 
 <style scoped>
-.header { display: flex; align-items: center; gap: 12px; margin-bottom: 16px; }
-.header h2 { flex: 1; margin: 0; }
-.layout { display: grid; grid-template-columns: minmax(260px, 340px) minmax(0, 1fr); gap: 12px; }
-.sidebar, .conversation { min-height: calc(100vh - 140px); }
-.session-list { display: grid; gap: 6px; }
-.session-item { display: flex; align-items: center; gap: 4px; padding: 7px; border-radius: 5px; }
-.session-item.selected { background: rgba(24, 160, 88, .12); }
-.session-select { min-width: 0; flex: 1; border: 0; background: transparent; color: inherit; text-align: left; cursor: pointer; }
-.session-select strong, .session-select small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-select small, .session-data { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
-@media (max-width: 800px) { .layout { grid-template-columns: 1fr; } .sidebar, .conversation { min-height: 240px; } }
+.session-layout {
+  display: grid;
+  grid-template-columns: minmax(260px, 340px) minmax(0, 1fr);
+  gap: var(--space-4);
+}
+
+.session-sidebar,
+.session-detail {
+  min-height: calc(100vh - 220px);
+}
+
+.session-list {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.session-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-2);
+  border-radius: var(--radius-md);
+}
+
+.session-item:hover {
+  background: var(--surface-2);
+}
+
+.session-item.selected {
+  background: var(--accent-soft);
+}
+
+.session-select {
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.session-select strong,
+.session-select small {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.session-select strong {
+  color: var(--fg);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.session-select small {
+  color: var(--muted);
+  font-size: var(--text-2xs);
+}
+
+.session-data {
+  margin: 0;
+  color: var(--fg-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 800px) {
+  .session-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .session-sidebar,
+  .session-detail {
+    min-height: 240px;
+  }
+}
 </style>

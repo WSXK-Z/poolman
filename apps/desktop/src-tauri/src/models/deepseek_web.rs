@@ -35,7 +35,7 @@ pub const CHANNEL: &str = "deepseek-web";
 
 /// 拼装提示词时置顶的前缀：网页会话本身带着历史对话，要求模型只依据本次内容作答。
 pub(crate) const PROMPT_PREFIX: &str =
-    "不需要考虑之前的内容，输出中文思考和正文，你只需要根据以下内容回答问题：";
+    "不需要考虑之前的内容，你只需要根据以下内容回答问题：";
 
 /// 系统提示词段标题：正文取自全部 system 消息。
 pub(crate) const SYSTEM_HEADING: &str = "以下是【系统提示词】：";

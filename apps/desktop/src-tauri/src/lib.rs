@@ -13,9 +13,11 @@ mod converters;
 mod entitys;
 mod extension;
 mod handlers;
+mod local_session;
 mod models;
 mod prompts;
 mod providers;
+mod request_record;
 mod session;
 mod stream_processor;
 mod throttle;
@@ -40,6 +42,8 @@ use extension::websocket::WebSocketBridge;
 use models::{DeepSeekWebModel, PluginModel, SessionPoolStore, YuanbaoWebModel};
 use providers::provider_control::{read_enablement_file, ProviderControl};
 use providers::{seed, ProviderManager};
+use local_session::LocalSessionStore;
+use request_record::RequestRecordStore;
 use session::manager::SessionManager;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -118,6 +122,7 @@ async fn start_server(
     chat_router: Arc<ChatRouter>,
     chat_frequency: Arc<ChatFrequency>,
 ) -> anyhow::Result<()> {
+    crate::apis::base::mark_started();
     init_logging();
     info!("正在启动 Rust AI 网关服务端（Tauri 集成）...");
 
@@ -348,6 +353,18 @@ pub fn run() {
             .block_on(ProviderManager::new(api_keys.db()))
             .expect("初始化供应商/模型表失败"),
     );
+    // 本地请求记录：每一次对话请求的输入与回答都落这张表
+    let request_records = Arc::new(
+        init_rt
+            .block_on(RequestRecordStore::new(api_keys.db()))
+            .expect("初始化请求记录表失败"),
+    );
+    // 本地会话管理：请求列表按系统提示词 + 第一条用户提问归并
+    let local_sessions = Arc::new(
+        init_rt
+            .block_on(LocalSessionStore::new(api_keys.db()))
+            .expect("初始化本地会话表失败"),
+    );
     // 启动装配：幂等补齐插件供应商与其网页模型
     let seeded = init_rt
         .block_on(seed::ensure_plugin_provider(&provider_manager))
@@ -399,7 +416,11 @@ pub fn run() {
     info!("已实例化渠道模型 {} 个", plugin_models.len());
     // 后台预热会话池（按渠道并发设置预建网页会话）：插件尚未连上时重试，请求进来也会兜底
     spawn_session_warmup(plugin_models.clone());
-    let chat_router = Arc::new(ChatRouter::new(plugin_models, provider_control.clone()));
+    let chat_router = Arc::new(
+        ChatRouter::new(plugin_models, provider_control.clone())
+            .with_request_records(request_records.clone())
+            .with_local_sessions(local_sessions.clone()),
+    );
 
     let api_keys_server = api_keys.clone();
     let credentials_server = credentials.clone();
@@ -427,6 +448,8 @@ pub fn run() {
         .manage(sessions)
         .manage(provider_control)
         .manage(provider_manager)
+        .manage(request_records)
+        .manage(local_sessions)
         .manage(extensions)
         .manage(bridge)
         .manage(chat_router)

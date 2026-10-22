@@ -3,9 +3,7 @@
 import { onMounted, ref } from "vue";
 import { invoke } from "@tauri-apps/api/core";
 import {
-  NAlert,
   NButton,
-  NCard,
   NForm,
   NFormItem,
   NInput,
@@ -24,7 +22,6 @@ const config = ref({
   ws_port: 3001,
   request_timeout_ms: 120000,
 });
-const loaded = ref(false);
 
 /** 对话请求频率：界面按秒输入，服务端按毫秒保存。 */
 const chatIntervalSeconds = ref<number | null>(1);
@@ -49,7 +46,6 @@ async function load() {
         ws_port: data.config.ws_port ?? config.value.ws_port,
         request_timeout_ms: data.config.request_timeout_ms ?? config.value.request_timeout_ms,
       };
-      loaded.value = true;
       if (typeof data.config.chat_interval_ms === "number") {
         chatIntervalSeconds.value = data.config.chat_interval_ms / 1000;
       }
@@ -104,8 +100,18 @@ onMounted(load);
 </script>
 
 <template>
-  <div class="settings">
-    <n-card title="连接配置">
+  <div class="settings panel-stack">
+    <header class="page-header">
+      <div>
+        <p class="page-kicker">07 / Config</p>
+        <h1 class="page-title">配置</h1>
+      </div>
+    </header>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">连接</h2>
+      </div>
       <n-form label-placement="left" label-width="130">
         <n-form-item label="网关服务地址">
           <n-input v-model:value="baseUrl" placeholder="http://127.0.0.1:13213" />
@@ -126,12 +132,12 @@ onMounted(load);
           <n-button type="primary" @click="save">保存</n-button>
         </n-form-item>
       </n-form>
-      <n-alert v-if="loaded" type="info" :show-icon="true" style="margin-top: 8px">
-        当前显示的是服务端实际运行的连接配置。修改后保存到本地,需重启应用生效。
-      </n-alert>
-    </n-card>
+    </section>
 
-    <n-card title="对话请求频率" style="margin-top: 16px">
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">对话请求频率</h2>
+      </div>
       <n-form label-placement="left" label-width="130">
         <n-form-item label="请求间隔">
           <div class="interval">
@@ -152,27 +158,23 @@ onMounted(load);
           </n-button>
         </n-form-item>
       </n-form>
-      <n-alert type="info" :show-icon="true" style="margin-top: 8px">
-        每个网页渠道每 x 秒最多发起一次对话请求，避免网页端因请求过快而报错；0 表示不限制。
-        修改后立即生效并保存到数据目录，无需重启。
-      </n-alert>
-    </n-card>
+    </section>
   </div>
 </template>
 
 <style scoped>
 .settings {
-  max-width: 560px;
+  max-width: 640px;
 }
 
 .interval {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .unit {
-  color: #888;
-  font-size: 12px;
+  color: var(--muted);
+  font-size: var(--text-xs);
 }
 </style>

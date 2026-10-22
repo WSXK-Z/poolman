@@ -18,8 +18,9 @@ use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
 
-use crate::apis::base::{error_response, parse_delta, ApiKeyAuth, AppState};
+use crate::apis::base::{error_response, parse_delta, request_meta, ApiKeyAuth, AppState};
 use crate::providers::InferRequest;
+use crate::request_record::RequestMeta;
 
 #[derive(Debug, Deserialize)]
 pub struct ResponsesRequest {
@@ -44,6 +45,7 @@ pub struct ResponsesRequest {
 pub async fn responses_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<ApiKeyAuth>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ResponsesRequest>,
 ) -> impl IntoResponse {
     let messages = input_to_messages(&req.input, req.instructions.as_deref());
@@ -52,6 +54,7 @@ pub async fn responses_handler(
     }
 
     let model = req.model.clone();
+    let meta = request_meta("openai", "/v1/responses", &headers);
     let request = InferRequest {
         model: model.clone(),
         messages,
@@ -66,10 +69,10 @@ pub async fn responses_handler(
     };
 
     if req.stream {
-        return sse_response(state, request, model);
+        return sse_response(state, request, meta, model);
     }
 
-    match state.chat_router.chat_completions(request).await {
+    match state.chat_router.chat_completions(request, meta).await {
         Ok(result) => {
             let response = response_object(&model, &result.text, result.usage.as_ref());
             (StatusCode::OK, AxumJson(response)).into_response()
@@ -123,7 +126,12 @@ fn usage_object(usage: Option<&Value>, text: &str) -> Value {
 }
 
 /// 流式响应接口：输出命名事件。
-fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> axum::response::Response {
+fn sse_response(
+    state: Arc<AppState>,
+    request: InferRequest,
+    meta: RequestMeta,
+    model: String,
+) -> axum::response::Response {
     // 用量口径：网页渠道不回传本轮用量，用官方分词器按本轮实际发送的 prompt
     // 计数（含每条消息的角色标记开销），与上游分词结果一致。
     let prompt_tokens = u64::from(crate::tokenizer::count_messages(
@@ -141,6 +149,7 @@ fn sse_response(state: Arc<AppState>, request: InferRequest, model: String) -> a
             let result = router
                 .chat_completions_stream(
                     request,
+                    meta,
                     Box::new(move |delta: String| {
                         let _ = chunk_tx.send(Ok(delta));
                     }),

@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.2.12"
+version = "0.3.0"
 description = "poolman"
 authors = ["wushi"]
 edition = "2024"
@@ -30,7 +30,7 @@ thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
-uuid = { version = "1", features = ["v4", "v7", "serde"] }
+uuid = { version = "1", features = ["v4", "v5", "v7", "serde"] }
 chrono = "0.4"
 tokio-tungstenite = "0.21"
 tungstenite = "0.21"

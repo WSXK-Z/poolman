@@ -5,8 +5,10 @@
 //! 命令只做参数搬运与「先落库、后刷新运行期状态」的编排，业务实现都在各模块内。
 
 mod api_keys;
+mod local_sessions;
 mod plugins;
 mod providers;
+mod request_records;
 mod sessions;
 mod settings;
 
@@ -26,8 +28,10 @@ pub fn handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + 'static 
         command_set![greet],
         api_keys::handler(),
         sessions::handler(),
+        local_sessions::handler(),
         plugins::handler(),
         providers::handler(),
+        request_records::handler(),
         settings::handler(),
     ]
 }

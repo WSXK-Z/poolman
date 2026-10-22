@@ -18,8 +18,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{info, warn};
 
-use crate::apis::base::{error_response, normalize_messages, parse_delta, ApiKeyAuth, AppState};
+use crate::apis::base::{
+    error_response, normalize_messages, parse_delta, request_meta, ApiKeyAuth, AppState,
+};
 use crate::providers::InferRequest;
+use crate::request_record::RequestMeta;
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -149,6 +152,7 @@ pub async fn chat_completions_handler(
     );
 
     let model = req.model.clone();
+    let meta = request_meta("openai", "/v1/chat/completions", &headers);
     let request = InferRequest {
         model: model.clone(),
         messages: normalize_messages(req.messages.clone()),
@@ -168,19 +172,20 @@ pub async fn chat_completions_handler(
             .stream_options
             .as_ref()
             .is_some_and(|options| options.include_usage);
-        return sse_response(state, request, model, include_usage);
+        return sse_response(state, request, meta, model, include_usage);
     }
 
-    match state.chat_router.chat_completions(request).await {
+    match state.chat_router.chat_completions(request, meta).await {
         Ok(result) => {
             let tool_calls = result.tool_calls;
+            let content = if result.text.is_empty() {
+                None
+            } else {
+                Some(result.text)
+            };
             let message = Message {
                 role: "assistant".to_string(),
-                content: if tool_calls.is_some() {
-                    None
-                } else {
-                    Some(result.text)
-                },
+                content,
                 reasoning_content: result.reasoning.filter(|text| !text.is_empty()),
                 tool_calls: tool_calls.and_then(|tc| serde_json::from_value(tc).ok()),
             };
@@ -235,6 +240,7 @@ impl Drop for TaskGuard {
 fn sse_response(
     state: Arc<AppState>,
     request: InferRequest,
+    meta: RequestMeta,
     model: String,
     include_usage: bool,
 ) -> axum::response::Response {
@@ -273,6 +279,7 @@ fn sse_response(
                 let result = router
                     .chat_completions_stream(
                         request,
+                        meta,
                         Box::new(move |delta: String| {
                             let _ = chunk_tx.send(Ok(delta));
                         }),

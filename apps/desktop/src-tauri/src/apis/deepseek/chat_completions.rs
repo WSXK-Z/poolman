@@ -24,8 +24,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
-use crate::apis::base::{error_response, normalize_messages, parse_delta, ApiKeyAuth, AppState};
+use crate::apis::base::{
+    error_response, normalize_messages, parse_delta, request_meta, ApiKeyAuth, AppState,
+};
 use crate::providers::InferRequest;
+use crate::request_record::RequestMeta;
 
 /// 思考模式开关与强度。
 #[derive(Debug, Clone, Deserialize)]
@@ -192,6 +195,7 @@ fn usage_field(usage: Option<&Value>, key: &str) -> Option<u64> {
 pub async fn chat_completions_handler(
     State(state): State<Arc<AppState>>,
     Extension(auth): Extension<ApiKeyAuth>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<ChatRequest>,
 ) -> impl IntoResponse {
     if req.messages.is_empty() {
@@ -246,6 +250,7 @@ pub async fn chat_completions_handler(
     );
 
     let model = req.model.clone();
+    let meta = request_meta("deepseek", "/chat/completions", &headers);
     let max_tokens = req
         .max_tokens
         .unwrap_or_else(|| default_max_tokens(req.thinking.as_ref()))
@@ -275,6 +280,7 @@ pub async fn chat_completions_handler(
         return sse_response(
             state,
             request,
+            meta,
             model,
             include_usage,
             prompt_tokens,
@@ -282,7 +288,7 @@ pub async fn chat_completions_handler(
         );
     }
 
-    match state.chat_router.chat_completions(request).await {
+    match state.chat_router.chat_completions(request, meta).await {
         Ok(result) => {
             let completion_tokens = usage_field(result.usage.as_ref(), "completion_tokens")
                 .unwrap_or_else(|| u64::from(crate::tokenizer::count(&result.text)));
@@ -298,7 +304,7 @@ pub async fn chat_completions_handler(
             message.insert("role".to_string(), json!("assistant"));
             message.insert(
                 "content".to_string(),
-                if result.tool_calls.is_some() {
+                if result.text.is_empty() {
                     Value::Null
                 } else {
                     json!(result.text)
@@ -371,6 +377,7 @@ impl Drop for TaskGuard {
 fn sse_response(
     state: Arc<AppState>,
     request: InferRequest,
+    meta: RequestMeta,
     model: String,
     include_usage: bool,
     prompt_tokens: u64,
@@ -403,6 +410,7 @@ fn sse_response(
                 let result = router
                     .chat_completions_stream(
                         request,
+                        meta,
                         Box::new(move |delta: String| {
                             let _ = chunk_tx.send(Ok(delta));
                         }),
