@@ -20,6 +20,8 @@ use serde_json::{json, Map, Value};
 use crate::entitys::local_session::{ActiveModel, Column, Entity, Model};
 use crate::entitys::local_session_content;
 use crate::entitys::request_record;
+use crate::entitys::web_context_binding;
+use crate::models::defs::WebContextBinding;
 use crate::request_record::{is_title_generation_record, message_text};
 
 /// 回复中的会话标记前缀。
@@ -122,6 +124,7 @@ impl LocalSessionStore {
             .register(Entity)
             .register(local_session_content::Entity)
             .register(request_record::Entity)
+            .register(web_context_binding::Entity)
             .sync(&db)
             .await?;
         Ok(Self {
@@ -179,12 +182,36 @@ impl LocalSessionStore {
             .collect())
     }
 
+    /// 读取一组本地会话的远端网页会话绑定；删除会话前用它清理远端对话。
+    pub async fn bindings_for(&self, session_ids: &[String]) -> Result<Vec<WebContextBinding>> {
+        if session_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = web_context_binding::Entity::find()
+            .filter(web_context_binding::Column::ContextKey.is_in(session_ids.to_vec()))
+            .all(&self.db)
+            .await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| WebContextBinding {
+                channel: row.channel,
+                context_key: row.context_key,
+                remote_session_id: row.remote_session_id,
+                parent_message_id: row.parent_message_id,
+                primed: row.primed,
+                system_hash: row.system_hash,
+                tools_hash: row.tools_hash,
+                approx_tokens: row.approx_tokens,
+                summary: row.summary.unwrap_or_default(),
+            })
+            .collect())
+    }
+
     /// 列出某个会话的内容表（按写入顺序）。
     pub async fn list_session_contents(
         &self,
         session_id: &str,
-    ) -> Result<Vec<LocalSessionContentInfo>> {
-        let rows = local_session_content::Entity::find()
+    ) -> Result<Vec<LocalSessionContentInfo>> {        let rows = local_session_content::Entity::find()
             .filter(local_session_content::Column::SessionId.eq(session_id))
             .order_by_asc(local_session_content::Column::Id)
             .all(&self.db)
@@ -453,6 +480,10 @@ impl LocalSessionStore {
                 .filter(local_session_content::Column::SessionId.eq(id))
                 .exec(&self.db)
                 .await?;
+            web_context_binding::Entity::delete_many()
+                .filter(web_context_binding::Column::ContextKey.eq(id))
+                .exec(&self.db)
+                .await?;
             if result.rows_affected > 0 {
                 deleted += 1;
             }
@@ -586,6 +617,27 @@ impl LocalSessionStore {
             result.linked_requests += 1;
         }
         result.added_sessions = sessions.len() as u64;
+        let valid_ids = sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        // 标题/摘要专用会话不属于本地会话，不能被同步清理掉。
+        let auxiliary_ids = vec![
+            "__poolman_title__".to_string(),
+            "__poolman_summary__".to_string(),
+        ];
+        if valid_ids.is_empty() {
+            web_context_binding::Entity::delete_many()
+                .filter(web_context_binding::Column::ContextKey.is_not_in(auxiliary_ids))
+                .exec(&self.db)
+                .await?;
+        } else {
+            web_context_binding::Entity::delete_many()
+                .filter(web_context_binding::Column::ContextKey.is_not_in(valid_ids))
+                .filter(web_context_binding::Column::ContextKey.is_not_in(auxiliary_ids))
+                .exec(&self.db)
+                .await?;
+        }
         self.rebuild_all_contents().await?;
         Ok(result)
     }
@@ -1126,6 +1178,47 @@ mod tests {
         let sessions = store.list_sessions().await.expect("读取会话失败");
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].request_count, 2);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// 会话删除前能读到远端网页会话绑定。
+    #[tokio::test]
+    async fn bindings_for_reads_remote_conversation() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-local-session-binding-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = LocalSessionStore::new(db.clone())
+            .await
+            .expect("同步表结构失败");
+        let bindings = crate::models::web_context::DbWebContextStore::new(db)
+            .await
+            .expect("初始化绑定表失败");
+        use crate::models::defs::{WebContextBinding, WebContextStore};
+        let binding = WebContextBinding {
+            channel: "deepseek-web".to_string(),
+            context_key: "sess_test".to_string(),
+            remote_session_id: "remote_test".to_string(),
+            parent_message_id: Some(7),
+            primed: true,
+            system_hash: "s".to_string(),
+            tools_hash: "t".to_string(),
+            approx_tokens: 10,
+            summary: String::new(),
+        };
+        bindings.save(&binding).await.expect("保存绑定失败");
+        let rows = store
+            .bindings_for(&["sess_test".to_string()])
+            .await
+            .expect("读取绑定失败");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].channel, "deepseek-web");
+        assert_eq!(rows[0].remote_session_id, "remote_test");
 
         let _ = std::fs::remove_file(path);
     }

@@ -16,6 +16,7 @@ pub(super) fn handler() -> CommandSet<tauri::Wry> {
         list_providers,
         list_provider_sessions,
         delete_provider_session,
+        rename_provider_session,
     ]
 }
 
@@ -122,4 +123,22 @@ pub async fn delete_provider_session(
         .await
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// 修改网页渠道的远端会话标题。
+#[tauri::command]
+pub async fn rename_provider_session(
+    provider: String,
+    session_id: String,
+    title: String,
+    chat_router: tauri::State<'_, Arc<ChatRouter>>,
+) -> Result<(), String> {
+    let renamed = chat_router
+        .rename_remote_session(&provider, &session_id, &title)
+        .await
+        .map_err(|e| e.to_string())?;
+    if !renamed {
+        return Err(format!("{provider} 网页端未确认标题修改"));
+    }
+    Ok(())
 }

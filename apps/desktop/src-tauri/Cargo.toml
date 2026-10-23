@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.3.0"
+version = "0.4.0"
 description = "poolman"
 authors = ["wushi"]
 edition = "2024"
@@ -44,6 +44,15 @@ sea-orm = { version = "2.0.2", features = ["sqlx-sqlite", "runtime-tokio-rustls"
 # 官方分词器：网页渠道不回传本轮用量，用 deepseek_v4_tokenizer/tokenizer.json 精确计数。
 # 关掉默认的 onig 后端，改用纯 Rust 的 fancy-regex，免去额外 C 依赖。
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+# 本地标题模型推理：ONNX Runtime 绑定。模型不随安装包分发，构建期由 ort 拉取
+# 运行库；发布时需把 onnxruntime.dll 一并放进软件目录（copy-dylibs 会拷到 target）。
+ort = { version = "2.0.0-rc.15", default-features = false, features = [
+    "std",
+    "ndarray",
+    "download-binaries",
+    "copy-dylibs",
+    "tls-native",
+] }
 
 [dev-dependencies]
 # 单测用暂停时钟（`#[tokio::test(start_paused = true)]`）精确验证排队间隔

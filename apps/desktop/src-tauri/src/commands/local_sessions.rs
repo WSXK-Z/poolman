@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use crate::chat_router::ChatRouter;
 use crate::handlers::{command_set, CommandSet};
 use crate::local_session::{
     LocalSessionContentInfo, LocalSessionInfo, LocalSessionRequestInfo, LocalSessionStore,
@@ -58,13 +59,32 @@ pub async fn list_local_session_contents(
         .map_err(|e| e.to_string())
 }
 
-/// 删除一个或多个本地会话（关联请求保留，但不再参与会话归并）。
+/// 删除一个或多个本地会话：先删除对应的远端网页会话，再删本地绑定与数据。
 #[tauri::command]
 pub async fn delete_local_sessions(
-    state: tauri::State<'_, Arc<LocalSessionStore>>,
+    local_sessions: tauri::State<'_, Arc<LocalSessionStore>>,
+    chat_router: tauri::State<'_, Arc<ChatRouter>>,
     session_ids: Vec<String>,
 ) -> Result<u64, String> {
-    state
+    let bindings = local_sessions
+        .bindings_for(&session_ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    for binding in &bindings {
+        if binding.remote_session_id.trim().is_empty() {
+            continue;
+        }
+        chat_router
+            .delete_remote_session(&binding.channel, &binding.remote_session_id)
+            .await
+            .map_err(|e| {
+                format!(
+                    "删除远端会话 {}（渠道 {}）失败：{}",
+                    binding.remote_session_id, binding.channel, e
+                )
+            })?;
+    }
+    local_sessions
         .delete_sessions(&session_ids)
         .await
         .map_err(|e| e.to_string())

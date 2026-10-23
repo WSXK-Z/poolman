@@ -8,6 +8,7 @@ import {
   NFormItem,
   NInput,
   NInputNumber,
+  NSelect,
   useMessage,
 } from "naive-ui";
 import { getBaseUrl, getHealthUrl, setBaseUrl } from "../config";
@@ -33,6 +34,63 @@ interface ChatSettings {
   chat_interval_ms: number;
   default_chat_interval_ms: number;
   max_chat_interval_ms: number;
+}
+
+/** 会话标题设置：来源策略与本地模型目录。 */
+interface TitleSettings {
+  source: string;
+  model_dir: string;
+  default_model_dir: string;
+  has_local_model: boolean;
+  model_dir_resolved: string;
+}
+
+const titleSource = ref("heuristic");
+const titleModelDir = ref("");
+const titleDefaults = ref({ dir: "models/qwen3-0.6b", hasModel: false, resolved: "" });
+const savingTitle = ref(false);
+
+const titleSourceOptions = [
+  { label: "启发式（默认，零依赖）", value: "heuristic" },
+  { label: "本地模型（优先，Qwen3-0.6B）", value: "local" },
+  { label: "网页渠道（旧行为）", value: "web" },
+];
+
+async function loadTitleSettings() {
+  try {
+    const data = await invoke<TitleSettings>("get_title_settings");
+    titleSource.value = data.source;
+    titleModelDir.value = data.model_dir;
+    titleDefaults.value = {
+      dir: data.default_model_dir,
+      hasModel: data.has_local_model,
+      resolved: data.model_dir_resolved,
+    };
+  } catch {
+    // 非 Tauri 环境：保留默认值
+  }
+}
+
+async function saveTitleSettings() {
+  savingTitle.value = true;
+  try {
+    const data = await invoke<TitleSettings>("set_title_settings", {
+      source: titleSource.value,
+      modelDir: titleModelDir.value,
+    });
+    titleModelDir.value = data.model_dir;
+    titleDefaults.value = {
+      dir: data.default_model_dir,
+      hasModel: data.has_local_model,
+      resolved: data.model_dir_resolved,
+    };
+    message.success("标题设置已保存");
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    message.error(`保存失败：${reason}`);
+  } finally {
+    savingTitle.value = false;
+  }
 }
 
 async function load() {
@@ -96,7 +154,10 @@ async function saveChatInterval() {
   }
 }
 
-onMounted(load);
+onMounted(() => {
+  void load();
+  void loadTitleSettings();
+});
 </script>
 
 <template>
@@ -159,6 +220,41 @@ onMounted(load);
         </n-form-item>
       </n-form>
     </section>
+    <section class="panel">
+      <div class="panel-head">
+        <h2 class="panel-title">会话标题</h2>
+      </div>
+      <n-form label-placement="left" label-width="130">
+        <n-form-item label="生成方式">
+          <n-select v-model:value="titleSource" :options="titleSourceOptions" style="width: 280px" />
+        </n-form-item>
+        <n-form-item label="本地模型目录">
+          <div class="model-dir">
+            <n-input
+              v-model:value="titleModelDir"
+              :placeholder="titleDefaults.dir"
+              style="flex: 1"
+            />
+            <n-button quaternary @click="titleModelDir = titleDefaults.dir">用默认目录</n-button>
+          </div>
+        </n-form-item>
+        <n-form-item label=" ">
+          <div class="model-hint">
+            <span v-if="titleDefaults.hasModel" class="ok">
+              已配置：{{ titleDefaults.resolved }}
+            </span>
+            <span v-else class="muted">
+              未配置本地模型，启用「本地模型」时会回落到网页渠道。模型不随安装包分发，需自行下载到数据目录。
+            </span>
+          </div>
+        </n-form-item>
+        <n-form-item label=" ">
+          <n-button type="primary" :loading="savingTitle" @click="saveTitleSettings">
+            保存
+          </n-button>
+        </n-form-item>
+      </n-form>
+    </section>
   </div>
 </template>
 
@@ -176,5 +272,27 @@ onMounted(load);
 .unit {
   color: var(--muted);
   font-size: var(--text-xs);
+}
+
+.model-dir {
+  display: flex;
+  gap: var(--space-2);
+  align-items: center;
+  width: 100%;
+}
+
+.model-hint {
+  font-size: var(--text-xs);
+  line-height: 1.5;
+}
+
+.model-hint .ok {
+  color: var(--fg-2);
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.model-hint .muted {
+  color: var(--muted);
 }
 </style>

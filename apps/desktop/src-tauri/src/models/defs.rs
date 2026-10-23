@@ -21,6 +21,8 @@ pub struct InferRequest {
     pub tool_choice: Option<Value>,
     /// 对外会话标识（当前只透传，不做对外会话管理）。
     pub session_key: Option<String>,
+    /// 本地会话 id：网页渠道用它绑定远端会话，后续只发增量。
+    pub web_context_key: Option<String>,
     /// 调用方 API Key（用于会话归属）。
     pub api_key: Option<String>,
 }
@@ -38,6 +40,7 @@ impl InferRequest {
             tools: None,
             tool_choice: None,
             session_key: None,
+            web_context_key: None,
             api_key: None,
         }
     }
@@ -197,6 +200,43 @@ pub trait SessionPoolStore: Send + Sync {
         channel: &'a str,
         sessions: &'a [PooledSession],
     ) -> BoxFuture<'a, Result<()>>;
+}
+
+/// 网页渠道的本地会话 ↔ 远端会话绑定。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WebContextBinding {
+    /// 渠道标识。
+    pub channel: String,
+    /// 本地会话 id。
+    pub context_key: String,
+    /// 远端网页会话 id。
+    pub remote_session_id: String,
+    /// 远端最近一条消息 id（DeepSeek 的 parent_message_id；其他渠道可为空）。
+    pub parent_message_id: Option<i64>,
+    /// 是否已经完成初始化（system / 工具 / 历史 / 首问）。
+    pub primed: bool,
+    /// system prompt 摘要哈希。
+    pub system_hash: String,
+    /// 工具表摘要哈希。
+    pub tools_hash: String,
+    /// 远端上下文 token 估算。
+    pub approx_tokens: i64,
+    /// 旧会话的摘要：上下文超限迁移时只把摘要灌入新会话，不再发全量历史。
+    pub summary: String,
+}
+
+/// 网页渠道会话绑定的持久化存储。
+pub trait WebContextStore: Send + Sync {
+    fn load<'a>(
+        &'a self,
+        channel: &'a str,
+        context_key: &'a str,
+    ) -> BoxFuture<'a, Result<Option<WebContextBinding>>>;
+
+    fn save<'a>(&'a self, binding: &'a WebContextBinding) -> BoxFuture<'a, Result<()>>;
+
+    fn delete<'a>(&'a self, channel: &'a str, context_key: &'a str)
+        -> BoxFuture<'a, Result<()>>;
 }
 
 /// 渠道执行器：模型用它把请求送到渠道（网页平台）。

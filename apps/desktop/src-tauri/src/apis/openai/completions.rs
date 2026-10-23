@@ -62,6 +62,7 @@ pub async fn completions_handler(
         tools: None,
         tool_choice: None,
         session_key: req.session_id.clone(),
+        web_context_key: None,
         api_key: Some(auth.key),
     };
 
@@ -69,7 +70,7 @@ pub async fn completions_handler(
         return sse_response(state, request, meta, model);
     }
 
-    match state.chat_router.chat_completions(request, meta).await {
+    match state.workflow_runtime.chat_completions(request, meta).await {
         Ok(result) => {
             let response = serde_json::json!({
                 "id": format!("cmpl-{}", chrono::Utc::now().timestamp_millis()),
@@ -106,7 +107,7 @@ fn sse_response(
     let stream = async_stream::stream! {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
         let chunk_tx = tx.clone();
-        let router = state.chat_router.clone();
+        let router = state.workflow_runtime.clone();
 
         tokio::spawn(async move {
             let result = router

@@ -26,11 +26,14 @@ use crate::extension::credentials::CredentialStore;
 use crate::extension::websocket::WebSocketBridge;
 use crate::request_record::RequestMeta;
 use crate::throttle::ChatFrequency;
+use crate::workflow::WorkflowRuntime;
 
 /// 入口层共享状态：各 API 格式的 handler 都从这里取依赖。
 pub struct AppState {
     /// 模型分派入口（按模型选供应商）。
     pub chat_router: Arc<ChatRouter>,
+    /// 工作流运行时：所有对话请求都提交到这里执行。
+    pub workflow_runtime: Arc<WorkflowRuntime>,
     /// 插件连接（健康检查/凭证同步等）。
     pub bridge: Arc<WebSocketBridge>,
     /// 供应商凭证库。

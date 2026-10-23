@@ -273,6 +273,7 @@ pub async fn chat_completions_handler(
         tools: req.tools.clone(),
         tool_choice: req.tool_choice.clone(),
         session_key: req.user_id.clone(),
+        web_context_key: None,
         api_key: Some(auth.key),
     };
 
@@ -288,7 +289,7 @@ pub async fn chat_completions_handler(
         );
     }
 
-    match state.chat_router.chat_completions(request, meta).await {
+    match state.workflow_runtime.chat_completions(request, meta).await {
         Ok(result) => {
             let completion_tokens = usage_field(result.usage.as_ref(), "completion_tokens")
                 .unwrap_or_else(|| u64::from(crate::tokenizer::count(&result.text)));
@@ -396,7 +397,7 @@ fn sse_response(
         // 闭包是同步 FnMut，不能 await/block，故用 unbounded 通道回传增量。
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<String, String>>();
         let chunk_tx = tx.clone();
-        let router = state.chat_router.clone();
+        let router = state.workflow_runtime.clone();
         let finished = Arc::new(AtomicBool::new(false));
 
         tokio::spawn({

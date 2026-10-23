@@ -16,6 +16,7 @@ import {
   CubeOutline,
   DocumentTextOutline,
   ExtensionPuzzleOutline,
+  GitNetworkOutline,
   HelpCircleOutline,
   KeyOutline,
   LayersOutline,
@@ -33,6 +34,7 @@ import PluginManagementView from "./views/PluginManagementView.vue";
 import ProviderManagementView from "./views/ProviderManagementView.vue";
 import RequestRecordsView from "./views/RequestRecordsView.vue";
 import LocalSessionsView from "./views/LocalSessionsView.vue";
+import WorkflowView from "./views/WorkflowView.vue";
 import { darkThemeOverrides, lightThemeOverrides } from "./theme";
 
 const THEME_KEY = "poolman-theme";
@@ -61,6 +63,7 @@ const menuOptions = [
   { label: "会话", key: "sessions", icon: renderIcon(ChatbubblesOutline) },
   { label: "会话管理", key: "local-sessions", icon: renderIcon(LayersOutline) },
   { label: "本地请求管理", key: "requests", icon: renderIcon(DocumentTextOutline) },
+  { label: "工作流", key: "workflow", icon: renderIcon(GitNetworkOutline) },
   { label: "状态", key: "status", icon: renderIcon(PulseOutline) },
   { label: "插件管理", key: "plugins", icon: renderIcon(ExtensionPuzzleOutline) },
   { label: "供应商管理", key: "providers", icon: renderIcon(CubeOutline) },
@@ -125,6 +128,7 @@ const menuOptions = [
             <SessionView v-else-if="activeMenu === 'sessions'" />
             <LocalSessionsView v-else-if="activeMenu === 'local-sessions'" />
             <RequestRecordsView v-else-if="activeMenu === 'requests'" />
+            <WorkflowView v-else-if="activeMenu === 'workflow'" />
             <PluginManagementView v-else-if="activeMenu === 'plugins'" />
             <ProviderManagementView v-else-if="activeMenu === 'providers'" />
             <StatusView v-else />

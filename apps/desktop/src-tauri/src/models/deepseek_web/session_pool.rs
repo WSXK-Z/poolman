@@ -8,8 +8,8 @@
 //! - 槽位表持久化：再次启动先与网页会话列表核对，仍然存在的直接复用、并按标题认领
 //!   丢失 id 的槽位，都不会重复创建；列表取不到（渠道未连接等）时保守保留已登记槽位。
 //!
-//! 请求是无状态的（每轮把整段对话拼进提示词），所以「哪个槽位对应哪段对话」不参与路由：
-//! 每个在途请求独占一个槽位即可，取到哪个槽位不影响结果。
+//! 有本地会话绑定的请求不会使用这里的槽位：它们按 `web_context_bindings` 一一绑定远端会话；
+//! 没有绑定的请求（标题生成等兼容路径）才按无状态完整 prompt 轮转槽位。
 //!
 //! 并发闸门保证同时在途的请求数不超过池容量，而槽位游标单调递增，
 //! 因此同时在途的请求必然落在互不相同的槽位上（N 个连续整数对 N 取模互不相同）。
@@ -25,8 +25,8 @@ use super::{is_biz_ok, DeepSeekWebModel, CHANNEL};
 use crate::models::defs::PooledSession;
 use crate::models::plugin::PluginModel;
 
-/// 池内会话标题前缀：`poolman_<槽位序号>`（序号从 1 起）。
-pub const POOL_TITLE_PREFIX: &str = "poolman_";
+/// 池内会话标题前缀：`poolman-<槽位序号>`（序号从 1 起）。
+pub const POOL_TITLE_PREFIX: &str = "poolman-";
 
 /// 池内会话在网页端的核对结果。
 enum SessionCheck {

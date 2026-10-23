@@ -20,11 +20,13 @@ use tracing::{debug, info, warn};
 
 use super::defs::{
     ChannelExecutor, ChannelRequest, ChunkSink, Concurrency, InferRequest, ModelCapability,
-    ModelResponse, SessionPoolStore,
+    ModelResponse, SessionPoolStore, WebContextStore,
 };
 use super::model::Model;
 use super::plugin::PluginModel;
 use super::pow::{build_pow_header, solve_pow};
+use super::prompt;
+use super::web_context::text_hash;
 use crate::apis::base::DeltaChunk;
 use crate::models::deepseek_web::chat_stream_processor::{ChatStreamProcessor, ToolSchemas};
 use crate::models::deepseek_web::sse_frame_processor::{SseFrameProcessor, UpstreamError};
@@ -32,6 +34,16 @@ use crate::throttle::{ChatFrequency, ChatThrottle, DEFAULT_CHAT_INTERVAL_MS};
 
 /// 渠道标识。
 pub const CHANNEL: &str = "deepseek-web";
+
+/// 专用的标题生成会话绑定 key。
+const TITLE_CONTEXT_KEY: &str = "__poolman_title__";
+/// 专用的摘要生成会话绑定 key。
+const SUMMARY_CONTEXT_KEY: &str = "__poolman_summary__";
+/// 专用会话的固定标题。
+const TITLE_SESSION_TITLE: &str = "poolman-标题生成";
+const SUMMARY_SESSION_TITLE: &str = "poolman-摘要生成";
+/// 网页端标题统一前缀。
+const WEB_TITLE_PREFIX: &str = "poolman-";
 
 /// 拼装提示词时置顶的前缀：网页会话本身带着历史对话，要求模型只依据本次内容作答。
 pub(crate) const PROMPT_PREFIX: &str =
@@ -137,6 +149,9 @@ const THINKING_ENABLED: bool = true;
 /// 网页端单次请求可容纳的输入上限（token）。
 const CONTEXT_LENGTH: u32 = 1024 * 1024;
 
+/// 绑定会话 bootstrap 单段最大字符数（DeepSeek 单条输入较宽，但仍分段）。
+const BOUND_BOOTSTRAP_CHARS: usize = 12_000;
+
 /// 网页端单次回答的输出上限（token）。
 const MAX_OUTPUT_TOKENS: u32 = 300 * 1024;
 
@@ -168,6 +183,12 @@ pub struct DeepSeekWebModel {
     pool_lock: tokio::sync::Mutex<()>,
     /// 会话池持久化存储；None 表示槽位不落库。
     pool_store: Option<Arc<dyn SessionPoolStore>>,
+    /// 本地会话 ↔ 远端会话绑定。
+    web_context_store: Option<Arc<dyn WebContextStore>>,
+    /// 同一本地会话的请求串行化：远端网页会话不能并发使用。
+    bound_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 已经加过 `poolman-` 前缀的网页会话。
+    prefixed_titles: Mutex<HashSet<String>>,
     /// 会话池中标题已就位的会话 id（已命名或已在网页端用同名标题存在）。
     pool_titled: Mutex<HashSet<String>>,
     /// 并发闸门：同时在途的请求数不超过池容量（保证每个在途请求独占一个槽位）。
@@ -200,6 +221,9 @@ impl DeepSeekWebModel {
             pool_ready: AtomicBool::new(false),
             pool_lock: tokio::sync::Mutex::new(()),
             pool_store: None,
+            web_context_store: None,
+            bound_locks: Mutex::new(HashMap::new()),
+            prefixed_titles: Mutex::new(HashSet::new()),
             pool_titled: Mutex::new(HashSet::new()),
             gate: tokio::sync::Semaphore::new(1),
             slot_cursor: AtomicUsize::new(0),
@@ -228,6 +252,21 @@ impl DeepSeekWebModel {
     pub fn with_session_store(mut self, store: Arc<dyn SessionPoolStore>) -> Self {
         self.pool_store = Some(store);
         self
+    }
+
+    /// 注入本地会话 ↔ 远端会话绑定存储。
+    pub fn with_web_context_store(mut self, store: Arc<dyn WebContextStore>) -> Self {
+        self.web_context_store = Some(store);
+        self
+    }
+
+    /// 同一本地会话的串行锁。
+    fn context_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.bound_locks.lock().unwrap();
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// DeepSeek 网页默认请求头。
@@ -599,15 +638,28 @@ impl DeepSeekWebModel {
     /// 聊天共用实现：`on_chunk` 为 Some 时流式回吐正文增量，工具调用在收尾时解析；
     /// 解析失败（DSML 块没写完）时用规范化器提示词（`dsml_normalizer.md`）重写一轮，最多修复一次。
     ///
-    /// 每次请求是无状态的（整段对话都拼在提示词里），因此不绑定调用方会话：
-    /// 先取并发闸门，再从会话池轮转一个网页会话独占使用，池容量即可并发的请求数。
-    /// 网页会话不能用时（上下文到上限、上游说还有消息正在生成、上游一个字都没回）
-    /// 换一个同标题的新会话重跑一轮，最多换一次。
+    /// 有本地会话 key 时与远端会话一一绑定：首次分段 bootstrap，后续只发新增内容；
+    /// 没有 key（标题生成等）时沿用无状态完整 prompt 与会话池轮转。
     async fn chat(
         &self,
         request: InferRequest,
         on_chunk: Option<ChunkSink>,
     ) -> Result<ModelResponse> {
+        if request.web_context_key.is_none()
+            && crate::request_record::detect_title_request(
+                &request.messages,
+                request.tools.as_ref(),
+            )
+            && self.web_context_store.is_some()
+        {
+            return self.chat_title(request, on_chunk).await;
+        }
+        if let (Some(key), Some(store)) = (
+            request.web_context_key.clone(),
+            self.web_context_store.clone(),
+        ) {
+            return self.chat_bound(request, on_chunk, key, store).await;
+        }
         self.token()?;
         let prompt = Self::prompt_of(&request);
         // 附件先上传并等解析完成：只有解析成功的文件才能参与本轮对话。
@@ -811,6 +863,704 @@ impl DeepSeekWebModel {
             finish_reason: Some(finish_reason.to_string()),
             is_complete: true,
         })
+    }
+
+    /// 读取网页会话当前标题。
+    async fn channel_session_title(&self, session_id: &str) -> Option<String> {
+        let list = self.list_channel_sessions().await.ok()?;
+        let item = list
+            .as_array()?
+            .iter()
+            .find(|item| item.get("id").and_then(Value::as_str) == Some(session_id))?;
+        item.get("title")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// 给普通会话标题加 `poolman-` 前缀；已有前缀或改名不生效时跳过。
+    async fn ensure_prefixed_title(&self, session_id: &str, fallback: &str) {
+        if self
+            .prefixed_titles
+            .lock()
+            .map(|set| set.contains(session_id))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let title = self.channel_session_title(session_id).await.unwrap_or_default();
+        let title = title.trim();
+        if title.starts_with(WEB_TITLE_PREFIX) {
+            if let Ok(mut set) = self.prefixed_titles.lock() {
+                set.insert(session_id.to_string());
+            }
+            return;
+        }
+        let base = if title.is_empty() {
+            fallback.trim().to_string()
+        } else {
+            title.to_string()
+        };
+        if base.is_empty() {
+            return;
+        }
+        let new_title = format!("{WEB_TITLE_PREFIX}{base}");
+        match self.rename_channel_session(session_id, &new_title).await {
+            Ok(true) => {
+                if let Ok(mut set) = self.prefixed_titles.lock() {
+                    set.insert(session_id.to_string());
+                }
+            }
+            Ok(false) => {}
+            Err(error) => warn!("网页会话 {} 加标题前缀失败: {}", session_id, error),
+        }
+    }
+
+    /// 专用会话使用固定标题（本身已带 poolman- 前缀）。
+    async fn ensure_fixed_title(&self, session_id: &str, title: &str) {
+        if self
+            .prefixed_titles
+            .lock()
+            .map(|set| set.contains(session_id))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        match self.rename_channel_session(session_id, title).await {
+            Ok(true) => {
+                if let Ok(mut set) = self.prefixed_titles.lock() {
+                    set.insert(session_id.to_string());
+                }
+            }
+            Ok(false) => {}
+            Err(error) => warn!("网页会话 {} 设置专用标题失败: {}", session_id, error),
+        }
+    }
+
+    /// 专用标题/摘要会话：长期复用，上下文不可用时换新会话重试一次。
+    async fn run_auxiliary(
+        &self,
+        store: &Arc<dyn WebContextStore>,
+        key: &str,
+        title: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let lock = self.context_lock(key);
+        let _guard = lock.lock().await;
+        let schemas = ToolSchemas::from_tools(None);
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut binding = store.load(CHANNEL, key).await?.unwrap_or_default();
+            binding.channel = CHANNEL.to_string();
+            binding.context_key = key.to_string();
+            if binding.remote_session_id.is_empty() {
+                let created = self
+                    .create_channel_session()
+                    .await?
+                    .ok_or_else(|| anyhow!("创建专用网页会话失败"))?;
+                binding.remote_session_id = created;
+                binding.parent_message_id = None;
+                binding.primed = true;
+            }
+            let parent = binding
+                .parent_message_id
+                .map(|id| Value::Number(id.into()))
+                .unwrap_or(Value::Null);
+            let result = self
+                .run_completion_round(
+                    &binding.remote_session_id,
+                    &parent,
+                    prompt,
+                    &[],
+                    false,
+                    &schemas,
+                    None,
+                )
+                .await;
+            match result {
+                Ok(round)
+                    if !hits_context_limit(&round)
+                        && !hits_parallel_chat_limit(&round)
+                        && !silent_round(&round)
+                        && !round.text.trim().is_empty() =>
+                {
+                    binding.parent_message_id = round.message_id;
+                    binding.primed = true;
+                    binding.approx_tokens += i64::from(estimate_tokens(prompt))
+                        + i64::from(estimate_tokens(&round.text));
+                    if let Err(error) = store.save(&binding).await {
+                        warn!("保存专用会话绑定失败 key={} err={}", key, error);
+                    }
+                    self.ensure_fixed_title(&binding.remote_session_id, title)
+                        .await;
+                    return Ok(round.text);
+                }
+                Ok(round) => {
+                    warn!(
+                        "DeepSeek 专用会话不可用 key={} reason={:?} text_empty={}",
+                        key,
+                        round
+                            .upstream_error
+                            .as_ref()
+                            .and_then(|error| error.finish_reason.clone()),
+                        round.text.trim().is_empty()
+                    );
+                    let old_remote = binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, key).await;
+                    if attempts >= 2 {
+                        anyhow::bail!("专用会话未返回有效内容");
+                    }
+                }
+                Err(error) => {
+                    warn!("DeepSeek 专用会话失败 key={} err={}", key, error);
+                    let old_remote = binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, key).await;
+                    if attempts >= 2 {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 标题请求使用专用标题会话，不再走普通会话池/绑定会话。
+    async fn chat_title(
+        &self,
+        request: InferRequest,
+        on_chunk: Option<ChunkSink>,
+    ) -> Result<ModelResponse> {
+        let Some(store) = self.web_context_store.clone() else {
+            anyhow::bail!("标题会话缺少绑定存储");
+        };
+        self.token()?;
+        let lock = self.context_lock(TITLE_CONTEXT_KEY);
+        let _guard = lock.lock().await;
+        let prompt = Self::prompt_of(&request);
+        let schemas = ToolSchemas::from_tools(None);
+        let mut pending_sink = on_chunk;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut binding = store
+                .load(CHANNEL, TITLE_CONTEXT_KEY)
+                .await?
+                .unwrap_or_default();
+            binding.channel = CHANNEL.to_string();
+            binding.context_key = TITLE_CONTEXT_KEY.to_string();
+            if binding.remote_session_id.is_empty() {
+                let created = self
+                    .create_channel_session()
+                    .await?
+                    .ok_or_else(|| anyhow!("创建标题网页会话失败"))?;
+                binding.remote_session_id = created;
+                binding.parent_message_id = None;
+                binding.primed = true;
+            }
+            let parent = binding
+                .parent_message_id
+                .map(|id| Value::Number(id.into()))
+                .unwrap_or(Value::Null);
+            let result = self
+                .run_completion_round(
+                    &binding.remote_session_id,
+                    &parent,
+                    &prompt,
+                    &[],
+                    false,
+                    &schemas,
+                    pending_sink.take(),
+                )
+                .await;
+            match result {
+                Ok(round)
+                    if !hits_context_limit(&round)
+                        && !hits_parallel_chat_limit(&round)
+                        && !silent_round(&round)
+                        && !round.text.trim().is_empty() =>
+                {
+                    binding.parent_message_id = round.message_id;
+                    binding.primed = true;
+                    binding.approx_tokens += i64::from(estimate_tokens(&prompt))
+                        + i64::from(estimate_tokens(&round.text));
+                    if let Err(error) = store.save(&binding).await {
+                        warn!("保存标题会话绑定失败 err={}", error);
+                    }
+                    self.ensure_fixed_title(&binding.remote_session_id, TITLE_SESSION_TITLE)
+                        .await;
+                    let completion_tokens = estimate_tokens(&round.text);
+                    return Ok(ModelResponse {
+                        text: round.text,
+                        reasoning: if round.reasoning.is_empty() {
+                            None
+                        } else {
+                            Some(round.reasoning)
+                        },
+                        tool_calls: None,
+                        usage: Some(json!({
+                            "prompt_tokens": estimate_tokens(&prompt),
+                            "completion_tokens": completion_tokens,
+                            "total_tokens": estimate_tokens(&prompt) + completion_tokens,
+                        })),
+                        finish_reason: Some("stop".to_string()),
+                        is_complete: true,
+                    });
+                }
+                Ok(round) => {
+                    warn!(
+                        "DeepSeek 标题会话不可用 reason={:?}",
+                        round
+                            .upstream_error
+                            .as_ref()
+                            .and_then(|error| error.finish_reason.clone())
+                    );
+                    let old_remote = binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, TITLE_CONTEXT_KEY).await;
+                    if attempts >= 2 {
+                        anyhow::bail!("标题会话未返回有效内容");
+                    }
+                }
+                Err(error) => {
+                    let old_remote = binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, TITLE_CONTEXT_KEY).await;
+                    if attempts >= 2 {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 上下文迁移前，用专用摘要会话压缩旧对话。
+    async fn summarize_for_migration(
+        &self,
+        request: &InferRequest,
+        store: &Arc<dyn WebContextStore>,
+        existing_summary: &str,
+    ) -> Result<String> {
+        let prompt = prompt::build_summary_prompt(request, existing_summary, 60);
+        self.run_auxiliary(
+            store,
+            SUMMARY_CONTEXT_KEY,
+            SUMMARY_SESSION_TITLE,
+            &prompt,
+        )
+        .await
+    }
+
+    /// 本地会话绑定远端会话：首次分段 bootstrap，后续只发新增内容。
+    async fn chat_bound(
+        &self,
+        request: InferRequest,
+        on_chunk: Option<ChunkSink>,
+        key: String,
+        store: Arc<dyn WebContextStore>,
+    ) -> Result<ModelResponse> {
+        let context_lock = self.context_lock(&key);
+        let _context_guard = context_lock.lock().await;
+        self.token()?;
+        let ref_file_ids = self.collect_ref_file_ids(&request.messages).await?;
+        let recognize_tools = request
+            .tools
+            .as_ref()
+            .and_then(Value::as_array)
+            .is_some_and(|items| !items.is_empty());
+        let schemas = ToolSchemas::from_tools(request.tools.as_ref());
+        let _slot_permit = self
+            .gate
+            .acquire()
+            .await
+            .map_err(|_| anyhow!("渠道并发闸门已关闭"))?;
+
+        let system_text = request
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let tools_text = request
+            .tools
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let system_hash = text_hash(&system_text);
+        let tools_hash = text_hash(&tools_text);
+
+        let mut binding = store
+            .load(CHANNEL, &key)
+            .await?
+            .unwrap_or_default();
+        binding.channel = CHANNEL.to_string();
+        binding.context_key = key.clone();
+        if !binding.remote_session_id.is_empty()
+            && binding.primed
+            && (binding.system_hash != system_hash || binding.tools_hash != tools_hash)
+        {
+            info!("DeepSeek 会话静态上下文变化，重建远端会话 key={}", key);
+            let _ = store.delete(CHANNEL, &key).await;
+            binding.remote_session_id.clear();
+            binding.parent_message_id = None;
+            binding.primed = false;
+            binding.approx_tokens = 0;
+        }
+        binding.system_hash = system_hash;
+        binding.tools_hash = tools_hash;
+
+        let sink_cell = Arc::new(Mutex::new(on_chunk));
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut attempt_binding = binding.clone();
+            let attempt = self
+                .run_bound_attempt(
+                    &request,
+                    &mut attempt_binding,
+                    &schemas,
+                    recognize_tools,
+                    &ref_file_ids,
+                    &sink_cell,
+                )
+                .await;
+            let (mut round, prompt, bootstrap_tokens) = match attempt {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "DeepSeek 绑定会话第 {} 次失败 key={} err={}",
+                        attempts, key, error
+                    );
+                    if attempts < 2 && error.to_string().contains("bootstrap") {
+                        let summary = match self
+                            .summarize_for_migration(
+                                &request,
+                                &store,
+                                &attempt_binding.summary,
+                            )
+                            .await
+                        {
+                            Ok(summary) if !summary.trim().is_empty() => summary,
+                            _ => "（摘要生成失败，旧历史未保留）".to_string(),
+                        };
+                        binding.summary = summary;
+                    }
+                    let old_remote = attempt_binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, &key).await;
+                    binding.remote_session_id.clear();
+                    binding.parent_message_id = None;
+                    binding.primed = false;
+                    binding.approx_tokens = 0;
+                    if attempts >= 2 {
+                        return Err(error);
+                    }
+                    continue;
+                }
+            };
+
+            let context_limit = hits_context_limit(&round);
+            let unusable = if context_limit {
+                Some("网页上下文到上限")
+            } else if hits_parallel_chat_limit(&round) {
+                Some("网页端还有消息正在生成")
+            } else if silent_round(&round) {
+                Some("网页端未返回任何内容")
+            } else {
+                None
+            };
+            if let Some(reason) = unusable {
+                if attempts < 2 {
+                    warn!("{}，重建绑定会话 key={}", reason, key);
+                    if context_limit {
+                        let summary = match self
+                            .summarize_for_migration(
+                                &request,
+                                &store,
+                                &attempt_binding.summary,
+                            )
+                            .await
+                        {
+                            Ok(summary) if !summary.trim().is_empty() => summary,
+                            Ok(_) => "（未能生成摘要，旧历史未保留）".to_string(),
+                            Err(error) => {
+                                warn!("DeepSeek 生成摘要失败 key={} err={}", key, error);
+                                if attempt_binding.summary.trim().is_empty() {
+                                    "（摘要生成失败，旧历史未保留）".to_string()
+                                } else {
+                                    attempt_binding.summary.clone()
+                                }
+                            }
+                        };
+                        binding.summary = summary;
+                    } else {
+                        binding.summary = attempt_binding.summary.clone();
+                    }
+                    let old_remote = attempt_binding.remote_session_id.clone();
+                    if !old_remote.is_empty() {
+                        let _ = self.delete_channel_session(&old_remote).await;
+                    }
+                    let _ = store.delete(CHANNEL, &key).await;
+                    binding.remote_session_id.clear();
+                    binding.parent_message_id = None;
+                    binding.primed = false;
+                    binding.approx_tokens = 0;
+                    continue;
+                }
+                let _ = store.delete(CHANNEL, &key).await;
+                anyhow::bail!("{}", reason);
+            }
+
+            let session_id = attempt_binding.remote_session_id.clone();
+            let mut repaired = false;
+            if let Some(broken) = round.parse_failure.take() {
+                let reason = round
+                    .parse_reason
+                    .take()
+                    .unwrap_or_else(|| "块内标签序列无法判定".to_string());
+                let repair_prompt =
+                    Self::repair_prompt(request.tools.as_ref(), &broken, &reason);
+                info!(
+                    "工具调用解析失败，发起修复重写 reason={} prompt_len={}",
+                    reason,
+                    repair_prompt.len()
+                );
+                let parent = round
+                    .message_id
+                    .map(|id| Value::Number(id.into()))
+                    .unwrap_or(Value::Null);
+                match self
+                    .run_completion_round(
+                        &session_id,
+                        &parent,
+                        &repair_prompt,
+                        &[],
+                        true,
+                        &schemas,
+                        None,
+                    )
+                    .await
+                {
+                    Ok(attempt) => {
+                        if !attempt.tool_calls.is_empty() {
+                            repaired = true;
+                            let base = round.tool_calls.len();
+                            if let Some(sink) = forwarding_sink(&sink_cell) {
+                                let indexed: Vec<Value> = attempt
+                                    .tool_calls
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(offset, call)| {
+                                        let mut call = call.clone();
+                                        call["index"] = json!(base + offset);
+                                        call
+                                    })
+                                    .collect();
+                                emit_delta(sink, DeltaChunk::FUNCTIONS, Value::Array(indexed));
+                            }
+                            round.tool_calls.extend(attempt.tool_calls);
+                        }
+                        if attempt.message_id.is_some() {
+                            round.message_id = attempt.message_id;
+                        }
+                    }
+                    Err(error) => warn!("工具调用修复请求失败，按解析失败处理：{}", error),
+                }
+                if !repaired {
+                    let _ = store.delete(CHANNEL, &key).await;
+                    anyhow::bail!(
+                        "工具调用解析失败，修复轮也没能重写出可解析的 DSML 调用（原因：{}）",
+                        reason
+                    );
+                }
+            }
+
+            attempt_binding.parent_message_id = round.message_id;
+            attempt_binding.primed = true;
+            attempt_binding.approx_tokens += i64::from(estimate_tokens(&prompt))
+                + i64::from(bootstrap_tokens);
+            if let Err(error) = store.save(&attempt_binding).await {
+                warn!("保存 DeepSeek 会话绑定失败 key={} err={}", key, error);
+            }
+            binding = attempt_binding;
+
+            let CompletionRound {
+                text,
+                reasoning,
+                tool_calls,
+                upstream_error,
+                message_id: _,
+                status,
+                raw_body,
+                parse_failure: _,
+                parse_reason: _,
+            } = round;
+            let has_calls = !tool_calls.is_empty();
+            let finish_reason = if has_calls { "tool_calls" } else { "stop" };
+            let prompt_tokens = estimate_tokens(&prompt) + bootstrap_tokens;
+            let completion_tokens = estimate_tokens(&text);
+            let total_tokens = prompt_tokens + completion_tokens;
+            if text.trim().is_empty() && !has_calls {
+                let raw = head_chars(&raw_body, RAW_HEAD_CHARS);
+                if let Some(upstream) = upstream_error {
+                    let reason = match upstream.finish_reason.as_deref() {
+                        Some(reason) => format!("{}（{}）", upstream.message, reason),
+                        None => upstream.message.clone(),
+                    };
+                    warn!(
+                        "网页上游报错：session={} status={} message={}",
+                        session_id, status, reason
+                    );
+                    anyhow::bail!("{}", reason);
+                }
+                warn!(
+                    "网页回答为空：session={} status={} 未解析出正文与工具调用，原始响应：{}",
+                    session_id, status, raw
+                );
+            } else {
+                let fallback = key.trim_start_matches("sess_").chars().take(12).collect::<String>();
+                self.ensure_prefixed_title(&session_id, &fallback).await;
+            }
+            return Ok(ModelResponse {
+                text,
+                reasoning: if reasoning.is_empty() {
+                    None
+                } else {
+                    Some(reasoning)
+                },
+                tool_calls: if has_calls {
+                    Some(Value::Array(tool_calls))
+                } else {
+                    None
+                },
+                usage: Some(json!({
+                    "prompt_tokens": prompt_tokens,
+                    "completion_tokens": completion_tokens,
+                    "total_tokens": total_tokens,
+                })),
+                finish_reason: Some(finish_reason.to_string()),
+                is_complete: true,
+            });
+        }
+    }
+
+    /// 执行一次绑定会话尝试：首次 bootstrap，后续增量。
+    async fn run_bound_attempt(
+        &self,
+        request: &InferRequest,
+        binding: &mut crate::models::defs::WebContextBinding,
+        schemas: &ToolSchemas,
+        recognize_tools: bool,
+        ref_file_ids: &[String],
+        sink_cell: &Arc<Mutex<Option<ChunkSink>>>,
+    ) -> Result<(CompletionRound, String, u32)> {
+        if binding.remote_session_id.is_empty() {
+            let created = self
+                .create_channel_session()
+                .await?
+                .ok_or_else(|| anyhow!("创建绑定网页会话失败"))?;
+            info!("DeepSeek 会话绑定创建远端会话 remote={}", created);
+            binding.remote_session_id = created;
+            binding.parent_message_id = None;
+            binding.primed = false;
+        }
+        let session_id = binding.remote_session_id.clone();
+
+        if !binding.primed {
+            let segments = if binding.summary.trim().is_empty() {
+                prompt::build_bootstrap_segments(request, BOUND_BOOTSTRAP_CHARS)
+            } else {
+                prompt::build_bootstrap_segments_with_summary(
+                    request,
+                    &binding.summary,
+                    BOUND_BOOTSTRAP_CHARS,
+                )
+            };
+            let total = segments.len();
+            info!(
+                "DeepSeek 会话 bootstrap key={} remote={} segments={}",
+                binding.context_key, session_id, total
+            );
+            let empty_refs: Vec<String> = Vec::new();
+            let empty_schemas = ToolSchemas::from_tools(None);
+            let mut last_round: Option<CompletionRound> = None;
+            let mut last_prompt = String::new();
+            let mut bootstrap_tokens = 0u32;
+            for (index, segment) in segments.iter().enumerate() {
+                let last = index + 1 == total;
+                let parent = binding
+                    .parent_message_id
+                    .map(|id| Value::Number(id.into()))
+                    .unwrap_or(Value::Null);
+                let round = self
+                    .run_completion_round(
+                        &session_id,
+                        &parent,
+                        segment,
+                        if last { ref_file_ids } else { &empty_refs },
+                        recognize_tools && last,
+                        if last { schemas } else { &empty_schemas },
+                        if last {
+                            forwarding_sink(sink_cell)
+                        } else {
+                            None
+                        },
+                    )
+                    .await?;
+                if let Some(id) = round.message_id {
+                    binding.parent_message_id = Some(id);
+                }
+                bootstrap_tokens += estimate_tokens(segment);
+                if last {
+                    last_round = Some(round);
+                    last_prompt = segment.clone();
+                } else if hits_context_limit(&round)
+                    || hits_parallel_chat_limit(&round)
+                    || (silent_round(&round) && round.message_id.is_none())
+                {
+                    anyhow::bail!("bootstrap 第 {} 段不可用", index + 1);
+                }
+            }
+            let round = last_round.ok_or_else(|| anyhow!("bootstrap 没有最后一段"))?;
+            return Ok((round, last_prompt, bootstrap_tokens));
+        }
+
+        // 提问轮：只带本轮新增内容，并重申工具调用要求。
+        let prompt = prompt::build_delta_prompt(request);
+        info!(
+            "DeepSeek 会话增量 key={} remote={} prompt_len={}",
+            binding.context_key,
+            session_id,
+            prompt.len()
+        );
+        let parent = binding
+            .parent_message_id
+            .map(|id| Value::Number(id.into()))
+            .unwrap_or(Value::Null);
+        let round = self
+            .run_completion_round(
+                &session_id,
+                &parent,
+                &prompt,
+                ref_file_ids,
+                recognize_tools,
+                schemas,
+                forwarding_sink(sink_cell),
+            )
+            .await?;
+        Ok((round, prompt, 0))
     }
 
     /// 跑一轮网页推理：发完成请求，按流式（`on_chunk` 为 Some）或整块收结果，
@@ -1255,6 +2005,7 @@ mod tests {
     };
     use crate::models::model::Model;
     use crate::models::plugin::PluginModel;
+    use crate::models::web_context::DbWebContextStore;
     use futures_util::future::BoxFuture;
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, VecDeque};
@@ -2431,6 +3182,204 @@ mod tests {
     }
 
     /// 流式的响应体不随结果回传：空回答时日志里要能看到这一轮收到的上游原文。
+    #[tokio::test]
+    async fn bound_session_splits_large_bootstrap() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-bound-large-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = executor("data: {\"v\":\"你好\"}\n", 0);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+        let mut request = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "system", "content": "系统提示词".repeat(8_000) }),
+                json!({ "role": "user", "content": "最新问题" }),
+            ],
+        );
+        request.web_context_key = Some("sess_bound_large".to_string());
+        model.infer(request).await.expect("大 bootstrap 应成功");
+
+        let bodies = executor.completion_bodies();
+        assert!(bodies.len() > 2, "bootstrap 应拆成多段");
+        for body in &bodies[..bodies.len() - 1] {
+            let prompt = body["prompt"].as_str().unwrap();
+            assert!(prompt.contains("不要回答"));
+            assert!(prompt.chars().count() <= 12_500);
+        }
+        let last = bodies.last().unwrap()["prompt"].as_str().unwrap();
+        assert!(last.contains("请回答最后一条"));
+        assert!(last.contains("最新问题"));
+        assert!(last.chars().count() <= 12_500);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn context_limit_migrates_with_summary_only() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-deepseek-summary-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = executor_with("data: {\"v\":\"最终回答\"}\n", 0, None);
+        executor.queue_completions(&[
+            "data: {\"v\":\"第一答\"}\n".to_string(),
+            LIMIT_BODY.to_string(),
+            "data: {\"v\":\"旧对话摘要：已完成第一问。\"}\n".to_string(),
+        ]);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+        let mut first = InferRequest::new(
+            "deepseek-web",
+            vec![json!({ "role": "user", "content": "第一问" })],
+        );
+        first.api_key = Some("sk-test".to_string());
+        first.web_context_key = Some("sess_summary_test".to_string());
+        let first_response = model.infer(first).await.expect("首次请求应成功");
+
+        let mut second = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "user", "content": "第一问" }),
+                json!({ "role": "assistant", "content": first_response.text }),
+                json!({ "role": "user", "content": "第二问" }),
+            ],
+        );
+        second.api_key = Some("sk-test".to_string());
+        second.web_context_key = Some("sess_summary_test".to_string());
+        let response = model.infer(second).await.expect("迁移后应成功");
+        assert_eq!(response.text, "最终回答");
+
+        let bodies = executor.completion_bodies();
+        assert!(bodies.len() >= 4, "应有旧会话、摘要、新会话三次以上调用");
+        let migrated = bodies.last().unwrap()["prompt"].as_str().unwrap();
+        assert!(migrated.contains("历史摘要"));
+        assert!(migrated.contains("旧对话摘要"));
+        assert!(!migrated.contains("【assistant】"), "迁移后不应发送历史助手消息");
+        assert_eq!(executor.create_count(), 3, "旧会话、摘要会话、新会话");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn title_requests_reuse_dedicated_session() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-deepseek-title-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = executor("data: {\"v\":\"标题\"}\n", 0);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+        for _ in 0..2 {
+            let mut request = InferRequest::new(
+                "deepseek-web",
+                vec![
+                    json!({
+                        "role": "system",
+                        "content": "Create a concise title for an AI coding-assistant session."
+                    }),
+                    json!({
+                        "role": "user",
+                        "content": "Generate the session title from this JSON array of human messages: []"
+                    }),
+                ],
+            );
+            request.api_key = Some("sk-test".to_string());
+            model.infer(request).await.expect("标题请求应成功");
+        }
+        assert_eq!(executor.create_count(), 1, "标题会话应长期复用");
+        let bodies = executor.completion_bodies();
+        assert_eq!(bodies.len(), 2);
+        assert!(bodies[0]["chat_session_id"].as_str().is_some());
+        assert!(executor.rename_count() >= 1, "标题会话应加 poolman- 前缀");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn bound_session_bootstraps_once_then_sends_delta() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-bound-session-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = executor("data: {\"v\":\"你好\"}\n", 0);
+        let model = DeepSeekWebModel::new("DeepSeek", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+
+        let mut first = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "system", "content": "系统提示词" }),
+                json!({ "role": "user", "content": "第一问" }),
+            ],
+        );
+        first.web_context_key = Some("sess_bound_test".to_string());
+        let first_response = model.infer(first).await.expect("首次请求应成功");
+        let bodies = executor.completion_bodies();
+        assert_eq!(bodies.len(), 1, "首次绑定会话只应 bootstrap 一段");
+        let prompt = bodies[0]["prompt"].as_str().unwrap();
+        assert!(prompt.contains("会话初始化完成"));
+        assert!(prompt.contains("第一问"));
+
+        let mut second = InferRequest::new(
+            "deepseek-web",
+            vec![
+                json!({ "role": "system", "content": "系统提示词" }),
+                json!({ "role": "user", "content": "第一问" }),
+                json!({ "role": "assistant", "content": first_response.text }),
+                json!({ "role": "user", "content": "第二问" }),
+            ],
+        );
+        second.web_context_key = Some("sess_bound_test".to_string());
+        model.infer(second).await.expect("后续请求应成功");
+        let bodies = executor.completion_bodies();
+        assert_eq!(bodies.len(), 2);
+        let delta = bodies[1]["prompt"].as_str().unwrap();
+        assert!(delta.contains("继续上一轮对话"));
+        assert!(delta.contains("第二问"));
+        assert!(!delta.contains("系统提示词"), "后续不应重发 system");
+        assert!(!delta.contains("第一问"), "后续不应重发历史");
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn streaming_empty_answer_logs_raw_response() {
         let logs = Arc::new(Mutex::new(Vec::<u8>::new()));

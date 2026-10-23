@@ -2,7 +2,7 @@
 // 展示指定网页供应商的远端会话，并将删除操作委托给对应的桌面适配器。
 import { onMounted, ref, watch } from "vue";
 import { invoke } from "@tauri-apps/api/core";
-import { NAlert, NButton, NEmpty, NPopconfirm, NScrollbar, useMessage } from "naive-ui";
+import { NAlert, NButton, NEmpty, NInput, NPopconfirm, NScrollbar, useMessage } from "naive-ui";
 
 const props = defineProps<{ providerId: string; providerName: string }>();
 const emit = defineEmits<{ back: [] }>();
@@ -20,6 +20,10 @@ const sessions = ref<SessionInfo[]>([]);
 const selected = ref<SessionInfo | null>(null);
 const loading = ref(false);
 const error = ref("");
+/// 正在改名的会话 id（同一时刻只允许一个，避免多点）。
+const renamingId = ref("");
+const renameDraft = ref("");
+const renaming = ref(false);
 
 async function loadSessions() {
   loading.value = true;
@@ -56,6 +60,46 @@ async function deleteSession(id: string) {
     await loadSessions();
   } catch (e) {
     message.error(e instanceof Error ? e.message : String(e));
+  }
+}
+
+/// 进入改名状态：预填当前标题。
+function startRename(session: SessionInfo) {
+  renamingId.value = session.id;
+  renameDraft.value = session.title === session.id ? "" : session.title;
+}
+
+function cancelRename() {
+  renamingId.value = "";
+  renameDraft.value = "";
+}
+
+/// 提交改名：成功后以本地返回值更新列表，避免网页端列表有延迟时看起来没生效。
+async function submitRename(session: SessionInfo) {
+  const title = renameDraft.value.trim();
+  if (!title) {
+    message.warning("标题不能为空");
+    return;
+  }
+  if (title === session.title) {
+    cancelRename();
+    return;
+  }
+  renaming.value = true;
+  try {
+    await invoke("rename_provider_session", {
+      provider: props.providerId,
+      sessionId: session.id,
+      title,
+    });
+    session.title = title;
+    if (selected.value?.id === session.id) selected.value = { ...session };
+    message.success("已修改标题");
+    cancelRename();
+  } catch (e) {
+    message.error(e instanceof Error ? e.message : String(e));
+  } finally {
+    renaming.value = false;
   }
 }
 
@@ -96,18 +140,39 @@ onMounted(() => void loadSessions());
               class="session-item"
               :class="{ selected: selected?.id === session.id }"
             >
-              <button class="session-select" @click="selectSession(session)">
-                <strong>{{ session.title || "未命名会话" }}</strong>
-                <small class="mono">
-                  {{ session.updated_at ? new Date(session.updated_at).toLocaleString() : "时间未知" }}
-                </small>
-              </button>
-              <n-popconfirm @positive-click="deleteSession(session.id)">
-                <template #trigger>
-                  <n-button size="tiny" type="error" quaternary>删除</n-button>
-                </template>
-                确定删除该会话及其对话记录吗？
-              </n-popconfirm>
+              <div v-if="renamingId === session.id" class="session-rename">
+                <n-input
+                  v-model:value="renameDraft"
+                  size="small"
+                  placeholder="输入新的会话标题"
+                  :maxlength="60"
+                  @keyup.enter="submitRename(session)"
+                  @keyup.esc="cancelRename"
+                />
+                <div class="session-rename-actions">
+                  <n-button size="tiny" type="primary" :loading="renaming" @click="submitRename(session)">
+                    保存
+                  </n-button>
+                  <n-button size="tiny" quaternary :disabled="renaming" @click="cancelRename">
+                    取消
+                  </n-button>
+                </div>
+              </div>
+              <template v-else>
+                <button class="session-select" @click="selectSession(session)">
+                  <strong>{{ session.title || "未命名会话" }}</strong>
+                  <small class="mono">
+                    {{ session.updated_at ? new Date(session.updated_at).toLocaleString() : "时间未知" }}
+                  </small>
+                </button>
+                <n-button size="tiny" quaternary @click="startRename(session)">改名</n-button>
+                <n-popconfirm @positive-click="deleteSession(session.id)">
+                  <template #trigger>
+                    <n-button size="tiny" type="error" quaternary>删除</n-button>
+                  </template>
+                  确定删除该会话及其对话记录吗？
+                </n-popconfirm>
+              </template>
             </div>
           </div>
         </n-scrollbar>
@@ -155,6 +220,18 @@ onMounted(() => void loadSessions());
 
 .session-item.selected {
   background: var(--accent-soft);
+}
+
+.session-rename {
+  display: grid;
+  flex: 1;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.session-rename-actions {
+  display: flex;
+  gap: var(--space-1);
 }
 
 .session-select {

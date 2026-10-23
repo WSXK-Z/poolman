@@ -61,6 +61,7 @@ mod tests {
     use crate::extension::websocket::WebSocketBridge;
     use crate::providers::provider_control::ProviderControl;
     use crate::throttle::ChatFrequency;
+    use crate::workflow::{WorkflowGraphStore, WorkflowRunStore, WorkflowRuntime};
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use std::collections::HashMap;
@@ -91,11 +92,27 @@ mod tests {
             .await
             .expect("创建测试 Key 失败")
             .key;
+        let chat_router = Arc::new(ChatRouter::new(
+            Vec::new(),
+            Arc::new(ProviderControl::new(HashMap::new())),
+        ));
+        let run_store = Arc::new(
+            WorkflowRunStore::new(api_keys.db())
+                .await
+                .expect("初始化工作流运行表失败"),
+        );
+        let graph_store = Arc::new(WorkflowGraphStore::new(
+            db_path.with_extension("workflow.json"),
+        ));
+        let workflow_runtime = Arc::new(WorkflowRuntime::new(
+            chat_router.clone(),
+            graph_store,
+            run_store,
+            1,
+        ));
         let state = Arc::new(AppState {
-            chat_router: Arc::new(ChatRouter::new(
-                Vec::new(),
-                Arc::new(ProviderControl::new(HashMap::new())),
-            )),
+            chat_router,
+            workflow_runtime,
             bridge: Arc::new(WebSocketBridge::default()),
             credentials: Arc::new(CredentialStore::new()),
             config: ServerConfig {

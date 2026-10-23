@@ -11,6 +11,7 @@ mod providers;
 mod request_records;
 mod sessions;
 mod settings;
+mod workflow;
 
 use tauri::ipc::Invoke;
 
@@ -33,5 +34,6 @@ pub fn handler() -> impl Fn(Invoke<tauri::Wry>) -> bool + Send + Sync + 'static 
         providers::handler(),
         request_records::handler(),
         settings::handler(),
+        workflow::handler(),
     ]
 }

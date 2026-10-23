@@ -3,33 +3,47 @@
 //! 会话管理（创建 / 列表 / 删除 / 历史）与聊天请求组装、流式帧解析都在模型内部完成；
 //! 对外的请求发送与凭证读取经 [`ChannelExecutor`]（由传输层实现）。
 //!
-//! 历史管理与 DeepSeek 网页渠道一致：每轮把整段对话拼进 `prompt`，并要求模型只依据本次内容作答，
-//! 因此不依赖服务端会话里的历史。会话本身只作为请求的落点。
+//! 历史管理：有本地会话绑定时与远端会话一一对应，首次分段 bootstrap，后续只发新增内容；
+//! 没有绑定时沿用完整 prompt + 调用方会话 id 的兼容路径。
 //!
 //! 请求签名（`x-uskey`、`x-bus-params-md5` 等）由页面上下文生成，模型侧只填业务头。
 
 pub mod frame_processor;
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
 use futures_util::future::BoxFuture;
 use serde_json::{json, Value};
 use tracing::{debug, info, warn};
 
+use super::deepseek_web::chat_stream_processor::{ChatStreamProcessor, ToolSchemas};
 use super::defs::{
     ChannelExecutor, ChannelRequest, ChunkSink, Concurrency, InferRequest, ModelCapability,
-    ModelResponse,
+    ModelResponse, WebContextStore,
 };
 use super::model::Model;
 use super::plugin::PluginModel;
+use super::prompt;
+use super::web_context::text_hash;
 use super::yuanbao_web::frame_processor::YuanbaoFrameProcessor;
 use crate::apis::base::DeltaChunk;
 use crate::throttle::{ChatFrequency, ChatThrottle, DEFAULT_CHAT_INTERVAL_MS};
 
+/// bootstrap 单段最大字符数：元宝单条输入较保守。
+const BOOTSTRAP_SEGMENT_CHARS: usize = 6_000;
+
 /// 渠道标识。
 pub const CHANNEL: &str = "yuanbao-web";
+
+/// 专用的标题生成会话绑定 key。
+const TITLE_CONTEXT_KEY: &str = "__poolman_title__";
+/// 专用的摘要生成会话绑定 key。
+const SUMMARY_CONTEXT_KEY: &str = "__poolman_summary__";
+/// 专用会话的固定标题（元宝网页端不支持改名，仅保留名称供日志/未来使用）。
+const TITLE_SESSION_TITLE: &str = "poolman-标题生成";
+const SUMMARY_SESSION_TITLE: &str = "poolman-摘要生成";
 
 /// 对话接口前缀，后面接会话 id。
 const CHAT_URL_PREFIX: &str = "https://yuanbao.tencent.com/api/chat/";
@@ -47,6 +61,9 @@ const SESSION_DETAIL_URL: &str =
 
 /// 删除 / 清空会话。
 const SESSION_CLEAR_URL: &str = "https://yuanbao.tencent.com/api/user/agent/conversation/v1/clear";
+
+/// 修改会话标题。
+const SESSION_UPDATE_URL: &str = "https://yuanbao.tencent.com/api/user/agent/conversation/update";
 
 /// 网页端使用的智能体标识。
 const AGENT_ID: &str = "naQivTmsDa";
@@ -136,6 +153,10 @@ pub struct YuanbaoWebModel {
     executor: std::sync::Arc<dyn ChannelExecutor>,
     /// 调用方会话标识 → 网页会话 id：同一调用方复用同一网页会话，避免每轮新建。
     sessions: Mutex<HashMap<String, String>>,
+    /// 本地会话 ↔ 远端会话绑定。
+    web_context_store: Option<Arc<dyn WebContextStore>>,
+    /// 同一本地会话的请求串行化：远端网页会话不能并发使用。
+    bound_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 对话请求排队：网页端限制提问频率，间隔由桌面端「对话请求频率」决定。
     throttle: ChatThrottle,
 }
@@ -147,6 +168,8 @@ impl YuanbaoWebModel {
             display_name: display_name.into(),
             executor,
             sessions: Mutex::new(HashMap::new()),
+            web_context_store: None,
+            bound_locks: Mutex::new(HashMap::new()),
             throttle: ChatThrottle::new(ChatFrequency::in_memory(DEFAULT_CHAT_INTERVAL_MS)),
         }
     }
@@ -155,6 +178,21 @@ impl YuanbaoWebModel {
     pub fn with_chat_frequency(mut self, frequency: std::sync::Arc<ChatFrequency>) -> Self {
         self.throttle = frequency.throttle();
         self
+    }
+
+    /// 注入本地会话绑定存储：有绑定时按远端会话增量发送。
+    pub fn with_web_context_store(mut self, store: Arc<dyn WebContextStore>) -> Self {
+        self.web_context_store = Some(store);
+        self
+    }
+
+    /// 同一本地会话的串行锁。
+    fn context_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.bound_locks.lock().unwrap();
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     /// 把推理请求拼成渠道所需的 prompt（规则见 [`super::prompt`]）。
@@ -201,6 +239,61 @@ impl YuanbaoWebModel {
                 body,
                 body_base64: None,
                 session_key: None,
+            })
+            .await?;
+        if !response.ok {
+            anyhow::bail!(
+                "元宝网页请求失败（HTTP {}）：{}",
+                response.status,
+                response.body.chars().take(200).collect::<String>()
+            );
+        }
+        Ok(serde_json::from_str(&response.body).unwrap_or(Value::Null))
+    }
+
+    /// 会话管理类请求的头：`content-type` 是 JSON，`x-agentid` 指向具体会话。
+    ///
+    /// 网页端在会话级接口上把 `x-agentid` 写成 `{agentId}/{conversationId}`，
+    /// 创建 / 列表这类不针对具体会话的接口才只带 `{agentId}`；聊天接口的
+    /// `content-type` 是 `text/plain`，与这些 JSON 接口不同，因此不能直接复用
+    /// [`Self::default_headers`]。
+    fn session_headers(&self, session_id: &str) -> Vec<(String, String)> {
+        let mut headers: Vec<(String, String)> = self
+            .default_headers()
+            .into_iter()
+            .filter(|(name, _)| {
+                let name = name.to_ascii_lowercase();
+                name != "content-type" && name != "x-agentid"
+            })
+            .collect();
+        headers.push((
+            "content-type".to_string(),
+            "application/json".to_string(),
+        ));
+        headers.push((
+            "x-agentid".to_string(),
+            format!("{AGENT_ID}/{session_id}"),
+        ));
+        headers
+    }
+
+    /// 发送一次会话级请求并解析响应体为 JSON。
+    async fn send_session(
+        &self,
+        method: &str,
+        url: &str,
+        session_id: &str,
+        body: Option<String>,
+    ) -> Result<Value> {
+        let response = self
+            .executor
+            .execute(ChannelRequest {
+                url: url.to_string(),
+                method: method.to_string(),
+                headers: self.session_headers(session_id),
+                body,
+                body_base64: None,
+                session_key: Some(session_id.to_string()),
             })
             .await?;
         if !response.ok {
@@ -297,6 +390,23 @@ impl YuanbaoWebModel {
     /// 网页会话不可用时（创建失败、请求失败、回答为空）丢弃缓存并重试一次：
     /// 会话可能已在网页端被删除，沿用只会一直失败。
     async fn chat(&self, request: InferRequest, on_chunk: Option<ChunkSink>) -> Result<ModelResponse> {
+        if request.web_context_key.is_none()
+            && crate::request_record::detect_title_request(
+                &request.messages,
+                request.tools.as_ref(),
+            )
+            && self.web_context_store.is_some()
+        {
+            return self.chat_title(request, on_chunk).await;
+        }
+        if let (Some(key), Some(store)) = (
+            request.web_context_key.clone(),
+            self.web_context_store.clone(),
+        ) {
+            return self
+                .chat_bound(request, on_chunk, key, store)
+                .await;
+        }
         let prompt = Self::prompt_of(&request);
         let session_key = request.session_key.clone();
         // 增量出口只能取一次：首轮走流式，重试时退回整块收取，避免同一批内容向客户端重复推送。
@@ -317,11 +427,15 @@ impl YuanbaoWebModel {
             // guard 持有到本次尝试结束，drop 时才记下完成时刻。
             let _guard = self.throttle.wait().await;
             let result = match pending_sink.take() {
-                Some(sink) => self.stream_once(url, body, sink).await,
-                None => self.complete_once(url, body).await,
+                Some(sink) => self
+                    .stream_once(url, body, sink, request.tools.as_ref())
+                    .await,
+                None => self.complete_once(url, body, request.tools.as_ref()).await,
             };
             match result {
-                Ok(response) if !response.text.trim().is_empty() => return Ok(response),
+                Ok(response) if !response.text.trim().is_empty() || response.tool_calls.is_some() => {
+                    return Ok(response)
+                }
                 Ok(response) => {
                     warn!("元宝网页回答为空（第 {} 次），丢弃缓存会话后重试", attempt);
                     self.forget_session(session_key.as_deref());
@@ -349,12 +463,359 @@ impl YuanbaoWebModel {
         }
     }
 
-    /// 非流式：整块收取响应，按帧解析出正文与用量。
-    async fn complete_once(&self, url: String, body: String) -> Result<ModelResponse> {
+    /// 专用标题/摘要会话：长期复用，失败或过长时换新会话重试一次。
+    async fn run_auxiliary(
+        &self,
+        store: &Arc<dyn WebContextStore>,
+        key: &str,
+        _title: &str,
+        prompt: &str,
+    ) -> Result<String> {
+        let lock = self.context_lock(key);
+        let _guard = lock.lock().await;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut binding = store.load(CHANNEL, key).await?.unwrap_or_default();
+            binding.channel = CHANNEL.to_string();
+            binding.context_key = key.to_string();
+            if binding.remote_session_id.is_empty() {
+                binding.remote_session_id = self.create_session().await?;
+                binding.primed = true;
+            }
+            let url = format!("{CHAT_URL_PREFIX}{}", binding.remote_session_id);
+            let body = Self::completion_body(&binding.remote_session_id, prompt);
+            let _guard = self.throttle.wait().await;
+            match self.complete_once(url, body, None).await {
+                Ok(response)
+                    if !looks_like_context_limit(&response.text)
+                        && (!response.text.trim().is_empty() || response.tool_calls.is_some()) =>
+                {
+                    binding.approx_tokens += i64::from(crate::tokenizer::count(prompt))
+                        + i64::from(crate::tokenizer::count(&response.text));
+                    if let Err(error) = store.save(&binding).await {
+                        warn!("保存元宝专用会话绑定失败 key={} err={}", key, error);
+                    }
+                    return Ok(response.text);
+                }
+                Ok(response) => {
+                    warn!(
+                        "元宝专用会话不可用 key={} text_len={}",
+                        key,
+                        response.text.len()
+                    );
+                    if !binding.remote_session_id.is_empty() {
+                        let _ = self
+                            .delete_channel_session(&binding.remote_session_id)
+                            .await;
+                    }
+                    let _ = store.delete(CHANNEL, key).await;
+                    if attempts >= 2 {
+                        anyhow::bail!("专用会话未返回有效内容");
+                    }
+                }
+                Err(error) => {
+                    warn!("元宝专用会话失败 key={} err={}", key, error);
+                    if !binding.remote_session_id.is_empty() {
+                        let _ = self
+                            .delete_channel_session(&binding.remote_session_id)
+                            .await;
+                    }
+                    let _ = store.delete(CHANNEL, key).await;
+                    if attempts >= 2 {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 标题请求走专用标题会话，不再使用普通会话绑定。
+    async fn chat_title(
+        &self,
+        request: InferRequest,
+        on_chunk: Option<ChunkSink>,
+    ) -> Result<ModelResponse> {
+        let Some(store) = self.web_context_store.clone() else {
+            anyhow::bail!("标题会话缺少绑定存储");
+        };
+        let lock = self.context_lock(TITLE_CONTEXT_KEY);
+        let _guard = lock.lock().await;
+        let prompt = Self::prompt_of(&request);
+        let mut pending_sink = on_chunk;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut binding = store
+                .load(CHANNEL, TITLE_CONTEXT_KEY)
+                .await?
+                .unwrap_or_default();
+            binding.channel = CHANNEL.to_string();
+            binding.context_key = TITLE_CONTEXT_KEY.to_string();
+            if binding.remote_session_id.is_empty() {
+                binding.remote_session_id = self.create_session().await?;
+                binding.primed = true;
+            }
+            let url = format!("{CHAT_URL_PREFIX}{}", binding.remote_session_id);
+            let body = Self::completion_body(&binding.remote_session_id, &prompt);
+            let _guard = self.throttle.wait().await;
+            let result = match pending_sink.take() {
+                Some(sink) => self.stream_once(url, body, sink, None).await,
+                None => self.complete_once(url, body, None).await,
+            };
+            match result {
+                Ok(response)
+                    if !looks_like_context_limit(&response.text)
+                        && (!response.text.trim().is_empty() || response.tool_calls.is_some()) =>
+                {
+                    binding.approx_tokens +=
+                        i64::from(crate::tokenizer::count(&prompt))
+                            + i64::from(crate::tokenizer::count(&response.text));
+                    if let Err(error) = store.save(&binding).await {
+                        warn!("保存元宝标题会话绑定失败 err={}", error);
+                    }
+                    let _ = TITLE_SESSION_TITLE;
+                    return Ok(response);
+                }
+                Ok(response) => {
+                    warn!(
+                        "元宝标题会话不可用 text_len={}",
+                        response.text.len()
+                    );
+                    if !binding.remote_session_id.is_empty() {
+                        let _ = self
+                            .delete_channel_session(&binding.remote_session_id)
+                            .await;
+                    }
+                    let _ = store.delete(CHANNEL, TITLE_CONTEXT_KEY).await;
+                    if attempts >= 2 {
+                        anyhow::bail!("标题会话未返回有效内容");
+                    }
+                }
+                Err(error) => {
+                    if !binding.remote_session_id.is_empty() {
+                        let _ = self
+                            .delete_channel_session(&binding.remote_session_id)
+                            .await;
+                    }
+                    let _ = store.delete(CHANNEL, TITLE_CONTEXT_KEY).await;
+                    if attempts >= 2 {
+                        return Err(error);
+                    }
+                }
+            }
+        }
+    }
+
+    /// 上下文迁移前，用专用摘要会话压缩旧对话。
+    async fn summarize_for_migration(
+        &self,
+        request: &InferRequest,
+        store: &Arc<dyn WebContextStore>,
+        existing_summary: &str,
+    ) -> Result<String> {
+        let prompt = prompt::build_summary_prompt(request, existing_summary, 60);
+        self.run_auxiliary(
+            store,
+            SUMMARY_CONTEXT_KEY,
+            SUMMARY_SESSION_TITLE,
+            &prompt,
+        )
+        .await
+    }
+
+    /// 本地会话绑定远端会话：首次分段 bootstrap，后续只发新增内容。
+    async fn chat_bound(
+        &self,
+        request: InferRequest,
+        on_chunk: Option<ChunkSink>,
+        key: String,
+        store: Arc<dyn WebContextStore>,
+    ) -> Result<ModelResponse> {
+        let context_lock = self.context_lock(&key);
+        let _context_guard = context_lock.lock().await;
+        let system_text = request
+            .messages
+            .iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("system"))
+            .filter_map(|message| message.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let tools_text = request
+            .tools
+            .as_ref()
+            .filter(|value| !value.is_null())
+            .map(Value::to_string)
+            .unwrap_or_default();
+        let system_hash = text_hash(&system_text);
+        let tools_hash = text_hash(&tools_text);
+
+        let mut binding = store
+            .load(CHANNEL, &key)
+            .await?
+            .unwrap_or_default();
+        binding.channel = CHANNEL.to_string();
+        binding.context_key = key.clone();
+        // 静态上下文变了：旧远端会话不能再增量续用，重新初始化。
+        if !binding.remote_session_id.is_empty()
+            && binding.primed
+            && (binding.system_hash != system_hash || binding.tools_hash != tools_hash)
+        {
+            info!("元宝会话静态上下文变化，重建远端会话 key={}", key);
+            let _ = store.delete(CHANNEL, &key).await;
+            binding.remote_session_id.clear();
+            binding.primed = false;
+        }
+        binding.system_hash = system_hash;
+        binding.tools_hash = tools_hash;
+
+        let mut pending_sink = on_chunk;
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            let mut failed: Option<anyhow::Error> = None;
+            let conversation_id = if binding.remote_session_id.is_empty() {
+                let created = self.create_session().await?;
+                info!("元宝会话绑定创建远端会话 key={} remote={}", key, created);
+                binding.remote_session_id = created.clone();
+                binding.primed = false;
+                created
+            } else {
+                binding.remote_session_id.clone()
+            };
+            let url = format!("{CHAT_URL_PREFIX}{conversation_id}");
+
+            // 初始化段：只灌上下文，不要求回答（本轮提问由下面的提问轮单独发出）。
+            let mut bootstrapped = false;
+            if !binding.primed {
+                let segments = if binding.summary.trim().is_empty() {
+                    prompt::build_context_segments(&request, BOOTSTRAP_SEGMENT_CHARS)
+                } else {
+                    prompt::build_context_segments_with_summary(
+                        &request,
+                        &binding.summary,
+                        BOOTSTRAP_SEGMENT_CHARS,
+                    )
+                };
+                info!(
+                    "元宝会话 bootstrap key={} remote={} segments={}",
+                    key,
+                    conversation_id,
+                    segments.len()
+                );
+                for segment in segments.iter() {
+                    let body = Self::completion_body(&conversation_id, segment);
+                    let _guard = self.throttle.wait().await;
+                    // 初始化段不带工具：这些回答只是 OK，不解析 DSML。
+                    match self.complete_once(url.clone(), body, None).await {
+                        Ok(_) => {
+                            // 初始化段的回答（OK）只用于推进远端消息链，内容丢弃。
+                            binding.approx_tokens += tokens_of(segment);
+                        }
+                        Err(error) => {
+                            failed = Some(error);
+                            break;
+                        }
+                    }
+                }
+                if failed.is_none() {
+                    binding.primed = true;
+                    if let Err(error) = store.save(&binding).await {
+                        warn!("保存元宝会话绑定失败 key={} err={}", key, error);
+                    }
+                    bootstrapped = true;
+                }
+            }
+
+            // 提问轮：刚初始化完是首轮提问，之后是增量；两轮都带工具调用强调。
+            if failed.is_none() {
+                let text = if bootstrapped {
+                    prompt::build_question_prompt(&request)
+                } else {
+                    prompt::build_delta_prompt(&request)
+                };
+                info!(
+                    "元宝会话提问 key={} remote={} prompt_len={}",
+                    key,
+                    conversation_id,
+                    text.len()
+                );
+                let body = Self::completion_body(&conversation_id, &text);
+                let _guard = self.throttle.wait().await;
+                let result = match pending_sink.take() {
+                    Some(sink) => self
+                        .stream_once(url.clone(), body, sink, request.tools.as_ref())
+                        .await,
+                    None => self
+                        .complete_once(url.clone(), body, request.tools.as_ref())
+                        .await,
+                };
+                match result {
+                    Ok(response)
+                        if !response.text.trim().is_empty() || response.tool_calls.is_some() =>
+                    {
+                        binding.approx_tokens += tokens_of(&text);
+                        if let Err(error) = store.save(&binding).await {
+                            warn!("保存元宝会话绑定失败 key={} err={}", key, error);
+                        }
+                        return Ok(response);
+                    }
+                    Ok(response) => {
+                        failed = Some(anyhow::anyhow!("元宝网页回答为空"));
+                        let _ = response;
+                    }
+                    Err(error) => failed = Some(error),
+                }
+            }
+
+            if let Some(error) = failed {
+                warn!(
+                    "元宝绑定会话第 {} 次失败 key={} remote={} err={}",
+                    attempts, key, conversation_id, error
+                );
+                if attempts < 2 && looks_like_context_limit(&format!("{error:#}")) {
+                    let summary = match self
+                        .summarize_for_migration(&request, &store, &binding.summary)
+                        .await
+                    {
+                        Ok(summary) if !summary.trim().is_empty() => summary,
+                        _ if !binding.summary.trim().is_empty() => binding.summary.clone(),
+                        _ => "（摘要生成失败，旧历史未保留）".to_string(),
+                    };
+                    binding.summary = summary;
+                }
+                if !binding.remote_session_id.is_empty() {
+                    let _ = self
+                        .delete_channel_session(&binding.remote_session_id)
+                        .await;
+                }
+                let _ = store.delete(CHANNEL, &key).await;
+                binding.remote_session_id.clear();
+                binding.primed = false;
+                binding.approx_tokens = 0;
+                if attempts >= 2 {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// 非流式：整块收取响应，按帧解析出正文、用量与工具调用。
+    ///
+    /// 帧处理器只负责把 `data:` 行还原成正文；正文再交给 [`ChatStreamProcessor`]
+    /// 识别 DSML 调用——网页端没有原生工具调用，调用只能靠解析标记得到。
+    async fn complete_once(
+        &self,
+        url: String,
+        body: String,
+        tools: Option<&Value>,
+    ) -> Result<ModelResponse> {
+        let recognize_tools = tools_recognized(tools);
+        let schemas = ToolSchemas::from_tools(tools);
         let response = self
             .executor
             .execute(ChannelRequest {
-                url,
+                url: url.clone(),
                 method: "POST".to_string(),
                 headers: self.default_headers(),
                 body: Some(body),
@@ -365,23 +826,60 @@ impl YuanbaoWebModel {
         if !response.ok {
             anyhow::bail!("元宝网页推理失败（HTTP {}）", response.status);
         }
-        let mut processor = YuanbaoFrameProcessor::new();
-        processor.feed(&response.body);
-        processor.finish();
-        if let Some(message) = processor.upstream_error() {
+        let mut frames = YuanbaoFrameProcessor::new();
+        frames.feed(&response.body);
+        frames.finish();
+        if let Some(message) = frames.upstream_error() {
             return Err(anyhow::Error::new(UpstreamFailure(message.to_string())));
         }
-        let parsed = to_model_response(&processor);
-        if parsed.text.trim().is_empty() {
+
+        let mut chat = ChatStreamProcessor::new(Box::new(|_| {}), recognize_tools)
+            .with_tool_schemas(schemas.clone());
+        chat.feed([(
+            DeltaChunk::RESPONSE.to_string(),
+            frames.text().to_string(),
+        )]);
+        chat.finish();
+
+        let mut parsed = to_model_response(&frames, &chat);
+        if let Some((broken, reason)) = failure_of(&chat) {
+            if let Some(calls) = self
+                .repair_calls(&url, tools, &broken, &reason, &schemas)
+                .await
+            {
+                parsed.tool_calls = Some(Value::Array(calls));
+                parsed.finish_reason = Some("tool_calls".to_string());
+            }
+        }
+        if parsed.text.trim().is_empty() && parsed.tool_calls.is_none() {
             // 空回答时留下上游原文：否则「请求走完了但客户端什么都没有」无从排查
             warn!("元宝网页回答为空，原始响应：{}", head_chars(&response.body));
         }
         Ok(parsed)
     }
 
-    /// 流式：原始增量交给帧处理器，正文增量经 `sink` 实时送出。
-    async fn stream_once(&self, url: String, body: String, sink: ChunkSink) -> Result<ModelResponse> {
-        let shared = std::sync::Arc::new(Mutex::new((YuanbaoFrameProcessor::new(), sink)));
+    /// 流式：原始增量交给帧处理器，正文增量经 [`ChatStreamProcessor`] 过滤后实时送出。
+    ///
+    /// DSML 标记不会流到客户端：处理器把正文与调用分开，调用在收尾时一次性送出。
+    async fn stream_once(
+        &self,
+        url: String,
+        body: String,
+        sink: ChunkSink,
+        tools: Option<&Value>,
+    ) -> Result<ModelResponse> {
+        let recognize_tools = tools_recognized(tools);
+        let schemas = ToolSchemas::from_tools(tools);
+        // 出口只能移动一次：先放进共享单元，修复轮需要时再取一个代理。
+        let sink_cell = std::sync::Arc::new(Mutex::new(Some(sink)));
+        let shared = std::sync::Arc::new(Mutex::new((
+            YuanbaoFrameProcessor::new(),
+            ChatStreamProcessor::new(
+                forwarding_sink(&sink_cell).expect("出口刚放入，必然可取"),
+                recognize_tools,
+            )
+            .with_tool_schemas(schemas.clone()),
+        )));
         let feeder = shared.clone();
         // 流式响应体不随结果回传，留一段原文给空回答排查。
         let raw_head = std::sync::Arc::new(Mutex::new(String::new()));
@@ -390,7 +888,7 @@ impl YuanbaoWebModel {
             .executor
             .execute_stream(
                 ChannelRequest {
-                    url,
+                    url: url.clone(),
                     method: "POST".to_string(),
                     headers: self.default_headers(),
                     body: Some(body),
@@ -406,10 +904,10 @@ impl YuanbaoWebModel {
                     let Ok(mut guard) = feeder.lock() else {
                         return;
                     };
-                    let (processor, sink) = &mut *guard;
-                    let delta = processor.feed(&raw);
+                    let (frames, chat) = &mut *guard;
+                    let delta = frames.feed(&raw);
                     if !delta.is_empty() {
-                        emit_delta(sink, DeltaChunk::RESPONSE, json!(delta));
+                        chat.feed([(DeltaChunk::RESPONSE.to_string(), delta)]);
                     }
                 }),
             )
@@ -417,22 +915,109 @@ impl YuanbaoWebModel {
         if !response.ok {
             anyhow::bail!("元宝网页推理失败（HTTP {}）", response.status);
         }
-        let Ok(mut guard) = shared.lock() else {
-            anyhow::bail!("流式处理器锁不可用");
+
+        let (mut parsed, failure) = {
+            let Ok(mut guard) = shared.lock() else {
+                anyhow::bail!("流式处理器锁不可用");
+            };
+            let (frames, chat) = &mut *guard;
+            let tail = frames.finish();
+            if !tail.is_empty() {
+                chat.feed([(DeltaChunk::RESPONSE.to_string(), tail)]);
+            }
+            chat.finish();
+            if let Some(message) = frames.upstream_error() {
+                return Err(anyhow::Error::new(UpstreamFailure(message.to_string())));
+            }
+            (to_model_response(frames, chat), failure_of(chat))
         };
-        let (processor, sink) = &mut *guard;
-        let tail = processor.finish();
-        if !tail.is_empty() {
-            emit_delta(sink, DeltaChunk::RESPONSE, json!(tail));
+
+        // 解析失败：用规范化提示词再问一轮（持锁会跨 await，所以放到锁外）。
+        if let Some((broken, reason)) = failure {
+            if let Some(calls) = self
+                .repair_calls(&url, tools, &broken, &reason, &schemas)
+                .await
+            {
+                if let Some(mut sink) = forwarding_sink(&sink_cell) {
+                    emit_delta(&mut sink, DeltaChunk::FUNCTIONS, Value::Array(calls.clone()));
+                }
+                parsed.tool_calls = Some(Value::Array(calls));
+                parsed.finish_reason = Some("tool_calls".to_string());
+            }
         }
-        if let Some(message) = processor.upstream_error() {
-            return Err(anyhow::Error::new(UpstreamFailure(message.to_string())));
-        }
-        let parsed = to_model_response(processor);
-        if parsed.text.trim().is_empty() {
-            warn!("元宝网页回答为空，原始响应：{}", head_chars(&*raw_head.lock().unwrap()));
+
+        if parsed.text.trim().is_empty() && parsed.tool_calls.is_none() {
+            warn!(
+                "元宝网页回答为空，原始响应：{}",
+                head_chars(&*raw_head.lock().unwrap())
+            );
         }
         Ok(parsed)
+    }
+
+    /// 修复轮：把解析失败的坏块交给规范化提示词重写，取回可解析的工具调用。
+    ///
+    /// 与正文分开走一次非流式请求：修复只需要一个调用块，不需要再流式回吐。
+    async fn repair_calls(
+        &self,
+        url: &str,
+        tools: Option<&Value>,
+        broken: &str,
+        reason: &str,
+        schemas: &ToolSchemas,
+    ) -> Option<Vec<Value>> {
+        let conversation_id = url.rsplit('/').next().unwrap_or_default();
+        if conversation_id.is_empty() {
+            return None;
+        }
+        let repair_prompt = prompt::repair_prompt(tools, broken, reason);
+        info!(
+            "元宝工具调用解析失败，发起修复重写 reason={} prompt_len={}",
+            reason,
+            repair_prompt.len()
+        );
+        let body = Self::completion_body(conversation_id, &repair_prompt);
+        let _guard = self.throttle.wait().await;
+        let response = match self
+            .executor
+            .execute(ChannelRequest {
+                url: url.to_string(),
+                method: "POST".to_string(),
+                headers: self.default_headers(),
+                body: Some(body),
+                body_base64: None,
+                session_key: None,
+            })
+            .await
+        {
+            Ok(response) if response.ok => response,
+            Ok(response) => {
+                warn!("元宝工具调用修复请求失败（HTTP {}）", response.status);
+                return None;
+            }
+            Err(error) => {
+                warn!("元宝工具调用修复请求失败：{}", error);
+                return None;
+            }
+        };
+
+        let mut frames = YuanbaoFrameProcessor::new();
+        frames.feed(&response.body);
+        frames.finish();
+        let mut chat =
+            ChatStreamProcessor::new(Box::new(|_| {}), true).with_tool_schemas(schemas.clone());
+        chat.feed([(
+            DeltaChunk::RESPONSE.to_string(),
+            frames.text().to_string(),
+        )]);
+        chat.finish();
+        let calls = chat.tool_calls();
+        if calls.is_empty() {
+            warn!("元宝工具调用修复轮没有产出可解析的调用");
+            None
+        } else {
+            Some(calls.to_vec())
+        }
     }
 }
 
@@ -492,11 +1077,22 @@ impl PluginModel for YuanbaoWebModel {
 
     fn rename_channel_session<'a>(
         &'a self,
-        _session_id: &'a str,
-        _title: &'a str,
+        session_id: &'a str,
+        title: &'a str,
     ) -> BoxFuture<'a, Result<bool>> {
-        // 网页端没有独立的改名接口；标题由首轮提问自动生成。
-        Box::pin(async { Ok(false) })
+        Box::pin(async move {
+            let title = title.trim();
+            // 空标题在网页端等于「清空标题」，请求本身会被接受，因此在这里就挡掉。
+            if title.is_empty() {
+                warn!("设置元宝会话标题失败：标题为空 session={}", session_id);
+                return Ok(false);
+            }
+            let body = json!({ "conversationId": session_id, "title": title }).to_string();
+            let json = self
+                .send_session("POST", SESSION_UPDATE_URL, session_id, Some(body))
+                .await?;
+            Ok(is_biz_ok(&json))
+        })
     }
 
     fn channel_history<'a>(&'a self, session_id: &'a str) -> BoxFuture<'a, Result<Value>> {
@@ -565,36 +1161,103 @@ fn is_biz_ok(json: &Value) -> bool {
 }
 
 /// 取正文开头一小段（按字符截断，避免切坏 UTF-8）。
+fn tokens_of(text: &str) -> i64 {
+    i64::from(crate::tokenizer::count(text))
+}
+
+fn looks_like_context_limit(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "上下文",
+        "长度",
+        "过长",
+        "轮数",
+        "context length",
+        "context_length",
+        "too long",
+    ]
+    .iter()
+    .any(|keyword| lower.contains(keyword))
+}
+
 fn head_chars(text: &str) -> String {
     text.chars().take(RAW_HEAD_CHARS).collect()
 }
 
-/// 帧处理器 → 模型响应。
-fn to_model_response(processor: &YuanbaoFrameProcessor) -> ModelResponse {
-    let text = processor.text().to_string();
-    let usage = processor.token_usage().map(|usage| {
+/// 帧处理器 + 增量处理器 → 模型响应。
+///
+/// 正文与工具调用都取自 [`ChatStreamProcessor`]（它已把 DSML 标记从正文里剔掉），
+/// 用量与结束原因来自帧处理器的收尾帧。
+fn to_model_response(frames: &YuanbaoFrameProcessor, chat: &ChatStreamProcessor) -> ModelResponse {
+    let usage = frames.token_usage().map(|usage| {
         json!({
             "prompt_tokens": usage.prompt_tokens,
             "completion_tokens": usage.completion_tokens,
             "total_tokens": usage.total_tokens,
         })
     });
-    let finish_reason = match processor.stop_reason() {
-        Some(reason) => reason.to_string(),
-        None if processor.is_finished() => "stop".to_string(),
-        None => "stop".to_string(),
+    let calls = chat.tool_calls();
+    let tool_calls = if calls.is_empty() {
+        None
+    } else {
+        Some(Value::Array(calls.to_vec()))
     };
-    if let Some(message_id) = processor.message_id() {
+    let finish_reason = if tool_calls.is_some() {
+        "tool_calls".to_string()
+    } else {
+        frames
+            .stop_reason()
+            .map(str::to_string)
+            .unwrap_or_else(|| "stop".to_string())
+    };
+    if let Some(message_id) = frames.message_id() {
         debug!("元宝网页回答 message_id={}", message_id);
     }
+    let reasoning = chat.reasoning();
     ModelResponse {
-        text,
-        reasoning: None,
-        tool_calls: None,
+        text: chat.text().to_string(),
+        reasoning: if reasoning.trim().is_empty() {
+            None
+        } else {
+            Some(reasoning.to_string())
+        },
+        tool_calls,
         usage,
         finish_reason: Some(finish_reason),
         is_complete: true,
     }
+}
+
+/// 请求是否要求识别工具调用：只有确实带了工具定义才解析 DSML。
+fn tools_recognized(tools: Option<&Value>) -> bool {
+    tools
+        .and_then(Value::as_array)
+        .is_some_and(|items| !items.is_empty())
+}
+
+/// 解析失败时的坏块原文与原因；没有失败返回 None。
+fn failure_of(chat: &ChatStreamProcessor) -> Option<(String, String)> {
+    let broken = chat.parse_failure()?.to_string();
+    let reason = chat
+        .failure_reason()
+        .unwrap_or("块内标签序列无法判定")
+        .to_string();
+    Some((broken, reason))
+}
+
+/// 取一个把增量转发到同一个出口的代理；出口已被取走时返回 None。
+fn forwarding_sink(cell: &Arc<Mutex<Option<ChunkSink>>>) -> Option<ChunkSink> {
+    if !cell.lock().map(|guard| guard.is_some()).unwrap_or(false) {
+        return None;
+    }
+    let cell = cell.clone();
+    Some(Box::new(move |delta: String| {
+        if let Ok(mut guard) = cell.lock() {
+            if let Some(sink) = guard.as_mut() {
+                sink(delta);
+            }
+        }
+    }))
 }
 
 /// 出站一条单键增量（与 [`DeltaChunk`] 的增量同格式：`{"键":值}`）。
@@ -608,6 +1271,7 @@ fn emit_delta(sink: &mut ChunkSink, key: &str, value: Value) {
 mod tests {
     use super::*;
     use crate::models::defs::ChannelResponse;
+    use crate::models::web_context::DbWebContextStore;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
 
@@ -709,6 +1373,52 @@ mod tests {
         .to_string()
     }
 
+    /// 一条真实的元宝工具调用标记（取自安装目录的请求记录）。
+    fn dsml_markup() -> String {
+        [
+            "<｜｜DSML｜｜ calls>",
+            "<｜｜DSML｜｜ invoke name=\"glob\">",
+            "<｜｜DSML｜｜ parameter name=\"pattern\" string=\"true\">**/*</｜｜DSML｜｜ parameter>",
+            "</｜｜DSML｜｜ invoke>",
+            "</｜｜DSML｜｜ calls>",
+        ]
+        .join("\n")
+    }
+
+    /// 带 DSML 调用的流式响应体。
+    fn dsml_stream() -> String {
+        let frames = [
+            json!({ "type": "text" }),
+            json!({ "type": "text", "msg": dsml_markup() }),
+            json!({ "type": "meta", "messageId": "m1", "stopReason": "stop" }),
+        ];
+        let mut body = String::new();
+        for frame in frames {
+            body.push_str("data: ");
+            body.push_str(&frame.to_string());
+            body.push_str("\n\n");
+        }
+        body.push_str("data: [DONE]\n\n");
+        body
+    }
+
+    /// 带工具定义的请求：只有一个 `glob` 工具。
+    fn request_with_tools() -> InferRequest {
+        let mut request = request(Some("caller"));
+        request.tools = Some(json!([{
+            "type": "function",
+            "function": {
+                "name": "glob",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "pattern": { "type": "string" } },
+                    "required": ["pattern"]
+                }
+            }
+        }]));
+        request
+    }
+
     fn model(executor: Arc<MockExecutor>) -> YuanbaoWebModel {
         YuanbaoWebModel::new("腾讯元宝", executor as Arc<dyn ChannelExecutor>)
     }
@@ -720,6 +1430,179 @@ mod tests {
         );
         request.session_key = session_key.map(str::to_string);
         request
+    }
+
+    #[tokio::test]
+    async fn bound_session_splits_large_bootstrap() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-yuanbao-large-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let mut responses = vec![create_body(CONV)];
+        for _ in 0..12 {
+            responses.push(completion_stream());
+        }
+        let executor = Arc::new(MockExecutor::new(responses));
+        let model = YuanbaoWebModel::new("腾讯元宝", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+        let mut request = InferRequest::new(
+            CHANNEL,
+            vec![
+                json!({ "role": "system", "content": "系统提示词".repeat(5_000) }),
+                json!({ "role": "user", "content": "最新问题" }),
+            ],
+        );
+        request.web_context_key = Some("yb_sess_large".to_string());
+        model.infer(request).await.expect("大 bootstrap 应成功");
+
+        let bodies = completion_prompts(&executor);
+        assert!(bodies.len() > 2, "bootstrap 应拆成多段");
+        for prompt in &bodies[..bodies.len() - 1] {
+            assert!(prompt.contains("不要回答"));
+            assert!(!prompt.contains("最新问题"), "初始化段不应带本轮提问");
+            assert!(prompt.chars().count() <= 6_300);
+        }
+        let last = bodies.last().unwrap();
+        assert!(last.contains("请回答本轮提问"));
+        assert!(last.contains("最新问题"));
+        assert!(last.chars().count() <= 6_300);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn title_requests_reuse_dedicated_session() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-yuanbao-title-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = Arc::new(MockExecutor::new(vec![
+            create_body(CONV),
+            completion_stream(),
+            completion_stream(),
+        ]));
+        let model = YuanbaoWebModel::new("腾讯元宝", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+        for _ in 0..2 {
+            let mut request = InferRequest::new(
+                CHANNEL,
+                vec![
+                    json!({
+                        "role": "system",
+                        "content": "Create a concise title for an AI coding-assistant session."
+                    }),
+                    json!({
+                        "role": "user",
+                        "content": "Generate the session title from this JSON array of human messages: []"
+                    }),
+                ],
+            );
+            request.api_key = Some("sk-test".to_string());
+            model.infer(request).await.expect("标题请求应成功");
+        }
+        let creates = executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.contains("/conversation/create"))
+            .count();
+        assert_eq!(creates, 1, "元宝标题会话应长期复用");
+        assert_eq!(completion_prompts(&executor).len(), 2);
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn bound_session_bootstraps_once_then_sends_delta() {
+        let path = std::env::temp_dir().join(format!(
+            "poolman-yuanbao-bound-{}.db",
+            uuid::Uuid::new_v4()
+        ));
+        let url = format!("sqlite://{}?mode=rwc", path.to_string_lossy());
+        let db = sea_orm::Database::connect(&url)
+            .await
+            .expect("初始化测试数据库失败");
+        let store = Arc::new(
+            DbWebContextStore::new(db)
+                .await
+                .expect("初始化绑定表失败"),
+        );
+        let executor = Arc::new(MockExecutor::new(vec![
+            create_body(CONV),
+            completion_stream(),
+            completion_stream(),
+            completion_stream(),
+        ]));
+        let model = YuanbaoWebModel::new("腾讯元宝", executor.clone() as Arc<dyn ChannelExecutor>)
+            .with_web_context_store(store);
+
+        let mut first = request(None);
+        first.web_context_key = Some("yb_sess_test".to_string());
+        let first_response = model.infer(first).await.expect("首次请求应成功");
+        let bodies = completion_prompts(&executor);
+        assert_eq!(bodies.len(), 2, "首次绑定会话：初始化一轮 + 提问一轮");
+        assert!(bodies[0].contains("初始化完成"), "{}", bodies[0]);
+        assert!(
+            !bodies[0].contains("你好"),
+            "初始化段不应带本轮提问：{}",
+            bodies[0]
+        );
+        assert!(bodies[1].contains("请回答本轮提问"), "{}", bodies[1]);
+        assert!(bodies[1].contains("你好"));
+
+        let mut second = InferRequest::new(
+            CHANNEL,
+            vec![
+                json!({ "role": "user", "content": "你好" }),
+                json!({ "role": "assistant", "content": first_response.text }),
+                json!({ "role": "user", "content": "第二问" }),
+            ],
+        );
+        second.web_context_key = Some("yb_sess_test".to_string());
+        model.infer(second).await.expect("后续请求应成功");
+        let bodies = completion_prompts(&executor);
+        assert_eq!(bodies.len(), 3);
+        assert!(bodies[2].contains("继续上一轮对话"));
+        assert!(bodies[2].contains("第二问"));
+        assert!(!bodies[2].contains("你好"), "后续不应重发历史");
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    fn completion_prompts(executor: &Arc<MockExecutor>) -> Vec<String> {
+        executor
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request.url.contains("/api/chat/"))
+            .filter_map(|request| {
+                request
+                    .body
+                    .as_deref()
+                    .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                    .and_then(|body| body.get("prompt").and_then(Value::as_str).map(String::from))
+            })
+            .collect()
     }
 
     /// 非流式：先建会话，再按会话 id 发对话请求，正文与用量都取到。
@@ -856,6 +1739,143 @@ mod tests {
         ]));
         let ok = model(executor).delete_channel_session(CONV).await.unwrap();
         assert!(ok);
+    }
+
+    /// 改名：走会话级接口，带 JSON 头与会话级 `x-agentid`，正文是会话 id + 新标题。
+    #[tokio::test]
+    async fn renames_session_via_session_endpoint() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            json!({ "data": { "biz_code": 0 } }).to_string()
+        ]));
+        let ok = model(executor.clone())
+            .rename_channel_session(CONV, "  新标题  ")
+            .await
+            .unwrap();
+        assert!(ok);
+
+        let requests = executor.requests.lock().unwrap();
+        let request = requests.first().expect("应发出一次请求");
+        assert_eq!(request.method, "POST");
+        assert_eq!(request.url, SESSION_UPDATE_URL);
+        assert_eq!(request.session_key.as_deref(), Some(CONV));
+
+        let header = |name: &str| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key.eq_ignore_ascii_case(name))
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(header("content-type"), Some("application/json"));
+        assert_eq!(header("x-agentid"), Some(format!("{AGENT_ID}/{CONV}").as_str()));
+        assert_eq!(
+            header("x-agentid").map(|value| value.matches('/').count()),
+            Some(1),
+            "会话级 x-agentid 只能是 agentId/conversationId 两段"
+        );
+
+        let body: Value =
+            serde_json::from_str(request.body.as_deref().unwrap()).expect("请求体应为 JSON");
+        assert_eq!(body["conversationId"], json!(CONV));
+        assert_eq!(body["title"], json!("新标题"), "标题应去掉首尾空白");
+    }
+
+    /// 空标题直接拒绝，不发请求（网页端会把它当成清空标题）。
+    #[tokio::test]
+    async fn rejects_blank_session_title() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            json!({ "data": { "biz_code": 0 } }).to_string()
+        ]));
+        let ok = model(executor.clone())
+            .rename_channel_session(CONV, "   ")
+            .await
+            .unwrap();
+        assert!(!ok);
+        assert!(executor.requests.lock().unwrap().is_empty(), "空标题不应发请求");
+    }
+
+    /// 业务失败码要透传成 `false`，便于命令层报错。
+    #[tokio::test]
+    async fn rename_reports_business_failure() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            json!({ "data": { "biz_code": 1001 } }).to_string()
+        ]));
+        let ok = model(executor)
+            .rename_channel_session(CONV, "新标题")
+            .await
+            .unwrap();
+        assert!(!ok);
+    }
+
+    /// 非流式：DSML 调用解析成 tool_calls，正文里不留标记。
+    #[tokio::test]
+    async fn parses_dsml_tool_calls_from_stream() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            create_body(CONV),
+            dsml_stream(),
+        ]));
+        let response = model(executor)
+            .infer(request_with_tools())
+            .await
+            .expect("应成功");
+
+        let calls = response.tool_calls.expect("应解析出工具调用");
+        let array = calls.as_array().expect("tool_calls 是数组");
+        assert_eq!(array.len(), 1, "{calls}");
+        assert_eq!(array[0]["function"]["name"], json!("glob"));
+        assert_eq!(array[0]["function"]["arguments"], json!("{\"pattern\":\"**/*\"}"));
+        assert!(
+            response.text.trim().is_empty(),
+            "标记不应留在正文：{}",
+            response.text
+        );
+        assert_eq!(response.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    /// 请求没带工具时，同样的标记按普通正文返回（保持旧行为）。
+    #[tokio::test]
+    async fn keeps_dsml_as_text_without_tools() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            create_body(CONV),
+            dsml_stream(),
+        ]));
+        let response = model(executor).infer(request(Some("caller"))).await.expect("应成功");
+        assert!(response.tool_calls.is_none());
+        assert!(
+            response.text.contains("DSML"),
+            "不带工具时标记原样返回：{}",
+            response.text
+        );
+    }
+
+    /// 流式：标记不外泄给客户端，工具调用单独作为 FUNCTIONS 增量送出。
+    #[tokio::test]
+    async fn streams_tool_calls_without_leaking_markup() {
+        let executor = Arc::new(MockExecutor::new(vec![
+            create_body(CONV),
+            dsml_stream(),
+        ]));
+        let deltas = Arc::new(Mutex::new(Vec::<String>::new()));
+        let collected = deltas.clone();
+        let sink: ChunkSink = Box::new(move |delta: String| {
+            collected.lock().unwrap().push(delta);
+        });
+        let model = model(executor);
+        let response = model
+            .infer_stream(request_with_tools(), sink)
+            .await
+            .expect("应成功");
+
+        let deltas = deltas.lock().unwrap();
+        assert!(
+            !deltas.iter().any(|delta| delta.contains("DSML")),
+            "DSML 标记不应流给客户端：{deltas:?}"
+        );
+        assert!(
+            deltas.iter().any(|delta| delta.contains("FUNCTIONS")),
+            "工具调用应作为 FUNCTIONS 增量送出：{deltas:?}"
+        );
+        assert!(response.tool_calls.is_some());
     }
 
     /// 历史拼装与公共实现逐字一致。

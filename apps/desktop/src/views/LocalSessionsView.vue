@@ -266,7 +266,7 @@ onMounted(() => void loadSessions());
                   删除选中
                 </n-button>
               </template>
-              确定删除选中的 {{ selectedIds.length }} 个会话吗？请求记录会保留，但不再参与会话归并。
+              确定删除选中的 {{ selectedIds.length }} 个会话吗？对应远端网页会话会一并删除；请求记录会保留，不再参与会话归并。
             </n-popconfirm>
           </div>
         </div>
@@ -290,7 +290,7 @@ onMounted(() => void loadSessions());
                 <template #trigger>
                   <n-button size="tiny" type="error" quaternary :loading="deleting">删除</n-button>
                 </template>
-                确定删除该会话吗？请求记录会保留，但不再参与会话归并。
+                确定删除该会话吗？对应远端网页会话会一并删除；请求记录会保留，不再参与会话归并。
               </n-popconfirm>
             </div>
           </div>
@@ -309,7 +309,7 @@ onMounted(() => void loadSessions());
                   删除会话
                 </n-button>
               </template>
-              确定删除该会话吗？请求记录会保留，但不再参与会话归并。
+              确定删除该会话吗？对应远端网页会话会一并删除；请求记录会保留，不再参与会话归并。
             </n-popconfirm>
           </div>
 

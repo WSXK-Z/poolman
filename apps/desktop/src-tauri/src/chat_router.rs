@@ -52,7 +52,7 @@ pub struct RouteDecision {
 }
 
 /// 一次请求的待落库快照：记录库未注入时为 None。
-type PendingRecord = Option<(Arc<RequestRecordStore>, RequestRecordDraft)>;
+pub(crate) type PendingRecord = Option<(Arc<RequestRecordStore>, RequestRecordDraft)>;
 
 pub struct ChatRouter {
     /// 供应商注册表：模型名 → 供应商。
@@ -93,11 +93,91 @@ impl ChatRouter {
         self
     }
 
+    /// 删除网页渠道的远端会话；渠道模型未实例化时返回错误。
+    pub async fn delete_remote_session(
+        &self,
+        channel: &str,
+        session_id: &str,
+    ) -> Result<bool> {
+        let model = self
+            .plugin
+            .channel(channel)
+            .ok_or_else(|| anyhow::anyhow!("渠道 {channel} 未实例化，无法删除远端会话"))?;
+        model.delete_channel_session(session_id).await
+    }
+
+    /// 修改网页渠道的远端会话标题；渠道模型未实例化时返回错误。
+    pub async fn rename_remote_session(
+        &self,
+        channel: &str,
+        session_id: &str,
+        title: &str,
+    ) -> Result<bool> {
+        let model = self
+            .plugin
+            .channel(channel)
+            .ok_or_else(|| anyhow::anyhow!("渠道 {channel} 未实例化，无法修改远端会话标题"))?;
+        model.rename_channel_session(session_id, title).await
+    }
+
     /// 在请求交给渠道前拍快照；未注入记录库时返回 None。
-    fn begin_record(&self, request: &InferRequest, meta: &RequestMeta) -> PendingRecord {
+    pub(crate) fn begin_record(&self, request: &InferRequest, meta: &RequestMeta) -> PendingRecord {
         self.request_records
             .as_ref()
             .map(|store| (store.clone(), RequestRecordDraft::from_request(request, meta)))
+    }
+
+    /// 工作流节点用：决定本地会话。
+    pub(crate) async fn plan_session_for(&self, request: &InferRequest) -> Option<SessionPlan> {
+        self.begin_session_plan(request).await
+    }
+
+    /// 工作流节点用：路由（不直接执行）。
+    pub(crate) fn resolve_route_for(&self, request: &InferRequest) -> Result<RouteDecision> {
+        self.route(&Self::route_request(request))
+    }
+
+    /// 工作流节点用：只把请求交给渠道，不处理会话标记。
+    pub(crate) async fn dispatch_channel(
+        &self,
+        request: InferRequest,
+        decision: Result<RouteDecision>,
+        on_chunk: Option<Box<dyn FnMut(String) + Send + Sync>>,
+    ) -> Result<ModelResponse> {
+        let decision = decision?;
+        info!(
+            "工作流渠道发送: model={} channel={} provider={} stream={}",
+            decision.model,
+            decision.channel,
+            decision.provider,
+            on_chunk.is_some()
+        );
+        match on_chunk {
+            Some(sink) => {
+                self.registry
+                    .chat_completions_stream(request, sink)
+                    .await
+            }
+            None => self.registry.chat_completions(request).await,
+        }
+    }
+
+    /// 工作流节点用：会话、请求记录、内容表收尾。
+    pub(crate) async fn finish_prepared(
+        &self,
+        pending: PendingRecord,
+        session_plan: Option<SessionPlan>,
+        result: &Result<ModelResponse>,
+    ) {
+        let answer = Self::session_answer(result);
+        Self::finish_record(
+            pending,
+            self.local_sessions.clone(),
+            session_plan,
+            answer,
+            result,
+        )
+        .await;
     }
 
     /// 请求交给渠道前决定本地会话；未注入会话库或查询失败时返回 None。
@@ -162,7 +242,7 @@ impl ChatRouter {
     }
 
     /// 新会话标记写入回复正文最前面。
-    fn prepend_marker(text: &str, marker: &str) -> String {
+    pub(crate) fn prepend_marker(text: &str, marker: &str) -> String {
         if text.starts_with(marker) {
             text.to_string()
         } else if text.is_empty() {
@@ -173,7 +253,7 @@ impl ChatRouter {
     }
 
     /// 流式输出前先送出标记增量，客户端随后会把它作为助手内容放回历史。
-    fn marker_frame(marker: &str) -> String {
+    pub(crate) fn marker_frame(marker: &str) -> String {
         json!({ DeltaChunk::RESPONSE: format!("{marker}\n\n") }).to_string()
     }
 
@@ -281,6 +361,7 @@ impl ChatRouter {
         request: InferRequest,
         meta: RequestMeta,
     ) -> Result<ModelResponse> {
+        let mut request = request;
         let title_request = crate::request_record::detect_title_request(
             &request.messages,
             request.tools.as_ref(),
@@ -290,6 +371,9 @@ impl ChatRouter {
         } else {
             self.begin_session_plan(&request).await
         };
+        if let Some(plan) = &session_plan {
+            request.web_context_key = Some(plan.session_id.clone());
+        }
         let marker = session_plan.as_ref().and_then(|plan| plan.marker.clone());
         let pending = self.begin_record(&request, &meta);
         let request_id = pending
@@ -329,6 +413,7 @@ impl ChatRouter {
         meta: RequestMeta,
         on_chunk: Box<dyn FnMut(String) + Send + Sync>,
     ) -> Result<ModelResponse> {
+        let mut request = request;
         let title_request = crate::request_record::detect_title_request(
             &request.messages,
             request.tools.as_ref(),
@@ -338,6 +423,9 @@ impl ChatRouter {
         } else {
             self.begin_session_plan(&request).await
         };
+        if let Some(plan) = &session_plan {
+            request.web_context_key = Some(plan.session_id.clone());
+        }
         let marker = session_plan.as_ref().and_then(|plan| plan.marker.clone());
         let pending = self.begin_record(&request, &meta);
         let request_id = pending
@@ -463,6 +551,20 @@ mod tests {
         let control = Arc::new(ProviderControl::new(std::collections::HashMap::new()));
         let model = Arc::new(MockModel { tools }) as Arc<dyn PluginModel>;
         (ChatRouter::new(vec![model], control.clone()), control)
+    }
+
+    /// 删除远端会话应转交给对应渠道模型。
+    #[tokio::test]
+    async fn deletes_remote_session_through_channel_model() {
+        let (router, _control) = router(true);
+        assert!(router
+            .delete_remote_session("deepseek-web", "sess-1")
+            .await
+            .expect("删除应成功"));
+        assert!(router
+            .delete_remote_session("missing-web", "sess-1")
+            .await
+            .is_err());
     }
 
     /// 正常路由：token + 请求参数齐备时选中该渠道的模型。

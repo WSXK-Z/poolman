@@ -21,8 +21,11 @@ mod request_record;
 mod session;
 mod stream_processor;
 mod throttle;
+mod title_engine;
+mod title_model;
 mod tokenizer;
 mod utils;
+mod workflow;
 
 use std::sync::Arc;
 
@@ -39,7 +42,11 @@ use extension::credentials::CredentialStore;
 use extension::executor::PluginChannelExecutor;
 use extension::manager::ExtensionManager;
 use extension::websocket::WebSocketBridge;
-use models::{DeepSeekWebModel, PluginModel, SessionPoolStore, YuanbaoWebModel};
+use models::{
+    DbWebContextStore, DeepSeekWebModel, PluginModel, SessionPoolStore, WebContextStore,
+    YuanbaoWebModel,
+};
+use workflow::{WorkflowGraphStore, WorkflowRunStore, WorkflowRuntime};
 use providers::provider_control::{read_enablement_file, ProviderControl};
 use providers::{seed, ProviderManager};
 use local_session::LocalSessionStore;
@@ -49,6 +56,7 @@ use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use tauri::{Manager, WindowEvent};
 use throttle::ChatFrequency;
+use title_engine::TitleSettings;
 
 /// 数据目录（数据库/日志）：环境变量 AI_GATEWAY_DATA 覆盖；
 /// 开发模式(debug)用项目 data 目录(../data，保持现有数据不丢)，
@@ -120,6 +128,7 @@ async fn start_server(
     credentials: Arc<CredentialStore>,
     bridge: Arc<WebSocketBridge>,
     chat_router: Arc<ChatRouter>,
+    workflow_runtime: Arc<WorkflowRuntime>,
     chat_frequency: Arc<ChatFrequency>,
 ) -> anyhow::Result<()> {
     crate::apis::base::mark_started();
@@ -148,6 +157,7 @@ async fn start_server(
     // HTTP API：横切关注点与三种 OpenAI 接口格式由 apis 层装配。
     let state = Arc::new(AppState {
         chat_router,
+        workflow_runtime,
         bridge: bridge.clone(),
         credentials: credentials.clone(),
         config: config.clone(),
@@ -176,6 +186,7 @@ fn build_plugin_models(
     stream_idle_timeout_ms: u64,
     chat_frequency: Arc<ChatFrequency>,
     pool_store: Arc<dyn SessionPoolStore>,
+    web_context_store: Arc<dyn WebContextStore>,
 ) -> Vec<Arc<dyn PluginModel>> {
     let mut models: Vec<Arc<dyn PluginModel>> = Vec::new();
     let mut channels: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -206,7 +217,8 @@ fn build_plugin_models(
                     DeepSeekWebModel::new(row.display_name.clone(), executor)
                         .with_concurrency(concurrency)
                         .with_chat_frequency(chat_frequency.clone())
-                        .with_session_store(pool_store.clone()),
+                        .with_session_store(pool_store.clone())
+                        .with_web_context_store(web_context_store.clone()),
                 ) as Arc<dyn PluginModel>);
             }
             "yuanbao-web" => {
@@ -221,7 +233,8 @@ fn build_plugin_models(
                 );
                 models.push(Arc::new(
                     YuanbaoWebModel::new(row.display_name.clone(), executor)
-                        .with_chat_frequency(chat_frequency.clone()),
+                        .with_chat_frequency(chat_frequency.clone())
+                        .with_web_context_store(web_context_store.clone()),
                 ) as Arc<dyn PluginModel>);
             }
             other => info!("渠道 {} 暂无桌面端模型实现，跳过实例化", other),
@@ -365,6 +378,18 @@ pub fn run() {
             .block_on(LocalSessionStore::new(api_keys.db()))
             .expect("初始化本地会话表失败"),
     );
+    // 网页渠道本地会话 ↔ 远端会话绑定
+    let web_contexts = Arc::new(
+        init_rt
+            .block_on(DbWebContextStore::new(api_keys.db()))
+            .expect("初始化网页会话绑定表失败"),
+    );
+    // 工作流运行与节点状态：每次请求都会持久化
+    let workflow_runs = Arc::new(
+        init_rt
+            .block_on(WorkflowRunStore::new(api_keys.db()))
+            .expect("初始化工作流运行表失败"),
+    );
     // 启动装配：幂等补齐插件供应商与其网页模型
     let seeded = init_rt
         .block_on(seed::ensure_plugin_provider(&provider_manager))
@@ -403,6 +428,8 @@ pub fn run() {
     let startup_config = ServerConfig::from_env();
     // 对话请求频率：界面可改、立即生效，持久化在数据目录的 settings.json
     let chat_frequency = ChatFrequency::load(&data_dir);
+    // 会话标题生成：启发式优先，可选本地模型，最后回落网页渠道
+    let title_settings = TitleSettings::load(&data_dir);
     // 按持久化的模型行构建运行期渠道模型，组装模型分派入口
     let plugin_models = build_plugin_models(
         &model_rows,
@@ -412,6 +439,7 @@ pub fn run() {
         startup_config.stream_idle_timeout_ms,
         chat_frequency.clone(),
         provider_manager.clone() as Arc<dyn SessionPoolStore>,
+        web_contexts.clone() as Arc<dyn WebContextStore>,
     );
     info!("已实例化渠道模型 {} 个", plugin_models.len());
     // 后台预热会话池（按渠道并发设置预建网页会话）：插件尚未连上时重试，请求进来也会兜底
@@ -421,11 +449,24 @@ pub fn run() {
             .with_request_records(request_records.clone())
             .with_local_sessions(local_sessions.clone()),
     );
+    let workflow_graph = Arc::new(WorkflowGraphStore::new(
+        std::path::PathBuf::from(&data_dir).join("workflow.json"),
+    ));
+    let workflow_runtime = Arc::new(
+        WorkflowRuntime::new(
+            chat_router.clone(),
+            workflow_graph,
+            workflow_runs,
+            4,
+        )
+        .with_title_settings(title_settings.clone()),
+    );
 
     let api_keys_server = api_keys.clone();
     let credentials_server = credentials.clone();
     let bridge_server = bridge.clone();
     let chat_router_server = chat_router.clone();
+    let workflow_runtime_server = workflow_runtime.clone();
     let chat_frequency_server = chat_frequency.clone();
 
     // 在独立线程中启动 HTTP 服务器（避免阻塞 Tauri UI）
@@ -436,6 +477,7 @@ pub fn run() {
             credentials_server,
             bridge_server,
             chat_router_server,
+            workflow_runtime_server,
             chat_frequency_server,
         )) {
             eprintln!("HTTP 服务端错误: {}", e);
@@ -453,7 +495,9 @@ pub fn run() {
         .manage(extensions)
         .manage(bridge)
         .manage(chat_router)
+        .manage(workflow_runtime)
         .manage(chat_frequency)
+        .manage(title_settings)
         .invoke_handler(commands::handler())
         .setup(|app| {
             setup_tray(app)?;

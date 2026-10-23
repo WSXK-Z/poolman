@@ -7,10 +7,16 @@ use std::sync::Arc;
 
 use crate::handlers::{command_set, CommandSet};
 use crate::throttle::{ChatFrequency, DEFAULT_CHAT_INTERVAL_MS, MAX_CHAT_INTERVAL_MS};
+use crate::title_engine::{TitleSettings, TitleSource, DEFAULT_MODEL_DIR};
 
 /// 本组命令的处理器。
 pub(super) fn handler() -> CommandSet<tauri::Wry> {
-    command_set![get_chat_settings, set_chat_interval]
+    command_set![
+        get_chat_settings,
+        set_chat_interval,
+        get_title_settings,
+        set_title_settings
+    ]
 }
 
 /// 当前对话请求频率与允许范围（界面据此显示输入框）。
@@ -41,4 +47,33 @@ pub fn set_chat_interval(
         ));
     }
     frequency.set_interval_ms(interval_ms as u64)
+}
+
+/// 当前会话标题设置：来源策略、本地模型目录与默认目录。
+#[tauri::command]
+pub fn get_title_settings(
+    title: tauri::State<'_, Arc<TitleSettings>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "source": title.source().as_str(),
+        "model_dir": title.model_dir(),
+        "default_model_dir": DEFAULT_MODEL_DIR,
+        "has_local_model": title.has_local_model(),
+        "model_dir_resolved": title
+            .model_path()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+    })
+}
+
+/// 保存会话标题设置：`source` 为 heuristic / local / web。
+#[tauri::command]
+pub fn set_title_settings(
+    title: tauri::State<'_, Arc<TitleSettings>>,
+    source: String,
+    model_dir: String,
+) -> Result<serde_json::Value, String> {
+    let parsed = TitleSource::parse(&source);
+    title.save(parsed, &model_dir)?;
+    Ok(get_title_settings(title))
 }
